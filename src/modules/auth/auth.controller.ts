@@ -30,7 +30,7 @@ export class AuthController {
     const oauth2Client: OAuth2Client = this.getOAuthClient();
 
     const state = randomBytes(16).toString('hex');
-    req.session.oauthState = state;
+    req.session.googleOauthState = state;
 
     const scopes: string[] = [
       // Identity
@@ -68,12 +68,12 @@ export class AuthController {
       return;
     }
 
-    if (!state || state !== req.session.oauthState) {
+    if (!state || state !== req.session.googleOauthState) {
       res.status(400).send('Invalid state');
       return;
     }
 
-    req.session.oauthState = undefined;
+    req.session.googleOauthState = undefined;
 
     const tokenResponse: GetTokenResponse = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokenResponse.tokens);

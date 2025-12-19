@@ -2,8 +2,10 @@ import { MiddlewareConsumer, Module, NestModule, RequestMethod } from '@nestjs/c
 import { WebController } from './web.controller';
 import { CurrentUserMiddleware } from './current-user.middleware';
 import { RequireAuthMiddleware } from './require-auth.middleware';
+import { HubspotModule } from '../integrations/hubspot/hubspot.module';
 
 @Module({
+  imports: [HubspotModule],
   controllers: [WebController],
   providers: [CurrentUserMiddleware, RequireAuthMiddleware],
 })

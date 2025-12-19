@@ -10,6 +10,12 @@
           Connect your accounts so the agent can retrieve context and take actions.
         </p>
 
+        <% if (flash) { %>
+          <div class="notice <%= flash.type === 'success' ? 'notice--success' : 'notice--error' %>">
+            <%= flash.message %>
+          </div>
+        <% } %>
+
         <div class="threads-desktop__status">
           <div class="status-chip">
             <span class="status-chip__label">Google</span>
@@ -22,7 +28,7 @@
           </div>
         </div>
 
-        <div class="threads-desktop__actions" style="margin-top: 18px;">
+        <div class="threads-desktop__actions" style="margin-top: 18px; display:flex; gap:10px; flex-wrap:wrap;">
           <% if (!connections.google) { %>
             <a class="btn btn--primary" href="/auth/google">Connect Google</a>
           <% } else { %>
@@ -30,9 +36,29 @@
           <% } %>
 
           <% if (!connections.hubspot) { %>
-            <a class="btn btn--ghost" href="#" aria-disabled="true">Connect HubSpot (next)</a>
+            <a class="btn btn--primary" href="/auth/hubspot">Connect HubSpot</a>
+          <% } else { %>
+            <form method="post" action="/settings/hubspot/test">
+              <button class="btn btn--ghost" type="submit">Test HubSpot</button>
+            </form>
+
+            <form method="post" action="/settings/hubspot/disconnect" onsubmit="return confirm('Disconnect HubSpot?');">
+              <button class="btn btn--ghost" type="submit">Disconnect HubSpot</button>
+            </form>
           <% } %>
         </div>
+
+        <% if (hubspotDebug) { %>
+          <div class="card" style="margin-top:16px;">
+            <div class="card__title" style="margin-bottom:6px;">HubSpot Debug</div>
+            <div style="font-size: 14px; opacity: .9;">
+              <div><strong>Hub:</strong> <%= hubspotDebug.hubDomain %> (ID: <%= hubspotDebug.hubId %>)</div>
+              <div><strong>User:</strong> <%= hubspotDebug.hubUserEmail %></div>
+              <div><strong>Expires in:</strong> <%= hubspotDebug.expiresIn %> seconds</div>
+              <div style="margin-top:6px;"><strong>Scopes:</strong> <%= hubspotDebug.scopes.join(', ') %></div>
+            </div>
+          </div>
+        <% } %>
       </div>
     </div>
   </main>

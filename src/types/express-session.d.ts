@@ -3,6 +3,21 @@ import 'express-session';
 declare module 'express-session' {
   interface SessionData {
     userId?: number;
-    oauthState?: string;
+
+    googleOauthState?: string;
+    hubspotOauthState?: string;
+
+    flash?: {
+      type: 'success' | 'error';
+      message: string;
+    };
+
+    hubspotDebug?: {
+      hubDomain: string;
+      hubUserEmail: string;
+      hubId: number;
+      scopes: string[];
+      expiresIn: number;
+    };
   }
 }
