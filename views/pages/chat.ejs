@@ -1,0 +1,178 @@
+<div class="app-shell">
+  <aside class="sidebar" aria-label="Sidebar">
+    <div class="sidebar__brand">
+      <div class="sidebar__logo">A</div>
+      <div class="sidebar__title">Advisor Agent</div>
+    </div>
+
+    <button class="sidebar__new-thread" type="button">
+      <span class="sidebar__new-thread-plus">+</span>
+      <span>New thread</span>
+    </button>
+
+    <div class="sidebar__section-title">History</div>
+
+    <nav class="sidebar__threads" aria-label="Threads">
+      <button class="thread thread--active" type="button">
+        <div class="thread__title">Ask Anything</div>
+        <div class="thread__meta">All meetings</div>
+      </button>
+
+      <button class="thread" type="button">
+        <div class="thread__title">Follow-ups</div>
+        <div class="thread__meta">Last week</div>
+      </button>
+
+      <button class="thread" type="button">
+        <div class="thread__title">Client questions</div>
+        <div class="thread__meta">Last month</div>
+      </button>
+    </nav>
+
+    <div class="sidebar__footer">
+      <div class="sidebar__user">
+        <div class="sidebar__avatar">G</div>
+        <div class="sidebar__user-text">
+          <div class="sidebar__user-name">Guest</div>
+          <div class="sidebar__user-meta">Not connected</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main-area" aria-label="Chat">
+    <div class="panel">
+      <header class="panel__header">
+        <h1 class="panel__title">Ask Anything</h1>
+        <a class="icon-btn" href="/threads" aria-label="Close">✕</a>
+      </header>
+
+      <div class="panel__tabs">
+        <div class="tabs">
+          <button class="tab tab--active" type="button">Chat</button>
+          <button class="tab" type="button">History</button>
+        </div>
+
+        <button class="new-thread" type="button">
+          <span class="new-thread__plus">+</span>
+          <span>New thread</span>
+        </button>
+      </div>
+
+      <div class="context">
+        <div class="context__line"></div>
+        <div class="context__text">
+          <div class="context__top">Context set to all meetings</div>
+          <div class="context__bottom">11:17am – May 13, 2025</div>
+        </div>
+        <div class="context__line"></div>
+      </div>
+
+      <main class="content">
+        <div class="content__inner">
+          <div class="msg msg--assistant">
+            <div class="msg__text">
+              I can answer questions about any Jump meeting. What do you want to know?
+            </div>
+          </div>
+
+          <div class="prompt-chip">
+            <div class="prompt-chip__text">
+              Find meetings I’ve had with
+              <span class="person">
+                <span class="avatar">🧑🏻</span>
+                <strong>Bill</strong>
+              </span>
+              and
+              <span class="person">
+                <span class="avatar">🧑🏽</span>
+                <strong>Tim</strong>
+              </span>
+              this month
+            </div>
+          </div>
+
+          <div class="msg msg--assistant">
+            <div class="msg__text">
+              Sure, here are some recent meetings that you, Bill, and Tim all attended. I found 2 in May.
+              <span class="sparkle" aria-hidden="true">〰</span>
+            </div>
+          </div>
+
+          <section class="results">
+            <div class="day">
+              <div class="day__header">
+                <span class="day__num">8</span>
+                <span class="day__name">Thursday</span>
+              </div>
+
+              <div class="card">
+                <div class="card__time">12 – 1:30pm</div>
+                <div class="card__title">Quarterly All Team Meeting</div>
+                <div class="avatars">
+                  <span class="avatar avatar--small">🧑🏻</span>
+                  <span class="avatar avatar--small">🧑🏽</span>
+                  <span class="avatar avatar--small">🧑‍🦱</span>
+                  <span class="avatar avatar--small">🧑‍🦳</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="day">
+              <div class="day__header">
+                <span class="day__num">16</span>
+                <span class="day__name">Friday</span>
+              </div>
+
+              <div class="card">
+                <div class="card__time">1 – 2pm</div>
+                <div class="card__title">Strategy review</div>
+                <div class="avatars">
+                  <span class="avatar avatar--small">🧑🏻</span>
+                  <span class="avatar avatar--small">🧑🏽</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="msg msg--assistant msg--footer">
+              <div class="msg__text">
+                I can summarize these meetings, schedule a follow up, and more!
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <footer class="composer">
+        <div class="composer__inner">
+          <div class="composer__box">
+            <textarea class="composer__input" rows="2" placeholder="Ask anything about your meetings..."></textarea>
+
+            <div class="composer__bar">
+              <button class="icon-btn icon-btn--outline" type="button" aria-label="Add">+</button>
+
+              <button class="pill" type="button" aria-label="Context scope">
+                <span>All meetings</span>
+                <span class="pill__chev">▾</span>
+              </button>
+
+              <div class="composer__spacer"></div>
+
+              <button class="icon-btn icon-btn--outline" type="button" aria-label="HubSpot shortcut"
+                title="HubSpot (shortcut)">
+                🐂
+              </button>
+              <button class="icon-btn icon-btn--outline" type="button" aria-label="Email shortcut"
+                title="Email (shortcut)">
+                e
+              </button>
+              <button class="icon-btn icon-btn--outline" type="button" aria-label="Mic" title="Voice input">
+                🎙
+              </button>
+            </div>
+          </div>
+        </div>
+      </footer>
+    </div>
+  </main>
+</div>
