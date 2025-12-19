@@ -1,0 +1,39 @@
+<div class="app-shell">
+  <%- include('../partials/sidebar', { active: 'settings' }) %>
+
+  <main class="main-area">
+    <div class="threads-desktop">
+      <div class="threads-desktop__inner">
+        <div class="threads-desktop__badge">Settings</div>
+        <h1 class="threads-desktop__title">Connections</h1>
+        <p class="threads-desktop__subtitle">
+          Connect your accounts so the agent can retrieve context and take actions.
+        </p>
+
+        <div class="threads-desktop__status">
+          <div class="status-chip">
+            <span class="status-chip__label">Google</span>
+            <span class="status-chip__value"><%= connections.google ? 'Connected' : 'Not connected' %></span>
+          </div>
+
+          <div class="status-chip">
+            <span class="status-chip__label">HubSpot</span>
+            <span class="status-chip__value"><%= connections.hubspot ? 'Connected' : 'Not connected' %></span>
+          </div>
+        </div>
+
+        <div class="threads-desktop__actions" style="margin-top: 18px;">
+          <% if (!connections.google) { %>
+            <a class="btn btn--primary" href="/auth/google">Connect Google</a>
+          <% } else { %>
+            <a class="btn btn--ghost" href="/chat">Go to chat</a>
+          <% } %>
+
+          <% if (!connections.hubspot) { %>
+            <a class="btn btn--ghost" href="#" aria-disabled="true">Connect HubSpot (next)</a>
+          <% } %>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>

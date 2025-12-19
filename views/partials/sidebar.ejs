@@ -1,0 +1,72 @@
+<aside class="sidebar" aria-label="Sidebar">
+  <div class="sidebar__brand">
+    <div class="sidebar__logo">A</div>
+    <div class="sidebar__title">Advisor Agent</div>
+  </div>
+
+  <!-- Primary nav (this fixes "no way to navigate to /threads from chat") -->
+  <nav class="sidebar__threads" aria-label="Primary">
+    <a class="thread <%= active === 'chat' ? 'thread--active' : '' %>" href="/chat">
+      <div class="thread__title">Chat</div>
+      <div class="thread__meta">Ask the agent</div>
+    </a>
+
+    <a class="thread <%= active === 'threads' ? 'thread--active' : '' %>" href="/threads">
+      <div class="thread__title">Threads</div>
+      <div class="thread__meta">History</div>
+    </a>
+
+    <a class="thread <%= active === 'settings' ? 'thread--active' : '' %>" href="/settings">
+      <div class="thread__title">Settings</div>
+      <div class="thread__meta">Connections</div>
+    </a>
+  </nav>
+
+  <button class="sidebar__new-thread" type="button">
+    <span class="sidebar__new-thread-plus">+</span>
+    <span>New thread</span>
+  </button>
+
+  <div class="sidebar__section-title">History</div>
+
+  <nav class="sidebar__threads" aria-label="Threads">
+    <a class="thread <%= active === 'chat' ? 'thread--active' : '' %>" href="/chat">
+      <div class="thread__title">Ask Anything</div>
+      <div class="thread__meta">All meetings</div>
+    </a>
+
+    <a class="thread" href="/chat">
+      <div class="thread__title">Follow-ups</div>
+      <div class="thread__meta">Last week</div>
+    </a>
+
+    <a class="thread" href="/chat">
+      <div class="thread__title">Client questions</div>
+      <div class="thread__meta">Last month</div>
+    </a>
+  </nav>
+
+  <div class="sidebar__footer">
+    <% if (locals.currentUser) { %>
+      <div class="sidebar__user">
+        <div class="sidebar__avatar"><%= locals.currentUser.initials %></div>
+        <div class="sidebar__user-text">
+          <div class="sidebar__user-name"><%= locals.currentUser.name || locals.currentUser.email %></div>
+          <div class="sidebar__user-meta"><%= locals.currentUser.email %></div>
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <a class="btn btn--ghost" style="width:100%;" href="/auth/logout">Logout</a>
+      </div>
+    <% } else { %>
+      <div class="sidebar__user">
+        <div class="sidebar__avatar">G</div>
+        <div class="sidebar__user-text">
+          <div class="sidebar__user-name">Guest</div>
+          <div class="sidebar__user-meta">Not connected</div>
+        </div>
+      </div>
+    <% } %>
+  </div>
+</aside>

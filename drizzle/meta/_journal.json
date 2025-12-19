@@ -8,6 +8,13 @@
       "when": 1766161179504,
       "tag": "0000_enable_vector",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1766171089709,
+      "tag": "0001_init_core_tables",
+      "breakpoints": true
     }
   ]
 }

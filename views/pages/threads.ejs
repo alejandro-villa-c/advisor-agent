@@ -1,47 +1,8 @@
 <div class="app-shell">
-  <aside class="sidebar" aria-label="Sidebar">
-    <div class="sidebar__brand">
-      <div class="sidebar__logo">A</div>
-      <div class="sidebar__title">Advisor Agent</div>
-    </div>
-
-    <button class="sidebar__new-thread" type="button">
-      <span class="sidebar__new-thread-plus">+</span>
-      <span>New thread</span>
-    </button>
-
-    <div class="sidebar__section-title">History</div>
-
-    <nav class="sidebar__threads" aria-label="Threads">
-      <a class="thread thread--active" href="/chat">
-        <div class="thread__title">Ask Anything</div>
-        <div class="thread__meta">All meetings</div>
-      </a>
-
-      <a class="thread" href="/chat">
-        <div class="thread__title">Follow-ups</div>
-        <div class="thread__meta">Last week</div>
-      </a>
-
-      <a class="thread" href="/chat">
-        <div class="thread__title">Client questions</div>
-        <div class="thread__meta">Last month</div>
-      </a>
-    </nav>
-
-    <div class="sidebar__footer">
-      <div class="sidebar__user">
-        <div class="sidebar__avatar">G</div>
-        <div class="sidebar__user-text">
-          <div class="sidebar__user-name">Guest</div>
-          <div class="sidebar__user-meta">Not connected</div>
-        </div>
-      </div>
-    </div>
-  </aside>
+  <%- include('../partials/sidebar', { active: 'threads' }) %>
 
   <main class="main-area" aria-label="Threads">
-    <!-- Desktop: do NOT repeat threads/profile (sidebar already has it) -->
+    <!-- Desktop -->
     <section class="threads-desktop" aria-label="Desktop threads landing">
       <div class="threads-desktop__inner">
         <div class="threads-desktop__badge">Threads</div>
@@ -58,11 +19,11 @@
         <div class="threads-desktop__status">
           <div class="status-chip">
             <span class="status-chip__label">Gmail</span>
-            <span class="status-chip__value">Not connected</span>
+            <span class="status-chip__value">Connected</span>
           </div>
           <div class="status-chip">
             <span class="status-chip__label">Calendar</span>
-            <span class="status-chip__value">Not connected</span>
+            <span class="status-chip__value">Connected</span>
           </div>
           <div class="status-chip">
             <span class="status-chip__label">HubSpot</span>
@@ -72,7 +33,7 @@
       </div>
     </section>
 
-    <!-- Mobile: this IS the threads screen (since sidebar is hidden) -->
+    <!-- Mobile -->
     <section class="threads-mobile" aria-label="Mobile threads">
       <div class="threads-page">
         <header class="threads-page__header">
@@ -102,16 +63,27 @@
             <div class="thread-card__title">Client questions</div>
             <div class="thread-card__meta">Last updated: last month</div>
           </a>
+
+          <a class="thread-card" href="/settings" role="listitem">
+            <div class="thread-card__title">Settings</div>
+            <div class="thread-card__meta">Connections</div>
+          </a>
         </div>
 
         <div class="threads-page__footer">
-          <div class="threads-user">
-            <div class="threads-user__avatar">G</div>
-            <div class="threads-user__text">
-              <div class="threads-user__name">Guest</div>
-              <div class="threads-user__meta">Not connected</div>
+          <% if (locals.currentUser) { %>
+            <div class="threads-user">
+              <div class="threads-user__avatar"><%= locals.currentUser.initials %></div>
+              <div class="threads-user__text">
+                <div class="threads-user__name"><%= locals.currentUser.name || locals.currentUser.email %></div>
+                <div class="threads-user__meta"><%= locals.currentUser.email %></div>
+              </div>
             </div>
-          </div>
+
+            <div style="margin-top: 12px;">
+              <a class="btn btn--ghost" style="width:100%;" href="/auth/logout">Logout</a>
+            </div>
+          <% } %>
         </div>
       </div>
     </section>

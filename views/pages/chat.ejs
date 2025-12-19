@@ -1,49 +1,11 @@
 <div class="app-shell">
-  <aside class="sidebar" aria-label="Sidebar">
-    <div class="sidebar__brand">
-      <div class="sidebar__logo">A</div>
-      <div class="sidebar__title">Advisor Agent</div>
-    </div>
-
-    <button class="sidebar__new-thread" type="button">
-      <span class="sidebar__new-thread-plus">+</span>
-      <span>New thread</span>
-    </button>
-
-    <div class="sidebar__section-title">History</div>
-
-    <nav class="sidebar__threads" aria-label="Threads">
-      <button class="thread thread--active" type="button">
-        <div class="thread__title">Ask Anything</div>
-        <div class="thread__meta">All meetings</div>
-      </button>
-
-      <button class="thread" type="button">
-        <div class="thread__title">Follow-ups</div>
-        <div class="thread__meta">Last week</div>
-      </button>
-
-      <button class="thread" type="button">
-        <div class="thread__title">Client questions</div>
-        <div class="thread__meta">Last month</div>
-      </button>
-    </nav>
-
-    <div class="sidebar__footer">
-      <div class="sidebar__user">
-        <div class="sidebar__avatar">G</div>
-        <div class="sidebar__user-text">
-          <div class="sidebar__user-name">Guest</div>
-          <div class="sidebar__user-meta">Not connected</div>
-        </div>
-      </div>
-    </div>
-  </aside>
+  <%- include('../partials/sidebar', { active: 'chat' }) %>
 
   <main class="main-area" aria-label="Chat">
     <div class="panel">
       <header class="panel__header">
         <h1 class="panel__title">Ask Anything</h1>
+        <!-- On mobile this acts like "close", on desktop it's fine too -->
         <a class="icon-btn" href="/threads" aria-label="Close">✕</a>
       </header>
 
@@ -158,12 +120,10 @@
 
               <div class="composer__spacer"></div>
 
-              <button class="icon-btn icon-btn--outline" type="button" aria-label="HubSpot shortcut"
-                title="HubSpot (shortcut)">
+              <button class="icon-btn icon-btn--outline" type="button" aria-label="HubSpot shortcut" title="HubSpot (shortcut)">
                 🐂
               </button>
-              <button class="icon-btn icon-btn--outline" type="button" aria-label="Email shortcut"
-                title="Email (shortcut)">
+              <button class="icon-btn icon-btn--outline" type="button" aria-label="Email shortcut" title="Email (shortcut)">
                 e
               </button>
               <button class="icon-btn icon-btn--outline" type="button" aria-label="Mic" title="Voice input">
