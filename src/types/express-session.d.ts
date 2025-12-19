@@ -19,5 +19,12 @@ declare module 'express-session' {
       scopes: string[];
       expiresIn: number;
     };
+
+    hubspotPeekContacts?: Array<{
+      id: string;
+      email?: string;
+      firstname?: string;
+      lastname?: string;
+    }>;
   }
 }
