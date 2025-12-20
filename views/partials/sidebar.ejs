@@ -4,16 +4,11 @@
     <div class="sidebar__title">Advisor Agent</div>
   </div>
 
-  <!-- Primary nav (this fixes "no way to navigate to /threads from chat") -->
+  <!-- Primary nav -->
   <nav class="sidebar__threads" aria-label="Primary">
-    <a class="thread <%= active === 'chat' ? 'thread--active' : '' %>" href="/chat">
-      <div class="thread__title">Chat</div>
+    <a class="thread <%= active === 'chat' ? 'thread--active' : '' %>" href="/chat" data-new-thread>
+      <div class="thread__title">New chat</div>
       <div class="thread__meta">Ask the agent</div>
-    </a>
-
-    <a class="thread <%= active === 'threads' ? 'thread--active' : '' %>" href="/threads">
-      <div class="thread__title">Threads</div>
-      <div class="thread__meta">History</div>
     </a>
 
     <a class="thread <%= active === 'settings' ? 'thread--active' : '' %>" href="/settings">
@@ -22,28 +17,16 @@
     </a>
   </nav>
 
-  <button class="sidebar__new-thread" type="button">
-    <span class="sidebar__new-thread-plus">+</span>
-    <span>New thread</span>
-  </button>
-
   <div class="sidebar__section-title">History</div>
 
-  <nav class="sidebar__threads" aria-label="Threads">
-    <a class="thread <%= active === 'chat' ? 'thread--active' : '' %>" href="/chat">
-      <div class="thread__title">Ask Anything</div>
-      <div class="thread__meta">All meetings</div>
-    </a>
-
-    <a class="thread" href="/chat">
-      <div class="thread__title">Follow-ups</div>
-      <div class="thread__meta">Last week</div>
-    </a>
-
-    <a class="thread" href="/chat">
-      <div class="thread__title">Client questions</div>
-      <div class="thread__meta">Last month</div>
-    </a>
+  <!-- Real threads history (filled by /public/js/threads.js) -->
+  <nav class="sidebar__threads" aria-label="Threads" data-threads-history>
+    <div class="thread-row">
+      <div class="thread" style="cursor: default; opacity: .75;">
+        <div class="thread__title">Loading…</div>
+        <div class="thread__meta">Please wait</div>
+      </div>
+    </div>
   </nav>
 
   <div class="sidebar__footer">
@@ -70,3 +53,5 @@
     <% } %>
   </div>
 </aside>
+
+<script src="/js/threads.js" defer></script>

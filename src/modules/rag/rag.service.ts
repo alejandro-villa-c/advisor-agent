@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
-import { and, eq, isNotNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, sql } from 'drizzle-orm';
+import { createHash } from 'crypto';
 import { DbService } from '../../db/db.service';
 import { documentChunks, documents } from '../../db/schema';
 import { OpenAiEmbeddingsService } from './openai-embeddings.service';
@@ -14,7 +15,7 @@ export class RagService {
   ) {}
 
   /**
-   * Basic overlapping char chunker (good enough for the challenge).
+   * Basic overlapping char chunker.
    */
   chunkText(
     input: string,
@@ -64,12 +65,20 @@ export class RagService {
   /**
    * Rebuilds chunks for all documents for a user (or a subset).
    * Deletes existing chunks for each document and recreates them.
+   *
+   * IMPORTANT: Now idempotent — if the document text hash + chunk params match, we skip rebuild
+   * to avoid re-embedding unchanged docs (saves budget).
    */
   async rebuildChunksForUser(input: {
     userId: number;
     documentIds?: number[];
   }): Promise<{ documentsProcessed: number; chunksInserted: number }> {
     const userId = input.userId;
+
+    const whereClause =
+      input.documentIds && input.documentIds.length > 0
+        ? and(eq(documents.userId, userId), inArray(documents.id, input.documentIds))
+        : eq(documents.userId, userId);
 
     const docs = await this.dbService.db
       .select({
@@ -81,16 +90,63 @@ export class RagService {
         updatedAt: documents.updatedAt,
       })
       .from(documents)
-      .where(
-        input.documentIds?.length
-          ? and(eq(documents.userId, userId), sql`${documents.id} = ANY(${input.documentIds})`)
-          : eq(documents.userId, userId),
-      );
+      .where(whereClause);
+
+    const docIds = docs.map((d) => d.id);
+    const firstChunkMetaByDocId = new Map<number, unknown>();
+
+    if (docIds.length > 0) {
+      const firstChunks = await this.dbService.db
+        .select({
+          documentId: documentChunks.documentId,
+          meta: documentChunks.meta,
+        })
+        .from(documentChunks)
+        .where(
+          and(
+            eq(documentChunks.userId, userId),
+            inArray(documentChunks.documentId, docIds),
+            eq(documentChunks.chunkIndex, 0),
+          ),
+        );
+
+      for (const row of firstChunks) {
+        firstChunkMetaByDocId.set(row.documentId, row.meta);
+      }
+    }
 
     let chunksInserted = 0;
 
+    // Keep the chunking params stable (so our "up-to-date" check is meaningful).
+    const chunkSize = 900;
+    const overlap = 120;
+
     for (const d of docs) {
-      const chunks = this.chunkText(d.text);
+      const docText = (d.text ?? '').trim();
+      if (!docText) {
+        // still wipe existing chunks if doc became empty
+        await this.dbService.db.delete(documentChunks).where(eq(documentChunks.documentId, d.id));
+        continue;
+      }
+
+      const docHash = hashText(docText);
+
+      const existingMeta = firstChunkMetaByDocId.get(d.id);
+      const existingHash = readMetaString(existingMeta, 'documentTextHash');
+      const existingChunkSize = readMetaNumber(existingMeta, 'chunkSize');
+      const existingOverlap = readMetaNumber(existingMeta, 'overlap');
+
+      // If unchanged + same chunk settings, skip rebuild entirely.
+      if (
+        existingHash &&
+        existingHash === docHash &&
+        existingChunkSize === chunkSize &&
+        existingOverlap === overlap
+      ) {
+        continue;
+      }
+
+      const chunks = this.chunkText(docText, { chunkSize, overlap });
 
       // Wipe existing chunks
       await this.dbService.db.delete(documentChunks).where(eq(documentChunks.documentId, d.id));
@@ -111,6 +167,9 @@ export class RagService {
           start: c.meta.start,
           end: c.meta.end,
           documentUpdatedAt: d.updatedAt?.toISOString?.() ?? null,
+          documentTextHash: docHash,
+          chunkSize,
+          overlap,
         },
       }));
 
@@ -122,14 +181,23 @@ export class RagService {
   }
 
   /**
-   * Embeds all chunks missing embeddings for a user.
+   * Embeds chunks missing embeddings for a user.
+   * If documentIds is provided, only embeds chunks belonging to those documents (prevents huge surprise bills).
    */
   async embedMissingChunksForUser(input: {
     userId: number;
     batchSize?: number;
+    documentIds?: number[];
   }): Promise<{ chunksEmbedded: number; modelUsed: string | null }> {
     const userId = input.userId;
     const batchSize = clampInt(input.batchSize ?? 64, 1, 256);
+
+    const documentIds =
+      input.documentIds && input.documentIds.length ? Array.from(new Set(input.documentIds)) : null;
+
+    if (documentIds && documentIds.length === 0) {
+      return { chunksEmbedded: 0, modelUsed: this.embeddings.isConfigured() ? 'unknown' : null };
+    }
 
     if (!this.embeddings.isConfigured()) {
       // Still “functional”: you can chunk + keyword search, but semantic search won’t work.
@@ -140,13 +208,22 @@ export class RagService {
     let modelUsed: string | null = null;
 
     while (true) {
+      const conditions = [
+        eq(documentChunks.userId, userId),
+        sql`${documentChunks.embedding} IS NULL`,
+      ];
+
+      if (documentIds) {
+        conditions.push(inArray(documentChunks.documentId, documentIds));
+      }
+
       const batch = await this.dbService.db
         .select({
           id: documentChunks.id,
           text: documentChunks.text,
         })
         .from(documentChunks)
-        .where(and(eq(documentChunks.userId, userId), sql`${documentChunks.embedding} IS NULL`))
+        .where(and(...conditions))
         .limit(batchSize);
 
       if (batch.length === 0) break;
@@ -189,7 +266,7 @@ export class RagService {
   > {
     const userId = input.userId;
     const q = (input.query ?? '').trim();
-    const k = clampInt(input.k ?? 8, 1, 25);
+    const k = clampInt(input.k ?? 10, 1, 25);
     if (!q) return [];
 
     // Fallback: keyword search
@@ -248,4 +325,24 @@ function clampInt(n: number, min: number, max: number): number {
   if (x < min) return min;
   if (x > max) return max;
   return x;
+}
+
+function hashText(text: string): string {
+  return createHash('sha1').update(text, 'utf8').digest('hex');
+}
+
+function isRecord(x: unknown): x is Record<string, unknown> {
+  return typeof x === 'object' && x !== null && !Array.isArray(x);
+}
+
+function readMetaString(meta: unknown, key: string): string | null {
+  if (!isRecord(meta)) return null;
+  const v = meta[key];
+  return typeof v === 'string' ? v : null;
+}
+
+function readMetaNumber(meta: unknown, key: string): number | null {
+  if (!isRecord(meta)) return null;
+  const v = meta[key];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }

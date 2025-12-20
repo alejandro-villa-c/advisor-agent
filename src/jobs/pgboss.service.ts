@@ -1,14 +1,20 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PgBoss } from 'pg-boss';
+import {
+  CALENDAR_SYNC_EVENTS_JOB,
+  GMAIL_SYNC_MESSAGES_JOB,
+  HUBSPOT_SYNC_CONTACTS_JOB,
+  HUBSPOT_SYNC_NOTES_JOB,
+  RAG_EMBED_DOCUMENTS_JOB,
+  SYNC_TICK_JOB,
+} from './job.constants';
 
 @Injectable()
 export class PgBossService implements OnModuleInit, OnModuleDestroy {
   private boss: PgBoss | null = null;
 
   get client(): PgBoss {
-    if (!this.boss) {
-      throw new Error('PgBoss not initialized yet.');
-    }
+    if (!this.boss) throw new Error('PgBoss not initialized yet.');
     return this.boss;
   }
 
@@ -22,18 +28,33 @@ export class PgBossService implements OnModuleInit, OnModuleDestroy {
 
     this.boss = new PgBoss({
       connectionString: databaseUrl,
-      // optional: schema: 'pgboss',
     });
 
-    // Prevent "Unhandled error" crashes when pg-boss emits an 'error' event
     this.boss.on('error', (err) => {
-      // Keep it simple; Nest Logger isn't necessary here
-
       console.error('[pg-boss] error event:', err);
     });
 
-    // Creates/updates pg-boss tables automatically as needed
     await this.boss.start();
+
+    // Ensure queues exist in BOTH web + worker processes (prevents early-send failures).
+    const queues: string[] = [
+      HUBSPOT_SYNC_CONTACTS_JOB,
+      HUBSPOT_SYNC_NOTES_JOB,
+      GMAIL_SYNC_MESSAGES_JOB,
+      CALENDAR_SYNC_EVENTS_JOB,
+      RAG_EMBED_DOCUMENTS_JOB,
+      SYNC_TICK_JOB,
+    ];
+
+    for (const queueName of queues) {
+      try {
+        await this.boss.createQueue(queueName);
+      } catch (err: unknown) {
+        // createQueue is usually idempotent; warn and continue.
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[pg-boss] createQueue(${queueName}) failed: ${message}`);
+      }
+    }
   }
 
   async onModuleDestroy(): Promise<void> {

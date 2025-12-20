@@ -29,6 +29,20 @@
       "when": 1766193525513,
       "tag": "0003_add_vector_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1766199427488,
+      "tag": "0004_add_more_core_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1766205813678,
+      "tag": "0005_update_integration_kinds",
+      "breakpoints": true
     }
   ]
 }

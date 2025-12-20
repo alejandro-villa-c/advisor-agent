@@ -1,13 +1,12 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PgBossService } from '../jobs/pgboss.service';
 import { RagService } from '../modules/rag/rag.service';
+import { RAG_EMBED_DOCUMENTS_JOB } from '../jobs/job.constants';
 
 export type RagEmbedJobData = {
   userId: number;
   documentIds?: number[];
 };
-
-export const RAG_EMBED_DOCUMENTS_JOB = 'rag.embedDocuments';
 
 type PgBossJob<T> = {
   id: string | number;
@@ -19,25 +18,25 @@ export class RagEmbedWorker implements OnModuleInit {
   private readonly logger = new Logger(RagEmbedWorker.name);
 
   constructor(
-    private readonly pgBoss: PgBossService,
+    private readonly pgBossService: PgBossService,
     private readonly rag: RagService,
   ) {}
 
   async onModuleInit(): Promise<void> {
-    try {
-      await this.pgBoss.client.createQueue(RAG_EMBED_DOCUMENTS_JOB);
-    } catch (err: unknown) {
-      this.logger.warn(
-        `createQueue(${RAG_EMBED_DOCUMENTS_JOB}) failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-
-    await this.pgBoss.client.work(
+    await this.pgBossService.client.work(
       RAG_EMBED_DOCUMENTS_JOB,
       { batchSize: 1 },
       async (jobs: PgBossJob<RagEmbedJobData>[]) => {
         for (const job of jobs) {
-          await this.handleOne(job);
+          try {
+            await this.handleOne(job);
+          } catch (err) {
+            this.logger.error(
+              `[${RAG_EMBED_DOCUMENTS_JOB}] FAILED job=${String(job.id)} userId=${job.data?.userId} ` +
+                (err instanceof Error ? err.stack : String(err)),
+            );
+            throw err; // keep the job marked failed so pg-boss retry rules apply
+          }
         }
       },
     );

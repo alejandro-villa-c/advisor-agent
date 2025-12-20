@@ -36,9 +36,8 @@ export const taskStepKindEnum = pgEnum('task_step_kind', ['llm', 'tool', 'system
 export const documentSourceEnum = pgEnum('document_source', [
   'hubspot_contact',
   'hubspot_note',
-  // Future:
-  // 'gmail_email',
-  // 'calendar_event',
+  'gmail_email',
+  'calendar_event',
 ]);
 
 /**
@@ -51,7 +50,7 @@ export const documentSourceEnum = pgEnum('document_source', [
 export const vector = customType<{
   data: number[];
   driverData: string;
-  config: { dimensions: number };
+  config?: { dimensions: number };
 }>({
   dataType: (config) => `vector(${config?.dimensions ?? 1536})`,
   toDriver: (value) => {
@@ -137,6 +136,44 @@ export const oauthAccounts = pgTable(
     providerAccountUq: uniqueIndex('oauth_accounts_provider_account_uq').on(
       t.provider,
       t.providerAccountId,
+    ),
+  }),
+);
+
+export const integrationKindEnum = pgEnum('integration_kind', [
+  'gmail',
+  'calendar',
+  'hubspot_notes',
+  'hubspot_contacts',
+]);
+
+export const integrationStates = pgTable(
+  'integration_states',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    integration: integrationKindEnum('integration').notNull(),
+
+    /**
+     * Provider-specific cursor/state.
+     * Gmail: { historyId, lastSyncedAt, labelIds?, query?, pageToken? }
+     * Calendar: { syncToken, lastSyncedAt, calendarId? }
+     * HubSpot: { lastSyncedAt, ... }
+     */
+    state: jsonb('state').notNull().default({}),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdIdx: index('integration_states_user_id_idx').on(t.userId),
+    userIntegrationUq: uniqueIndex('integration_states_user_integration_uq').on(
+      t.userId,
+      t.integration,
     ),
   }),
 );
@@ -431,5 +468,82 @@ export const documentChunks = pgTable(
     userIdIdx: index('document_chunks_user_id_idx').on(t.userId),
     documentIdIdx: index('document_chunks_document_id_idx').on(t.documentId),
     docChunkUq: uniqueIndex('document_chunks_document_chunk_uq').on(t.documentId, t.chunkIndex),
+  }),
+);
+
+export const gmailMessages = pgTable(
+  'gmail_messages',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    gmailMessageId: text('gmail_message_id').notNull(),
+    gmailThreadId: text('gmail_thread_id'),
+
+    from: text('from'),
+    to: text('to'),
+    cc: text('cc'),
+    bcc: text('bcc'),
+
+    subject: text('subject'),
+    snippet: text('snippet'),
+
+    /**
+     * Gmail internalDate is ms since epoch; we store as timestamptz for querying.
+     */
+    sentAt: timestamp('sent_at', { withTimezone: true }),
+
+    /**
+     * Raw Gmail payload (or the subset you keep).
+     */
+    raw: jsonb('raw'),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdIdx: index('gmail_messages_user_id_idx').on(t.userId),
+    threadIdx: index('gmail_messages_thread_id_idx').on(t.gmailThreadId),
+    sentAtIdx: index('gmail_messages_sent_at_idx').on(t.sentAt),
+    userMsgUq: uniqueIndex('gmail_messages_user_msg_uq').on(t.userId, t.gmailMessageId),
+  }),
+);
+
+export const calendarEvents = pgTable(
+  'calendar_events',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    calendarId: text('calendar_id').notNull().default('primary'),
+    googleEventId: text('google_event_id').notNull(),
+
+    summary: text('summary'),
+    description: text('description'),
+    location: text('location'),
+
+    startAt: timestamp('start_at', { withTimezone: true }),
+    endAt: timestamp('end_at', { withTimezone: true }),
+
+    attendees: jsonb('attendees'),
+    raw: jsonb('raw'),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdIdx: index('calendar_events_user_id_idx').on(t.userId),
+    startIdx: index('calendar_events_start_at_idx').on(t.startAt),
+    userEventUq: uniqueIndex('calendar_events_user_event_uq').on(
+      t.userId,
+      t.calendarId,
+      t.googleEventId,
+    ),
   }),
 );

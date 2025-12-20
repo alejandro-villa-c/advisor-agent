@@ -3,9 +3,10 @@ import { WebController } from './web.controller';
 import { CurrentUserMiddleware } from './current-user.middleware';
 import { RequireAuthMiddleware } from './require-auth.middleware';
 import { HubspotModule } from '../integrations/hubspot/hubspot.module';
+import { JobsModule } from '../../jobs/jobs.module';
 
 @Module({
-  imports: [HubspotModule],
+  imports: [HubspotModule, JobsModule],
   controllers: [WebController],
   providers: [CurrentUserMiddleware, RequireAuthMiddleware],
 })

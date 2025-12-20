@@ -5,12 +5,15 @@ import { and, eq } from 'drizzle-orm';
 import { HubspotOAuthService } from './hubspot-oauth.service';
 import { DbService } from '../../../db/db.service';
 import { oauthAccounts } from '../../../db/schema';
+import { PgBossService } from '../../../jobs/pgboss.service';
+import { HUBSPOT_SYNC_CONTACTS_JOB, HUBSPOT_SYNC_NOTES_JOB } from '../../../jobs/job.constants';
 
 @Controller('auth/hubspot')
 export class HubspotAuthController {
   constructor(
     private readonly hubspotOAuth: HubspotOAuthService,
     private readonly dbService: DbService,
+    private readonly pgBoss: PgBossService,
   ) {}
 
   @Get()
@@ -58,7 +61,6 @@ export class HubspotAuthController {
 
     const expiresAt = new Date(Date.now() + tokens.expiresIn * 1000);
 
-    // store useful info for later (debug + future API calls)
     const metaForDb = {
       hubId: meta.hub_id,
       hubDomain: meta.hub_domain,
@@ -98,6 +100,10 @@ export class HubspotAuthController {
         meta: metaForDb,
       });
     }
+
+    // Bootstrap sync for HubSpot
+    await this.pgBoss.client.send(HUBSPOT_SYNC_CONTACTS_JOB, { userId });
+    await this.pgBoss.client.send(HUBSPOT_SYNC_NOTES_JOB, { userId });
 
     res.redirect('/settings');
   }

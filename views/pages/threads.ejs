@@ -7,29 +7,13 @@
       <div class="center-page">
         <div class="center-card">
           <div class="page-badge">Threads</div>
-          <h1 class="page-title">Pick up where you left off</h1>
+          <h1 class="page-title">Your threads are in the sidebar</h1>
           <p class="page-subtitle">
-            Select a thread from the sidebar, or start a new conversation.
+            Start a new conversation or select a thread from the history list.
           </p>
 
           <div class="page-actions">
-            <a class="btn btn--primary" href="/chat">Open chat</a>
-            <button class="btn btn--ghost" type="button">New thread</button>
-          </div>
-
-          <div class="page-status">
-            <div class="status-chip">
-              <span class="status-chip__label">Gmail</span>
-              <span class="status-chip__value">Connected</span>
-            </div>
-            <div class="status-chip">
-              <span class="status-chip__label">Calendar</span>
-              <span class="status-chip__value">Connected</span>
-            </div>
-            <div class="status-chip">
-              <span class="status-chip__label">HubSpot</span>
-              <span class="status-chip__value">Not connected</span>
-            </div>
+            <button class="btn btn--primary" type="button" data-new-thread>+ New thread</button>
           </div>
         </div>
       </div>
@@ -47,29 +31,25 @@
             </div>
           </div>
 
-          <a class="threads-page__cta" href="/chat">Open chat</a>
+          <button class="btn btn--primary" type="button" data-new-thread>+ New thread</button>
         </header>
 
         <div class="threads-page__list" role="list">
-          <a class="thread-card" href="/chat" role="listitem">
-            <div class="thread-card__title">Ask Anything</div>
-            <div class="thread-card__meta">Context: all meetings</div>
-          </a>
-
-          <a class="thread-card" href="/chat" role="listitem">
-            <div class="thread-card__title">Follow-ups</div>
-            <div class="thread-card__meta">Last updated: last week</div>
-          </a>
-
-          <a class="thread-card" href="/chat" role="listitem">
-            <div class="thread-card__title">Client questions</div>
-            <div class="thread-card__meta">Last updated: last month</div>
-          </a>
-
           <a class="thread-card" href="/settings" role="listitem">
             <div class="thread-card__title">Settings</div>
             <div class="thread-card__meta">Connections</div>
           </a>
+        </div>
+
+        <div class="threads-section-title">History</div>
+
+        <div class="threads-page__list" role="list" data-threads-list>
+          <div class="thread-card-row" role="listitem" aria-busy="true">
+            <div class="thread-card">
+              <div class="thread-card__title">Loading…</div>
+              <div class="thread-card__meta">Please wait</div>
+            </div>
+          </div>
         </div>
 
         <div class="threads-page__footer">
@@ -91,3 +71,5 @@
     </section>
   </main>
 </div>
+
+<script src="/js/threads.js" defer></script>

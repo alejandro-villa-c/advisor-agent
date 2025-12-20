@@ -59,6 +59,93 @@
             </div>
           </div>
         <% } %>
+
+        <div class="card" style="margin-top:16px;">
+          <div class="card__title" style="margin-bottom:6px;">Sync status</div>
+          <div style="font-size: 14px; opacity: .9;">
+            Recent sync activity for connected integrations.
+          </div>
+
+          <div style="margin-top:10px; font-size: 14px;">
+            <div style="display:flex; gap:12px; flex-wrap:wrap;">
+              <div class="status-chip">
+                <span class="status-chip__label">Gmail last sync</span>
+                <span class="status-chip__value">
+                  <%= (syncState && syncState.gmail && syncState.gmail.lastSyncedAt) ? syncState.gmail.lastSyncedAt : '—' %>
+                </span>
+              </div>
+
+              <div class="status-chip">
+                <span class="status-chip__label">Calendar last sync</span>
+                <span class="status-chip__value">
+                  <%= (syncState && syncState.calendar && syncState.calendar.lastSyncedAt) ? syncState.calendar.lastSyncedAt : '—' %>
+                </span>
+              </div>
+
+              <div class="status-chip">
+                <span class="status-chip__label">HubSpot contacts last sync</span>
+                <span class="status-chip__value">
+                  <%= (syncState && syncState.hubspotContacts && syncState.hubspotContacts.lastSyncedAt) ? syncState.hubspotContacts.lastSyncedAt : '—' %>
+                </span>
+              </div>
+
+              <div class="status-chip">
+                <span class="status-chip__label">HubSpot notes last sync</span>
+                <span class="status-chip__value">
+                  <%= (syncState && syncState.hubspotNotes && syncState.hubspotNotes.lastSyncedAt) ? syncState.hubspotNotes.lastSyncedAt : '—' %>
+                </span>
+              </div>
+            </div>
+
+            <div style="margin-top:10px; opacity:.85;">
+              Manual sync is optional. In production, sync jobs typically run automatically on a schedule.
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <div class="card__title" style="margin-bottom:6px;">Manual sync (optional)</div>
+          <div style="font-size: 14px; opacity: .9;">
+            Use these to pull data into the database. Defaults are conservative to avoid huge imports.
+            After sync, new/changed documents are automatically queued for RAG embedding.
+          </div>
+
+          <div class="page-actions" style="margin-top: 12px; display:flex; gap:10px; flex-wrap:wrap;">
+            <% if (connections.hubspot) { %>
+              <form method="post" action="/settings/sync/hubspot/contacts">
+                <button class="btn btn--ghost" type="submit">Sync HubSpot contacts</button>
+              </form>
+
+              <form method="post" action="/settings/sync/hubspot/notes">
+                <button class="btn btn--ghost" type="submit">Sync HubSpot notes</button>
+              </form>
+            <% } %>
+
+            <% if (connections.google) { %>
+              <form method="post" action="/settings/sync/gmail" onsubmit="return confirm('Queue Gmail sync (max 500, default window)?');">
+                <button class="btn btn--ghost" type="submit">Sync Gmail</button>
+              </form>
+
+              <form method="post" action="/settings/sync/calendar">
+                <button class="btn btn--ghost" type="submit">Sync Calendar</button>
+              </form>
+            <% } %>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <div class="card__title" style="margin-bottom:6px;">RAG indexing</div>
+          <div style="font-size: 14px; opacity: .9;">
+            Usually you don’t need this manually (sync queues embedding automatically).
+            This button is a maintenance tool to rebuild chunks and embed any missing chunks.
+          </div>
+
+          <div class="page-actions" style="margin-top: 12px; display:flex; gap:10px; flex-wrap:wrap;">
+            <form method="post" action="/settings/rag/rebuild-and-embed" onsubmit="return confirm('Queue RAG rebuild + embed?');">
+              <button class="btn btn--primary" type="submit">Rebuild + Embed</button>
+            </form>
+          </div>
+        </div>
       </div>
     </div>
   </main>

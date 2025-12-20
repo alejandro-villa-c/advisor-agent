@@ -5,10 +5,15 @@ import { google } from 'googleapis';
 import type { OAuth2Client } from 'google-auth-library';
 import type { GetTokenResponse } from 'google-auth-library/build/src/auth/oauth2client';
 import { AuthService } from './auth.service';
+import { PgBossService } from '../../jobs/pgboss.service';
+import { CALENDAR_SYNC_EVENTS_JOB, GMAIL_SYNC_MESSAGES_JOB } from '../../jobs/job.constants';
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly pgBoss: PgBossService,
+  ) {}
 
   private getOAuthClient(): OAuth2Client {
     const baseUrl = process.env.APP_BASE_URL;
@@ -20,8 +25,6 @@ export class AuthController {
     if (!clientSecret) throw new Error('GOOGLE_CLIENT_SECRET is not set');
 
     const redirectUri = `${baseUrl}/auth/google/callback`;
-
-    // google.auth.OAuth2 is a constructor that returns an OAuth2Client
     return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
   }
 
@@ -33,16 +36,11 @@ export class AuthController {
     req.session.googleOauthState = state;
 
     const scopes: string[] = [
-      // Identity
       'openid',
       'email',
       'profile',
-
-      // Gmail read + send
       'https://www.googleapis.com/auth/gmail.readonly',
       'https://www.googleapis.com/auth/gmail.send',
-
-      // Calendar read/write
       'https://www.googleapis.com/auth/calendar',
     ];
 
@@ -84,15 +82,12 @@ export class AuthController {
       return;
     }
 
-    // Fetch profile
     const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
     const meResponse = await oauth2.userinfo.get();
 
     const email = meResponse.data.email ?? null;
     const name = meResponse.data.name ?? null;
     const avatarUrl = meResponse.data.picture ?? null;
-
-    // Stable Google ID is `id` in this endpoint
     const providerAccountId = meResponse.data.id ?? null;
 
     if (!email || !providerAccountId) {
@@ -118,6 +113,24 @@ export class AuthController {
     });
 
     req.session.userId = userId;
+
+    // Bootstrap sync (professional default): index last 90 days of Gmail + ±6 months calendar.
+    // These are idempotent (upserts), and the workers will only embed changed docs (after the updates below).
+    await this.pgBoss.client.send(GMAIL_SYNC_MESSAGES_JOB, {
+      userId,
+      mode: 'initial',
+      daysBack: 90,
+      maxMessages: 500,
+      maxPages: 10,
+    });
+
+    await this.pgBoss.client.send(CALENDAR_SYNC_EVENTS_JOB, {
+      userId,
+      calendarId: 'primary',
+      maxPages: 10,
+      daysPast: 180,
+      daysFuture: 180,
+    });
 
     res.redirect('/chat');
   }

@@ -14,6 +14,13 @@ export type HubspotNoteSummary = {
   timestamp: string | undefined; // hs_timestamp can be ISO or unix-ms
 };
 
+export type HubspotNoteWithContactSummary = {
+  id: string;
+  hubspotContactId: string | undefined;
+  body: string | undefined;
+  timestamp: string | undefined;
+};
+
 /**
  * Minimal, strict-ish HubSpot API wrapper.
  * All methods require userId so we can fetch a valid access token (refreshing if needed).
@@ -203,6 +210,67 @@ export class HubspotApiService {
       const lastName = (props ? readString(props, 'lastname') : null) ?? undefined;
 
       results.push({ id, email, firstName, lastName });
+    }
+
+    const paging = readRecord(data, 'paging');
+    const next = paging ? readRecord(paging, 'next') : null;
+    const nextAfter = (next ? readString(next, 'after') : null) ?? undefined;
+
+    return { results, nextAfter };
+  }
+
+  /**
+   * Paginated note listing used for ingestion.
+   * Pulls notes and tries to grab an associated contact id (if present).
+   */
+  async listNotesPage(
+    userId: number,
+    input: { limit?: number; after?: string | null },
+  ): Promise<{ results: HubspotNoteWithContactSummary[]; nextAfter: string | undefined }> {
+    const limit = clampInt(input.limit ?? 100, 1, 100);
+
+    const qs = new URLSearchParams({
+      limit: String(limit),
+      archived: 'false',
+      properties: 'hs_note_body,hs_timestamp',
+      associations: 'contact',
+    });
+
+    if (input.after) qs.set('after', input.after);
+
+    const data = await this.hubspotRequest(userId, 'GET', `/crm/v3/objects/notes?${qs.toString()}`);
+
+    const resultsRaw = readArray(data, 'results');
+    const results: HubspotNoteWithContactSummary[] = [];
+
+    for (const r of resultsRaw) {
+      const id = readString(r, 'id');
+      if (!id) continue;
+
+      const props = readRecord(r, 'properties');
+      const body = (props ? readString(props, 'hs_note_body') : null) ?? undefined;
+      const timestamp = (props ? readString(props, 'hs_timestamp') : null) ?? undefined;
+
+      const associations = readRecord(r, 'associations');
+      const contactsAssoc =
+        (associations ? readRecord(associations, 'contacts') : null) ??
+        (associations ? readRecord(associations, 'contact') : null);
+
+      const assocResults = contactsAssoc ? readArray(contactsAssoc, 'results') : [];
+
+      let hubspotContactId: string | undefined;
+      for (const ar of assocResults) {
+        const assocId =
+          readIdAsString(ar, 'id') ??
+          readIdAsString(ar, 'toObjectId') ??
+          readIdAsString(ar, 'toObjectIdStr');
+        if (assocId) {
+          hubspotContactId = assocId;
+          break;
+        }
+      }
+
+      results.push({ id, hubspotContactId, body, timestamp });
     }
 
     const paging = readRecord(data, 'paging');
