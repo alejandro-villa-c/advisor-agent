@@ -11,7 +11,7 @@
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",
-    "start:worker:dev": "ts-node -r tsconfig-paths/register src/worker.ts",
+    "start:worker:dev": "ts-node --files -r tsconfig-paths/register src/worker.ts",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
     "start:worker:prod": "node dist/src/worker.js",

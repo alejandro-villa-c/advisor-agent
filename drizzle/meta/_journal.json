@@ -15,6 +15,13 @@
       "when": 1766171089709,
       "tag": "0001_init_core_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1766187513452,
+      "tag": "0002_add_hubspot_mirror_and_rag_tables",
+      "breakpoints": true
     }
   ]
 }

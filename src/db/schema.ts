@@ -1,5 +1,6 @@
 import {
   boolean,
+  customType,
   index,
   integer,
   jsonb,
@@ -28,6 +29,44 @@ export const taskStatusEnum = pgEnum('task_status', [
 ]);
 
 export const taskStepKindEnum = pgEnum('task_step_kind', ['llm', 'tool', 'system']);
+
+/**
+ * RAG / Documents
+ */
+export const documentSourceEnum = pgEnum('document_source', [
+  'hubspot_contact',
+  'hubspot_note',
+  // Future:
+  // 'gmail_email',
+  // 'calendar_event',
+]);
+
+/**
+ * pgvector column type helper for Drizzle
+ * Stores vectors as pgvector's `vector(n)` type.
+ *
+ * NOTE: We set 1536 dims by default (common for many embedding models).
+ * If you later change embedding model dimensions, you’ll need a migration.
+ */
+export const vector = customType<{
+  data: number[];
+  driverData: string;
+  config: { dimensions: number };
+}>({
+  dataType: (config) => `vector(${config?.dimensions ?? 1536})`,
+  toDriver: (value) => {
+    // pgvector accepts strings like: '[0.1,0.2,0.3]'
+    return `[${value.join(',')}]`;
+  },
+  fromDriver: (value) => {
+    if (typeof value !== 'string') return [];
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) return [];
+    const inner = trimmed.slice(1, -1).trim();
+    if (!inner) return [];
+    return inner.split(',').map((x) => Number(x.trim()));
+  },
+});
 
 /**
  * USERS
@@ -263,5 +302,134 @@ export const taskSteps = pgTable(
   (t) => ({
     taskIdIdx: index('task_steps_task_id_idx').on(t.taskId),
     stepIndexUq: uniqueIndex('task_steps_task_id_step_index_uq').on(t.taskId, t.stepIndex),
+  }),
+);
+
+/**
+ * HUBSPOT CONTACTS (local mirror)
+ * This is the stable ingestion layer for HubSpot → RAG.
+ */
+export const hubspotContacts = pgTable(
+  'hubspot_contacts',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    hubspotContactId: text('hubspot_contact_id').notNull(),
+
+    email: text('email'),
+    firstName: text('first_name'),
+    lastName: text('last_name'),
+
+    raw: jsonb('raw'),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdIdx: index('hubspot_contacts_user_id_idx').on(t.userId),
+    emailIdx: index('hubspot_contacts_email_idx').on(t.email),
+    userContactUq: uniqueIndex('hubspot_contacts_user_contact_uq').on(t.userId, t.hubspotContactId),
+  }),
+);
+
+/**
+ * HUBSPOT NOTES (local mirror)
+ */
+export const hubspotNotes = pgTable(
+  'hubspot_notes',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    hubspotNoteId: text('hubspot_note_id').notNull(),
+    hubspotContactId: text('hubspot_contact_id').notNull(),
+
+    body: text('body'),
+    occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+
+    raw: jsonb('raw'),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdIdx: index('hubspot_notes_user_id_idx').on(t.userId),
+    contactIdx: index('hubspot_notes_user_contact_idx').on(t.userId, t.hubspotContactId),
+    userNoteUq: uniqueIndex('hubspot_notes_user_note_uq').on(t.userId, t.hubspotNoteId),
+  }),
+);
+
+/**
+ * DOCUMENTS
+ * Generic normalized text units that feed chunking + embeddings.
+ */
+export const documents = pgTable(
+  'documents',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    source: documentSourceEnum('source').notNull(),
+    sourceId: text('source_id').notNull(),
+
+    title: text('title'),
+    text: text('text').notNull(),
+
+    meta: jsonb('meta'),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdIdx: index('documents_user_id_idx').on(t.userId),
+    sourceIdx: index('documents_source_idx').on(t.source),
+    userSourceUq: uniqueIndex('documents_user_source_uq').on(t.userId, t.source, t.sourceId),
+  }),
+);
+
+/**
+ * DOCUMENT CHUNKS
+ * Chunked text + embeddings for similarity search.
+ *
+ * Embedding is nullable for now; we’ll backfill via a worker job later.
+ */
+export const documentChunks = pgTable(
+  'document_chunks',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    documentId: integer('document_id')
+      .notNull()
+      .references(() => documents.id, { onDelete: 'cascade' }),
+
+    chunkIndex: integer('chunk_index').notNull(),
+    text: text('text').notNull(),
+
+    embedding: vector('embedding', { dimensions: 1536 }),
+
+    embeddingModel: text('embedding_model'),
+
+    meta: jsonb('meta'),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdIdx: index('document_chunks_user_id_idx').on(t.userId),
+    documentIdIdx: index('document_chunks_document_id_idx').on(t.documentId),
+    docChunkUq: uniqueIndex('document_chunks_document_chunk_uq').on(t.documentId, t.chunkIndex),
   }),
 );

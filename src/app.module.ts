@@ -4,6 +4,7 @@ import { DbModule } from './db/db.module';
 import { WebModule } from './modules/web/web.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { HubspotModule } from './modules/integrations/hubspot/hubspot.module';
+import { JobsModule } from './jobs/jobs.module';
 
 @Module({
   imports: [
@@ -12,6 +13,7 @@ import { HubspotModule } from './modules/integrations/hubspot/hubspot.module';
     WebModule,
     AuthModule,
     HubspotModule,
+    JobsModule,
   ],
 })
 export class AppModule {}

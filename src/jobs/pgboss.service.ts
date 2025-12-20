@@ -25,6 +25,13 @@ export class PgBossService implements OnModuleInit, OnModuleDestroy {
       // optional: schema: 'pgboss',
     });
 
+    // Prevent "Unhandled error" crashes when pg-boss emits an 'error' event
+    this.boss.on('error', (err) => {
+      // Keep it simple; Nest Logger isn't necessary here
+
+      console.error('[pg-boss] error event:', err);
+    });
+
     // Creates/updates pg-boss tables automatically as needed
     await this.boss.start();
   }
