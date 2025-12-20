@@ -5,6 +5,7 @@ import { WebModule } from './modules/web/web.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { HubspotModule } from './modules/integrations/hubspot/hubspot.module';
 import { JobsModule } from './jobs/jobs.module';
+import { RagModule } from './modules/rag/rag.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { JobsModule } from './jobs/jobs.module';
     AuthModule,
     HubspotModule,
     JobsModule,
+    RagModule,
   ],
 })
 export class AppModule {}

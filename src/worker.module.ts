@@ -2,10 +2,12 @@ import { Module } from '@nestjs/common';
 import { DbModule } from './db/db.module';
 import { JobsModule } from './jobs/jobs.module';
 import { HubspotModule } from './modules/integrations/hubspot/hubspot.module';
+import { RagModule } from './modules/rag/rag.module';
 import { HubspotImportWorker } from './worker/hubspot-import.worker';
+import { RagEmbedWorker } from './worker/rag-embed.worker';
 
 @Module({
-  imports: [DbModule, JobsModule, HubspotModule],
-  providers: [HubspotImportWorker],
+  imports: [DbModule, JobsModule, HubspotModule, RagModule],
+  providers: [HubspotImportWorker, RagEmbedWorker],
 })
 export class WorkerModule {}
