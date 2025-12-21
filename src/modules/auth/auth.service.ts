@@ -45,7 +45,7 @@ export class AuthService {
     } else {
       userId = existingUsers[0].id;
 
-      // Keep profile fresh (optional but nice)
+      // Keep profile fresh
       await db
         .update(users)
         .set({

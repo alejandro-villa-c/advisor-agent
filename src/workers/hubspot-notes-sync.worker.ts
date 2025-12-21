@@ -57,6 +57,7 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
     let page = 0;
 
     const changedSourceIds: string[] = [];
+    const processedSourceIds: string[] = [];
 
     while (true) {
       page += 1;
@@ -73,6 +74,9 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
       );
 
       if (results.length > 0) {
+        const ids = results.map((r) => r.id).filter(Boolean);
+        processedSourceIds.push(...ids);
+
         await this.upsertNotes(userId, results);
 
         const pageChanged = await this.upsertNoteDocumentsIfChanged(userId, results);
@@ -88,26 +92,26 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
       }
     }
 
-    // 1) Normal behavior: embed docs that changed this run
-    await this.enqueueEmbedForChangedDocs({
+    const uniqueChangedSourceIds = Array.from(new Set(changedSourceIds)).filter(Boolean);
+
+    // Repair behavior: include docs missing chunkIndex=0 even if unchanged
+    const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'hubspot_note',
-      changedSourceIds,
+      sourceIds: processedSourceIds,
     });
 
-    // 2) “repair mode” — if any hubspot_note docs exist without chunks, force-queue embedding
-    // This solves the "notes exist, but have 0 chunks forever" deadlock.
-    const missingChunkDocIds = await this.findHubspotNoteDocumentIdsMissingChunks({ userId });
-
-    if (missingChunkDocIds.length > 0) {
-      await this.enqueueEmbedForDocumentIds({ userId, documentIds: missingChunkDocIds });
-
-      this.logger.warn(
-        `[${HUBSPOT_SYNC_NOTES_JOB}] repair: queued embed for hubspot_note docs missing chunks count=${missingChunkDocIds.length}`,
-      );
-    }
-
-    const uniqueChangedSourceIds = Array.from(new Set(changedSourceIds)).filter(Boolean);
+    await this.enqueueEmbedForDocumentIds({
+      userId,
+      documentIds: [
+        ...(await this.loadDocumentIdsForSourceIds({
+          userId,
+          source: 'hubspot_note',
+          sourceIds: uniqueChangedSourceIds,
+        })),
+        ...repairDocIds,
+      ],
+    });
 
     await this.dbService.db
       .insert(integrationStates)
@@ -119,7 +123,7 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
           totalImported: total,
           page,
           changedDocuments: uniqueChangedSourceIds.length,
-          missingChunkDocumentsQueued: missingChunkDocIds.length,
+          missingChunkDocumentsQueued: repairDocIds.length,
         },
       })
       .onConflictDoUpdate({
@@ -131,7 +135,7 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
       });
 
     this.logger.log(
-      `[${HUBSPOT_SYNC_NOTES_JOB}] done job=${String(job.id)} totalNotes=${total} changedDocs=${uniqueChangedSourceIds.length} missingChunkDocsQueued=${missingChunkDocIds.length}`,
+      `[${HUBSPOT_SYNC_NOTES_JOB}] done job=${String(job.id)} totalNotes=${total} changedDocs=${uniqueChangedSourceIds.length} repairedDocs=${repairDocIds.length}`,
     );
   }
 
@@ -162,19 +166,21 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
       };
     });
 
-    await this.dbService.db
-      .insert(hubspotNotes)
-      .values(rows)
-      .onConflictDoUpdate({
-        target: [hubspotNotes.userId, hubspotNotes.hubspotNoteId],
-        set: {
-          hubspotContactId: sql`excluded.hubspot_contact_id`,
-          body: sql`excluded.body`,
-          occurredAt: sql`excluded.occurred_at`,
-          raw: sql`excluded.raw`,
-          updatedAt: sql`now()`,
-        },
-      });
+    for (const batch of chunkArray(rows, 500)) {
+      await this.dbService.db
+        .insert(hubspotNotes)
+        .values(batch)
+        .onConflictDoUpdate({
+          target: [hubspotNotes.userId, hubspotNotes.hubspotNoteId],
+          set: {
+            hubspotContactId: sql`excluded.hubspot_contact_id`,
+            body: sql`excluded.body`,
+            occurredAt: sql`excluded.occurred_at`,
+            raw: sql`excluded.raw`,
+            updatedAt: sql`now()`,
+          },
+        });
+    }
   }
 
   private async upsertNoteDocumentsIfChanged(
@@ -194,13 +200,19 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
     });
 
     const changedSourceIds: string[] = [];
+    const changedRows: Array<{
+      userId: number;
+      source: 'hubspot_note';
+      sourceId: string;
+      title: string;
+      text: string;
+      meta: Record<string, unknown>;
+    }> = [];
 
     for (const n of notes) {
       const contactId = (n.hubspotContactId ?? 'unknown').trim() || 'unknown';
-
       const title = `HubSpot Note (${contactId})`;
 
-      // IMPORTANT: only include time fields if HubSpot provided a stable timestamp
       const stableIso = toOccurredAtIsoForDoc(n.timestamp);
 
       const textValue = [
@@ -223,30 +235,34 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
       if (!unchanged) {
         changedSourceIds.push(n.id);
 
-        await this.dbService.db
-          .insert(documents)
-          .values({
-            userId,
-            source: 'hubspot_note',
-            sourceId: n.id,
-            title,
-            text: docText,
-            meta: {
-              hubspotNoteId: n.id,
-              hubspotContactId: n.hubspotContactId ?? null,
-              timestamp: n.timestamp ?? null,
-            },
-          })
-          .onConflictDoUpdate({
-            target: [documents.userId, documents.source, documents.sourceId],
-            set: {
-              title: sql`excluded.title`,
-              text: sql`excluded.text`,
-              meta: sql`excluded.meta`,
-              updatedAt: sql`now()`,
-            },
-          });
+        changedRows.push({
+          userId,
+          source: 'hubspot_note',
+          sourceId: n.id,
+          title,
+          text: docText,
+          meta: {
+            hubspotNoteId: n.id,
+            hubspotContactId: n.hubspotContactId ?? null,
+            timestamp: n.timestamp ?? null,
+          },
+        });
       }
+    }
+
+    for (const batch of chunkArray(changedRows, 500)) {
+      await this.dbService.db
+        .insert(documents)
+        .values(batch)
+        .onConflictDoUpdate({
+          target: [documents.userId, documents.source, documents.sourceId],
+          set: {
+            title: sql`excluded.title`,
+            text: sql`excluded.text`,
+            meta: sql`excluded.meta`,
+            updatedAt: sql`now()`,
+          },
+        });
     }
 
     return changedSourceIds;
@@ -282,17 +298,17 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
     return map;
   }
 
-  private async enqueueEmbedForChangedDocs(input: {
+  private async loadDocumentIdsForSourceIds(input: {
     userId: number;
     source: 'hubspot_note' | 'hubspot_contact' | 'gmail_email' | 'calendar_event';
-    changedSourceIds: string[];
-  }): Promise<void> {
-    const uniqueChanged = Array.from(new Set(input.changedSourceIds)).filter(Boolean);
-    if (uniqueChanged.length === 0) return;
+    sourceIds: string[];
+  }): Promise<number[]> {
+    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
+    if (ids.length === 0) return [];
 
-    const documentIds: number[] = [];
+    const out: number[] = [];
 
-    for (const chunk of chunkArray(uniqueChanged, 1000)) {
+    for (const chunk of chunkArray(ids, 1000)) {
       const rows = await this.dbService.db
         .select({ id: documents.id })
         .from(documents)
@@ -304,12 +320,47 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
           ),
         );
 
-      for (const r of rows) documentIds.push(r.id);
+      for (const r of rows) out.push(r.id);
     }
 
-    if (documentIds.length === 0) return;
+    return out;
+  }
 
-    await this.enqueueEmbedForDocumentIds({ userId: input.userId, documentIds });
+  private async loadDocumentIdsMissingChunksForSourceIds(input: {
+    userId: number;
+    source: 'hubspot_note' | 'hubspot_contact' | 'gmail_email' | 'calendar_event';
+    sourceIds: string[];
+  }): Promise<number[]> {
+    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
+    if (ids.length === 0) return [];
+
+    const out: number[] = [];
+
+    for (const chunk of chunkArray(ids, 1000)) {
+      const rows = await this.dbService.db
+        .select({ id: documents.id })
+        .from(documents)
+        .leftJoin(
+          documentChunks,
+          and(
+            eq(documentChunks.userId, documents.userId),
+            eq(documentChunks.documentId, documents.id),
+            eq(documentChunks.chunkIndex, 0),
+          ),
+        )
+        .where(
+          and(
+            eq(documents.userId, input.userId),
+            eq(documents.source, input.source),
+            inArray(documents.sourceId, chunk),
+            sql`${documentChunks.id} IS NULL`,
+          ),
+        );
+
+      for (const r of rows) out.push(r.id);
+    }
+
+    return out;
   }
 
   private async enqueueEmbedForDocumentIds(input: {
@@ -322,47 +373,16 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
 
     if (unique.length === 0) return;
 
-    // pg-boss payload size safety
-    for (const chunk of chunkArray(unique, 1000)) {
+    for (const batch of chunkArray(unique, 1000)) {
       await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
         userId: input.userId,
-        documentIds: chunk,
+        documentIds: batch,
       });
     }
-  }
-
-  private async findHubspotNoteDocumentIdsMissingChunks(input: {
-    userId: number;
-  }): Promise<number[]> {
-    // We consider a document "chunked" if it has chunkIndex=0.
-    // If chunkIndex=0 is missing, the doc has no chunks (or chunking failed).
-    const rows = await this.dbService.db
-      .select({ id: documents.id })
-      .from(documents)
-      .leftJoin(
-        documentChunks,
-        and(
-          eq(documentChunks.userId, input.userId),
-          eq(documentChunks.documentId, documents.id),
-          eq(documentChunks.chunkIndex, 0),
-        ),
-      )
-      .where(
-        and(
-          eq(documents.userId, input.userId),
-          eq(documents.source, 'hubspot_note'),
-          sql`${documentChunks.id} IS NULL`,
-        ),
-      )
-      .limit(5000);
-
-    return rows.map((r) => r.id);
   }
 }
 
 function toOccurredAtForDb(ts: string | undefined): Date {
-  // If HubSpot gives nothing, we still need *something* for the table column.
-  // But we must NOT use "now()" in the *document text* (that would cause re-embed each run).
   if (!ts) return new Date(0);
 
   const asNum = Number(ts);
@@ -393,8 +413,10 @@ function capText(s: string, maxLen: number): string {
 }
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
-  if (arr.length <= size) return [arr];
+  const a = arr ?? [];
+  if (a.length === 0) return [];
+  if (a.length <= size) return [a];
   const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  for (let i = 0; i < a.length; i += size) out.push(a.slice(i, i + size));
   return out;
 }

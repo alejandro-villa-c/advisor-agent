@@ -12,16 +12,37 @@ import {
 
 export type GmailSyncJobData = {
   userId: number;
-  mode?: 'initial' | 'incremental';
+
+  /**
+   * incremental: recent sync, uses after:lastSyncedAt (or newer_than:30d)
+   * initial: bounded historical sync (defaults to newer_than:90d)
+   * backfill: NO time filter; paginates through the mailbox using pageToken
+   */
+  mode?: 'initial' | 'incremental' | 'backfill';
+
   daysBack?: number;
   q?: string;
-  maxPages?: number; // default 10
-  maxMessages?: number; // default 500
+
+  maxPages?: number; // default varies by mode
+  maxMessages?: number; // default varies by mode
+
+  /**
+   * For backfill paging:
+   * - pass the last stored token to continue where you left off
+   * - worker writes next token to integration state
+   */
+  pageToken?: string | null;
 };
 
 type PgBossJob<T> = {
   id: string | number;
   data: T;
+};
+
+type BackfillState = {
+  done: boolean;
+  nextPageToken: string | null;
+  lastRunAt: string | null;
 };
 
 @Injectable()
@@ -70,11 +91,16 @@ export class GmailSyncWorker implements OnModuleInit {
     const userId = job.data.userId;
 
     const mode = job.data.mode ?? 'incremental';
-    const maxPages = clampInt(job.data.maxPages ?? 10, 1, 50);
-    const maxMessages = clampInt(job.data.maxMessages ?? 500, 1, 5000);
+
+    // Aggressive defaults (big speed-up)
+    const maxPagesDefault = mode === 'backfill' ? 25 : mode === 'initial' ? 25 : 10;
+    const maxMessagesDefault = mode === 'backfill' ? 4000 : mode === 'initial' ? 2000 : 500;
+
+    const maxPages = clampInt(job.data.maxPages ?? maxPagesDefault, 1, 50);
+    const maxMessages = clampInt(job.data.maxMessages ?? maxMessagesDefault, 1, 20000);
 
     this.logger.log(
-      `[${GMAIL_SYNC_MESSAGES_JOB}] start job=${String(job.id)} userId=${userId} mode=${mode}`,
+      `[${GMAIL_SYNC_MESSAGES_JOB}] start job=${String(job.id)} userId=${userId} mode=${mode} maxPages=${maxPages} maxMessages=${maxMessages}`,
     );
 
     const state = await this.getIntegrationState(userId);
@@ -94,12 +120,17 @@ export class GmailSyncWorker implements OnModuleInit {
       daysBack: job.data.daysBack,
     });
 
-    this.logger.log(`[${GMAIL_SYNC_MESSAGES_JOB}] using query="${query}"`);
+    const startPageToken = typeof job.data.pageToken === 'string' ? job.data.pageToken : null;
 
-    let pageToken: string | null = null;
+    this.logger.log(
+      `[${GMAIL_SYNC_MESSAGES_JOB}] using query="${query}" pageToken=${startPageToken ? 'YES' : 'NO'}`,
+    );
+
+    let pageToken: string | null = startPageToken;
     let pages = 0;
 
     const messageIds: string[] = [];
+    let lastNextPageToken: string | undefined;
 
     while (pages < maxPages && messageIds.length < maxMessages) {
       pages += 1;
@@ -114,8 +145,10 @@ export class GmailSyncWorker implements OnModuleInit {
 
       messageIds.push(...page.ids);
 
+      lastNextPageToken = page.nextPageToken;
+
       this.logger.log(
-        `[${GMAIL_SYNC_MESSAGES_JOB}] page=${pages} fetchedIds=${page.ids.length} totalIds=${messageIds.length}`,
+        `[${GMAIL_SYNC_MESSAGES_JOB}] page=${pages} fetchedIds=${page.ids.length} totalIds=${messageIds.length} nextToken=${page.nextPageToken ? 'YES' : 'NO'}`,
       );
 
       if (!page.nextPageToken) break;
@@ -124,31 +157,33 @@ export class GmailSyncWorker implements OnModuleInit {
 
     const uniqueIds = Array.from(new Set(messageIds)).slice(0, maxMessages);
 
+    // Fetch existing docs once (for changed detection)
     const existingBySourceId = await this.loadExistingDocsMap({
       userId,
       source: 'gmail_email',
       sourceIds: uniqueIds,
     });
 
-    const changedSourceIds: string[] = [];
     const touchedThreadIds = new Set<string>();
 
-    let processed = 0;
-
-    for (const id of uniqueIds) {
+    // Parallelize Gmail message fetch for speed (major win)
+    const concurrency = mode === 'backfill' ? 12 : 8;
+    const messages = await mapWithConcurrency(uniqueIds, concurrency, async (id) => {
       const msg = await this.gmailApi.getMessage(userId, id);
-
       if (msg.threadId) touchedThreadIds.add(msg.threadId);
+      return msg;
+    });
 
-      const sentAt =
-        typeof msg.internalDateMs === 'number' && Number.isFinite(msg.internalDateMs)
-          ? new Date(msg.internalDateMs)
-          : null;
+    // Batch upsert mirror table
+    let mirrorInserted = 0;
+    for (const batch of chunkArray(messages, 500)) {
+      const rows = batch.map((msg) => {
+        const sentAt =
+          typeof msg.internalDateMs === 'number' && Number.isFinite(msg.internalDateMs)
+            ? new Date(msg.internalDateMs)
+            : null;
 
-      // Mirror table (always upsert)
-      await this.dbService.db
-        .insert(gmailMessages)
-        .values({
+        return {
           userId,
           gmailMessageId: msg.id,
           gmailThreadId: msg.threadId ?? null,
@@ -168,7 +203,12 @@ export class GmailSyncWorker implements OnModuleInit {
             bodyText: msg.bodyText ?? null,
             bodyHtml: msg.bodyHtml ?? null,
           },
-        })
+        };
+      });
+
+      await this.dbService.db
+        .insert(gmailMessages)
+        .values(rows)
         .onConflictDoUpdate({
           target: [gmailMessages.userId, gmailMessages.gmailMessageId],
           set: {
@@ -184,6 +224,27 @@ export class GmailSyncWorker implements OnModuleInit {
             updatedAt: sql`now()`,
           },
         });
+
+      mirrorInserted += rows.length;
+    }
+
+    const changedSourceIds: string[] = [];
+    const changedDocRows: Array<{
+      userId: number;
+      source: 'gmail_email';
+      sourceId: string;
+      title: string;
+      text: string;
+      meta: Record<string, unknown>;
+    }> = [];
+
+    let processed = 0;
+
+    for (const msg of messages) {
+      const sentAt =
+        typeof msg.internalDateMs === 'number' && Number.isFinite(msg.internalDateMs)
+          ? new Date(msg.internalDateMs)
+          : null;
 
       const docTitle = msg.headers.subject?.trim()
         ? `Email: ${msg.headers.subject.trim()}`
@@ -208,55 +269,74 @@ export class GmailSyncWorker implements OnModuleInit {
 
       const docText = capText(docTextRaw || docTitle, 40_000);
 
-      // Only upsert documents if changed
       const existing = existingBySourceId.get(msg.id);
       const unchanged = existing && existing.title === docTitle && existing.text === docText;
 
       if (!unchanged) {
         changedSourceIds.push(msg.id);
-
-        await this.dbService.db
-          .insert(documents)
-          .values({
-            userId,
-            source: 'gmail_email',
-            sourceId: msg.id,
-            title: docTitle,
-            text: docText,
-            meta: {
-              gmailMessageId: msg.id,
-              gmailThreadId: msg.threadId ?? null,
-              sentAt: sentAt ? sentAt.toISOString() : null,
-              from: msg.headers.from ?? null,
-              to: msg.headers.to ?? null,
-              subject: msg.headers.subject ?? null,
-            },
-          })
-          .onConflictDoUpdate({
-            target: [documents.userId, documents.source, documents.sourceId],
-            set: {
-              title: sql`excluded.title`,
-              text: sql`excluded.text`,
-              meta: sql`excluded.meta`,
-              updatedAt: sql`now()`,
-            },
-          });
+        changedDocRows.push({
+          userId,
+          source: 'gmail_email',
+          sourceId: msg.id,
+          title: docTitle,
+          text: docText,
+          meta: {
+            gmailMessageId: msg.id,
+            gmailThreadId: msg.threadId ?? null,
+            sentAt: sentAt ? sentAt.toISOString() : null,
+            from: msg.headers.from ?? null,
+            to: msg.headers.to ?? null,
+            subject: msg.headers.subject ?? null,
+          },
+        });
       }
 
       processed += 1;
-
-      if (processed % 25 === 0) {
-        this.logger.log(`[${GMAIL_SYNC_MESSAGES_JOB}] processed=${processed}/${uniqueIds.length}`);
+      if (processed % 250 === 0) {
+        this.logger.log(
+          `[${GMAIL_SYNC_MESSAGES_JOB}] processed=${processed}/${messages.length} mirrorUpserts=${mirrorInserted}`,
+        );
       }
     }
 
+    // Batch upsert changed documents
+    for (const batch of chunkArray(changedDocRows, 500)) {
+      await this.dbService.db
+        .insert(documents)
+        .values(batch)
+        .onConflictDoUpdate({
+          target: [documents.userId, documents.source, documents.sourceId],
+          set: {
+            title: sql`excluded.title`,
+            text: sql`excluded.text`,
+            meta: sql`excluded.meta`,
+            updatedAt: sql`now()`,
+          },
+        });
+    }
+
     const nowIso = new Date().toISOString();
+
+    // Backfill progress (only meaningful in backfill mode)
+    const backfillState: BackfillState | null =
+      mode === 'backfill'
+        ? {
+            done: !lastNextPageToken,
+            nextPageToken: lastNextPageToken ?? null,
+            lastRunAt: nowIso,
+          }
+        : null;
 
     await this.setIntegrationState(userId, {
       ...(state ?? {}),
       baseQuery: baseQueryFromState,
       lastSyncedAt: nowIso,
       lastQueryUsed: query,
+      ...(backfillState
+        ? {
+            backfill: backfillState,
+          }
+        : {}),
       lastRun: {
         at: nowIso,
         mode,
@@ -264,10 +344,13 @@ export class GmailSyncWorker implements OnModuleInit {
         idsFetched: uniqueIds.length,
         processed,
         changedDocuments: Array.from(new Set(changedSourceIds)).length,
+        mirrorUpserts: mirrorInserted,
+        backfillNextPageToken: backfillState?.nextPageToken ?? null,
+        backfillDone: backfillState?.done ?? null,
       },
     });
 
-    // Repair behavior: include docs that are missing chunkIndex=0, even if unchanged
+    // Repair behavior: include docs missing chunkIndex=0 even if unchanged
     const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'gmail_email',
@@ -286,7 +369,7 @@ export class GmailSyncWorker implements OnModuleInit {
       ],
     });
 
-    // ✅ "gmailsyncworker query thing": wake agent waiting tasks for touched threads
+    // Wake agent waiting tasks for touched threads
     const threads = Array.from(touchedThreadIds).filter(Boolean);
     for (const batch of chunkArray(threads, 200)) {
       await this.pgBossService.client.send(AGENT_REACT_JOB, {
@@ -296,7 +379,7 @@ export class GmailSyncWorker implements OnModuleInit {
     }
 
     this.logger.log(
-      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} touchedThreads=${threads.length}`,
+      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} mode=${mode} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} touchedThreads=${threads.length} backfillDone=${backfillState?.done ?? 'n/a'}`,
     );
   }
 
@@ -399,7 +482,10 @@ export class GmailSyncWorker implements OnModuleInit {
     userId: number;
     documentIds: number[];
   }): Promise<void> {
-    const unique = Array.from(new Set(input.documentIds)).filter((x) => Number.isFinite(x));
+    const unique = Array.from(new Set(input.documentIds))
+      .map((x) => Number(x))
+      .filter((x) => Number.isFinite(x) && x > 0);
+
     if (unique.length === 0) return;
 
     for (const batch of chunkArray(unique, 1000)) {
@@ -439,7 +525,7 @@ export class GmailSyncWorker implements OnModuleInit {
 }
 
 function buildGmailQuery(input: {
-  mode: 'initial' | 'incremental';
+  mode: 'initial' | 'incremental' | 'backfill';
   overrideQuery?: string;
   baseQuery?: string;
   lastSyncedAt?: string;
@@ -450,13 +536,17 @@ function buildGmailQuery(input: {
     input.baseQuery?.trim() ||
     'in:inbox -in:spam -in:trash -in:chats';
 
+  // backfill explicitly means "no time filter"
+  if (input.mode === 'backfill') return base;
+
   if (hasTimeFilter(base)) return base;
 
   if (input.mode === 'initial') {
-    const daysBack = clampInt(input.daysBack ?? 90, 1, 3650);
+    const daysBack = clampInt(input.daysBack ?? 90, 1, 36500);
     return `${base} newer_than:${daysBack}d`;
   }
 
+  // incremental
   if (input.lastSyncedAt) {
     const lastMs = Date.parse(input.lastSyncedAt);
     if (Number.isFinite(lastMs)) {
@@ -506,4 +596,29 @@ function hasTimeFilter(q: string): boolean {
     /\bafter:\S+/i.test(q) ||
     /\bbefore:\S+/i.test(q)
   );
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const list = items ?? [];
+  if (list.length === 0) return [];
+
+  const out = new Array<R>(list.length);
+
+  let index = 0;
+
+  const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
+    while (true) {
+      const i = index;
+      index += 1;
+      if (i >= list.length) break;
+      out[i] = await fn(list[i]);
+    }
+  });
+
+  await Promise.all(workers);
+  return out;
 }

@@ -1,3 +1,25 @@
+<%
+  // Format ISO timestamps coming from integrationStates.state.lastSyncedAt
+  // Displayed in Dominican Republic time.
+  const TIME_ZONE = 'America/Santo_Domingo';
+
+  function formatSyncDate(value) {
+    if (!value || typeof value !== 'string') return '—';
+
+    const ms = Date.parse(value);
+    if (!Number.isFinite(ms)) return value; // fallback if not parseable
+
+    const d = new Date(ms);
+
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone: TIME_ZONE,
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      // hour12: false, // uncomment if you prefer 24h
+    }).format(d);
+  }
+%>
+
 <div class="app-shell">
   <%- include('../partials/sidebar', { active: 'settings' }) %>
 
@@ -50,7 +72,7 @@
           <div class="card" style="margin-top:16px;">
             <div class="card__title" style="margin-bottom:6px;">HubSpot Debug</div>
             <div style="font-size: 14px; opacity: .9;">
-              <div><strong>Hub:</strong> <%= hubspotDebug.hubDomain %> (ID: <%= hubspotDebug.hubId %>)</div>
+              <div><strong>Hub:</strong> <%= hubspotDebug.hubDomain %></div>
               <div><strong>User:</strong> <%= hubspotDebug.hubUserEmail %></div>
               <div><strong>Expires in:</strong> <%= hubspotDebug.expiresIn %> seconds</div>
               <div style="margin-top:6px;"><strong>Scopes:</strong> <%= hubspotDebug.scopes.join(', ') %></div>
@@ -69,29 +91,60 @@
               <div class="status-chip">
                 <span class="status-chip__label">Gmail last sync</span>
                 <span class="status-chip__value">
-                  <%= (syncState && syncState.gmail && syncState.gmail.lastSyncedAt) ? syncState.gmail.lastSyncedAt : '—' %>
+                  <%= formatSyncDate(syncState && syncState.gmail && syncState.gmail.lastSyncedAt) %>
                 </span>
               </div>
 
               <div class="status-chip">
                 <span class="status-chip__label">Calendar last sync</span>
                 <span class="status-chip__value">
-                  <%= (syncState && syncState.calendar && syncState.calendar.lastSyncedAt) ? syncState.calendar.lastSyncedAt : '—' %>
+                  <%= formatSyncDate(syncState && syncState.calendar && syncState.calendar.lastSyncedAt) %>
                 </span>
               </div>
 
               <div class="status-chip">
                 <span class="status-chip__label">HubSpot contacts last sync</span>
                 <span class="status-chip__value">
-                  <%= (syncState && syncState.hubspotContacts && syncState.hubspotContacts.lastSyncedAt) ? syncState.hubspotContacts.lastSyncedAt : '—' %>
+                  <%= formatSyncDate(syncState && syncState.hubspotContacts && syncState.hubspotContacts.lastSyncedAt) %>
                 </span>
               </div>
 
               <div class="status-chip">
                 <span class="status-chip__label">HubSpot notes last sync</span>
                 <span class="status-chip__value">
-                  <%= (syncState && syncState.hubspotNotes && syncState.hubspotNotes.lastSyncedAt) ? syncState.hubspotNotes.lastSyncedAt : '—' %>
+                  <%= formatSyncDate(syncState && syncState.hubspotNotes && syncState.hubspotNotes.lastSyncedAt) %>
                 </span>
+              </div>
+
+              <!-- NEW: ingested counts -->
+              <div class="status-chip">
+                <span class="status-chip__label">Gmail ingested</span>
+                <span class="status-chip__value"><%= counts ? counts.gmailMessages : 0 %> emails</span>
+              </div>
+
+              <div class="status-chip">
+                <span class="status-chip__label">Calendar ingested</span>
+                <span class="status-chip__value"><%= counts ? counts.calendarEvents : 0 %> events</span>
+              </div>
+
+              <div class="status-chip">
+                <span class="status-chip__label">HubSpot contacts ingested</span>
+                <span class="status-chip__value"><%= counts ? counts.hubspotContacts : 0 %> contacts</span>
+              </div>
+
+              <div class="status-chip">
+                <span class="status-chip__label">HubSpot notes ingested</span>
+                <span class="status-chip__value"><%= counts ? counts.hubspotNotes : 0 %> notes</span>
+              </div>
+
+              <div class="status-chip">
+                <span class="status-chip__label">RAG documents</span>
+                <span class="status-chip__value"><%= counts ? counts.documents : 0 %></span>
+              </div>
+
+              <div class="status-chip">
+                <span class="status-chip__label">RAG chunks</span>
+                <span class="status-chip__value"><%= counts ? counts.documentChunks : 0 %></span>
               </div>
             </div>
 
@@ -120,8 +173,8 @@
             <% } %>
 
             <% if (connections.google) { %>
-              <form method="post" action="/settings/sync/gmail" onsubmit="return confirm('Queue Gmail sync (max 500, default window)?');">
-                <button class="btn btn--ghost" type="submit">Sync Gmail</button>
+              <form method="post" action="/settings/sync/gmail" onsubmit="return confirm('Queue Gmail backfill? This will ingest thousands of emails.');">
+                <button class="btn btn--ghost" type="submit">Sync Gmail (Backfill)</button>
               </form>
 
               <form method="post" action="/settings/sync/calendar">

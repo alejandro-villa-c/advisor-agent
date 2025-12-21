@@ -10,14 +10,13 @@ export class SyncSchedulerService implements OnModuleInit {
 
   async onModuleInit(): Promise<void> {
     try {
-      // Sync scheduler (existing)
-      await this.pgBoss.client.schedule(SYNC_TICK_JOB, '*/10 * * * *', {});
-      this.logger.log(`Scheduled ${SYNC_TICK_JOB} every 10 minutes`);
+      await this.pgBoss.client.schedule(SYNC_TICK_JOB, '*/3 * * * *', {});
+      this.logger.log(`Scheduled ${SYNC_TICK_JOB} every 3 minutes`);
 
       await this.pgBoss.client.send(SYNC_TICK_JOB, { reason: 'startup' });
       this.logger.log(`Enqueued ${SYNC_TICK_JOB} immediately (startup)`);
 
-      // Agent tick scheduler (new)
+      // Agent tick scheduler
       await this.pgBoss.client.schedule(AGENT_TICK_JOB, '*/2 * * * *', {});
       this.logger.log(`Scheduled ${AGENT_TICK_JOB} every 2 minutes`);
 

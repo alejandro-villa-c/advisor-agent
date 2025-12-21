@@ -17,6 +17,18 @@ type PgBossJob<T> = {
   data: T;
 };
 
+type GmailBackfill = {
+  done: boolean;
+  nextPageToken: string | null;
+  lastRunAt: Date | null;
+};
+
+type PgBossSend = (
+  name: string,
+  data?: unknown,
+  options?: Record<string, unknown>,
+) => Promise<unknown>;
+
 @Injectable()
 export class SyncTickWorker implements OnModuleInit {
   private readonly logger = new Logger(SyncTickWorker.name);
@@ -36,6 +48,15 @@ export class SyncTickWorker implements OnModuleInit {
     );
 
     this.logger.log(`Registered worker: ${SYNC_TICK_JOB}`);
+  }
+
+  private async enqueueJob(
+    name: string,
+    data: unknown,
+    options?: Record<string, unknown>,
+  ): Promise<void> {
+    const send = getPgBossSend(this.pgBoss.client as unknown);
+    await send(name, data, options);
   }
 
   private async handleOne(job: PgBossJob<Record<string, unknown>>): Promise<void> {
@@ -60,10 +81,7 @@ export class SyncTickWorker implements OnModuleInit {
     const userIds = Array.from(byUser.keys());
     if (userIds.length === 0) {
       this.logger.log(`[${SYNC_TICK_JOB}] no connected users`);
-
-      // Still tick agent (waiting tasks can exist even if no integrations are connected now)
-      await this.pgBoss.client.send(AGENT_TICK_JOB, { reason: 'sync_tick_no_users' });
-
+      await this.enqueueJob(AGENT_TICK_JOB, { reason: 'sync_tick_no_users' });
       return;
     }
 
@@ -76,13 +94,18 @@ export class SyncTickWorker implements OnModuleInit {
       .from(integrationStates)
       .where(inArray(integrationStates.userId, userIds));
 
-    const lastSyncedAtByUserIntegration = new Map<string, Date>();
+    const stateByKey = new Map<string, unknown>();
+    const lastSyncedAtByKey = new Map<string, Date>();
 
     for (const row of stateRows) {
       const userId = Number(row.userId);
       const integration = String(row.integration);
-      const lastSyncedAt = readLastSyncedAt(row.state);
-      if (lastSyncedAt) lastSyncedAtByUserIntegration.set(`${userId}:${integration}`, lastSyncedAt);
+
+      const stateUnknown: unknown = row.state;
+      stateByKey.set(`${userId}:${integration}`, stateUnknown);
+
+      const lastSyncedAt = readLastSyncedAt(stateUnknown);
+      if (lastSyncedAt) lastSyncedAtByKey.set(`${userId}:${integration}`, lastSyncedAt);
     }
 
     let enqueued = 0;
@@ -92,61 +115,144 @@ export class SyncTickWorker implements OnModuleInit {
       if (!flags) continue;
 
       if (flags.hasGoogle) {
-        // Gmail: frequent incremental
-        if (shouldRun(lastSyncedAtByUserIntegration.get(`${userId}:gmail`), 8)) {
-          await this.pgBoss.client.send(GMAIL_SYNC_MESSAGES_JOB, {
-            userId,
-            maxMessages: 200,
-            mode: 'incremental',
-          });
+        // 1) Gmail backfill (NO time filter) until done
+        const gmailBackfill = readGmailBackfill(stateByKey.get(`${userId}:gmail`));
+        const backfillLast = gmailBackfill.lastRunAt ?? lastSyncedAtByKey.get(`${userId}:gmail`);
+
+        // Best-effort: only enqueue backfill if last run is older than 10 minutes
+        if (!gmailBackfill.done && shouldRun(backfillLast, 10)) {
+          await this.enqueueJob(
+            GMAIL_SYNC_MESSAGES_JOB,
+            {
+              userId,
+              mode: 'backfill',
+              maxPages: 25,
+              maxMessages: 4000,
+              pageToken: gmailBackfill.nextPageToken,
+            },
+            {
+              singletonKey: `gmail_backfill:${userId}`,
+              singletonSeconds: 600,
+            },
+          );
           enqueued += 1;
         }
 
-        // Calendar: less frequent
-        if (shouldRun(lastSyncedAtByUserIntegration.get(`${userId}:calendar`), 360)) {
-          await this.pgBoss.client.send(CALENDAR_SYNC_EVENTS_JOB, {
-            userId,
-            calendarId: 'primary',
-            maxPages: 10,
-            daysPast: 60,
-            daysFuture: 60,
-          });
+        // 2) Gmail incremental for “new stuff”
+        if (shouldRun(lastSyncedAtByKey.get(`${userId}:gmail`), 3)) {
+          await this.enqueueJob(
+            GMAIL_SYNC_MESSAGES_JOB,
+            {
+              userId,
+              mode: 'incremental',
+              maxPages: 10,
+              maxMessages: 500,
+            },
+            {
+              singletonKey: `gmail_incremental:${userId}`,
+              singletonSeconds: 180,
+            },
+          );
+          enqueued += 1;
+        }
+
+        // Calendar: run hourly, wider window
+        if (shouldRun(lastSyncedAtByKey.get(`${userId}:calendar`), 60)) {
+          await this.enqueueJob(
+            CALENDAR_SYNC_EVENTS_JOB,
+            {
+              userId,
+              calendarId: 'primary',
+              maxPages: 20,
+              daysPast: 365,
+              daysFuture: 365,
+            },
+            {
+              singletonKey: `calendar_sync:${userId}`,
+              singletonSeconds: 3600,
+            },
+          );
           enqueued += 1;
         }
       }
 
       if (flags.hasHubspot) {
-        // HubSpot notes: somewhat frequent
-        if (shouldRun(lastSyncedAtByUserIntegration.get(`${userId}:hubspot_notes`), 25)) {
-          await this.pgBoss.client.send(HUBSPOT_SYNC_NOTES_JOB, { userId });
+        // HubSpot notes: every 15 minutes
+        if (shouldRun(lastSyncedAtByKey.get(`${userId}:hubspot_notes`), 15)) {
+          await this.enqueueJob(
+            HUBSPOT_SYNC_NOTES_JOB,
+            { userId },
+            { singletonKey: `hubspot_notes:${userId}`, singletonSeconds: 900 },
+          );
           enqueued += 1;
         }
 
-        // HubSpot contacts: infrequent
-        if (shouldRun(lastSyncedAtByUserIntegration.get(`${userId}:hubspot_contacts`), 360)) {
-          await this.pgBoss.client.send(HUBSPOT_SYNC_CONTACTS_JOB, { userId });
+        // HubSpot contacts: every 6 hours
+        if (shouldRun(lastSyncedAtByKey.get(`${userId}:hubspot_contacts`), 360)) {
+          await this.enqueueJob(
+            HUBSPOT_SYNC_CONTACTS_JOB,
+            { userId },
+            { singletonKey: `hubspot_contacts:${userId}`, singletonSeconds: 21600 },
+          );
           enqueued += 1;
         }
       }
     }
 
-    // Backup agent tick (even though we separately schedule it every 2 min)
-    await this.pgBoss.client.send(AGENT_TICK_JOB, { reason: 'sync_tick' });
+    // Backup agent tick
+    await this.enqueueJob(
+      AGENT_TICK_JOB,
+      { reason: 'sync_tick' },
+      { singletonKey: `agent_tick`, singletonSeconds: 60 },
+    );
 
     this.logger.log(`[${SYNC_TICK_JOB}] done job=${String(job.id)} enqueued=${enqueued}`);
   }
 }
 
-function shouldRun(lastSyncedAt: Date | undefined, minMinutes: number): boolean {
+function shouldRun(lastSyncedAt: Date | undefined | null, minMinutes: number): boolean {
   if (!lastSyncedAt) return true;
   const ageMs = Date.now() - lastSyncedAt.getTime();
   return ageMs >= minMinutes * 60_000;
 }
 
 function readLastSyncedAt(state: unknown): Date | null {
-  if (!state || typeof state !== 'object') return null;
-  const maybe = (state as { lastSyncedAt?: unknown }).lastSyncedAt;
+  if (!isRecord(state)) return null;
+  const maybe = state['lastSyncedAt'];
   if (typeof maybe !== 'string') return null;
   const ms = Date.parse(maybe);
   return Number.isFinite(ms) ? new Date(ms) : null;
+}
+
+function readGmailBackfill(state: unknown): GmailBackfill {
+  if (!isRecord(state)) return { done: false, nextPageToken: null, lastRunAt: null };
+
+  const backfill = state['backfill'];
+  if (!isRecord(backfill)) return { done: false, nextPageToken: null, lastRunAt: null };
+
+  const done = Boolean(backfill['done']);
+
+  const nextPageTokenRaw = backfill['nextPageToken'];
+  const nextPageToken = typeof nextPageTokenRaw === 'string' ? nextPageTokenRaw : null;
+
+  const lastRunAtRaw = backfill['lastRunAt'];
+  const lastRunAtStr = typeof lastRunAtRaw === 'string' ? lastRunAtRaw : null;
+  const lastRunAtMs = lastRunAtStr ? Date.parse(lastRunAtStr) : NaN;
+
+  return {
+    done,
+    nextPageToken,
+    lastRunAt: Number.isFinite(lastRunAtMs) ? new Date(lastRunAtMs) : null,
+  };
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null;
+}
+
+function getPgBossSend(client: unknown): PgBossSend {
+  if (!isRecord(client)) throw new Error('PgBoss client is not an object');
+  const send = client['send'];
+  if (typeof send !== 'function') throw new Error('PgBoss client.send is not a function');
+  return send as PgBossSend;
 }

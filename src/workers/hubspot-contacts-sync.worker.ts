@@ -77,10 +77,10 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
         const pageIds = results.map((r) => r.id).filter(Boolean);
         processedSourceIds.push(...pageIds);
 
-        // 1) Upsert raw contacts
+        // 1) Upsert raw contacts (already batch)
         await this.upsertContacts(userId, results);
 
-        // 2) Upsert documents, but ONLY when changed
+        // 2) Upsert documents, but ONLY when changed (now batch)
         const pageChanged = await this.upsertContactDocumentsIfChanged(userId, results);
         changedSourceIds.push(...pageChanged);
       }
@@ -115,7 +115,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
         },
       });
 
-    // 4) Enqueue embed for changed docs OR docs that are missing chunkIndex=0 (repair behavior)
+    // 4) Enqueue embed for changed docs OR docs missing chunkIndex=0 (repair behavior)
     const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'hubspot_contact',
@@ -184,6 +184,14 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
     });
 
     const changedSourceIds: string[] = [];
+    const changedRows: Array<{
+      userId: number;
+      source: 'hubspot_contact';
+      sourceId: string;
+      title: string;
+      text: string;
+      meta: Record<string, unknown>;
+    }> = [];
 
     for (const c of contacts) {
       const fullName = [c.firstName ?? '', c.lastName ?? ''].join(' ').trim();
@@ -207,32 +215,35 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
 
       if (!unchanged) {
         changedSourceIds.push(c.id);
-
-        await this.dbService.db
-          .insert(documents)
-          .values({
-            userId,
-            source: 'hubspot_contact',
-            sourceId: c.id,
-            title,
-            text: docText,
-            meta: {
-              hubspotContactId: c.id,
-              email: c.email ?? null,
-              firstName: c.firstName ?? null,
-              lastName: c.lastName ?? null,
-            },
-          })
-          .onConflictDoUpdate({
-            target: [documents.userId, documents.source, documents.sourceId],
-            set: {
-              title: sql`excluded.title`,
-              text: sql`excluded.text`,
-              meta: sql`excluded.meta`,
-              updatedAt: sql`now()`,
-            },
-          });
+        changedRows.push({
+          userId,
+          source: 'hubspot_contact',
+          sourceId: c.id,
+          title,
+          text: docText,
+          meta: {
+            hubspotContactId: c.id,
+            email: c.email ?? null,
+            firstName: c.firstName ?? null,
+            lastName: c.lastName ?? null,
+          },
+        });
       }
+    }
+
+    for (const batch of chunkArray(changedRows, 500)) {
+      await this.dbService.db
+        .insert(documents)
+        .values(batch)
+        .onConflictDoUpdate({
+          target: [documents.userId, documents.source, documents.sourceId],
+          set: {
+            title: sql`excluded.title`,
+            text: sql`excluded.text`,
+            meta: sql`excluded.meta`,
+            updatedAt: sql`now()`,
+          },
+        });
     }
 
     return changedSourceIds;
@@ -337,7 +348,10 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
     userId: number;
     documentIds: number[];
   }): Promise<void> {
-    const unique = Array.from(new Set(input.documentIds)).filter((x) => Number.isFinite(x));
+    const unique = Array.from(new Set(input.documentIds))
+      .map((x) => Number(x))
+      .filter((x) => Number.isFinite(x) && x > 0);
+
     if (unique.length === 0) return;
 
     for (const batch of chunkArray(unique, 1000)) {
@@ -357,6 +371,7 @@ function capText(s: string, maxLen: number): string {
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
   const a = arr ?? [];
+  if (a.length === 0) return [];
   if (a.length <= size) return [a];
   const out: T[][] = [];
   for (let i = 0; i < a.length; i += size) out.push(a.slice(i, i + size));

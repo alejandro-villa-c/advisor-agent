@@ -13,8 +13,8 @@ import {
 export type CalendarSyncJobData = {
   userId: number;
   calendarId?: string; // default 'primary'
-  maxPages?: number; // default 10
-  daysPast?: number; // default 180
+  maxPages?: number; // default 20
+  daysPast?: number; // default 365
   daysFuture?: number; // default 365
 };
 
@@ -69,8 +69,8 @@ export class CalendarSyncWorker implements OnModuleInit {
     const userId = job.data.userId;
     const calendarId = job.data.calendarId ?? 'primary';
 
-    const maxPages = clampInt(job.data.maxPages ?? 10, 1, 50);
-    const daysPast = clampInt(job.data.daysPast ?? 180, 1, 3650);
+    const maxPages = clampInt(job.data.maxPages ?? 20, 1, 50);
+    const daysPast = clampInt(job.data.daysPast ?? 365, 1, 3650);
     const daysFuture = clampInt(job.data.daysFuture ?? 365, 1, 3650);
 
     this.logger.log(
@@ -112,24 +112,29 @@ export class CalendarSyncWorker implements OnModuleInit {
         sourceIds: pageSourceIds,
       });
 
-      for (const ev of page.events) {
+      // Batch upsert calendar_events
+      const eventRows = page.events.map((ev) => {
         const startAt = ev.startIso ? safeDate(ev.startIso) : null;
         const endAt = ev.endIso ? safeDate(ev.endIso) : null;
 
+        return {
+          userId,
+          calendarId,
+          googleEventId: ev.id,
+          summary: ev.summary ?? null,
+          description: ev.description ?? null,
+          location: ev.location ?? null,
+          startAt,
+          endAt,
+          attendees: ev.attendees ?? null,
+          raw: ev.raw,
+        };
+      });
+
+      for (const batch of chunkArray(eventRows, 500)) {
         await this.dbService.db
           .insert(calendarEvents)
-          .values({
-            userId,
-            calendarId,
-            googleEventId: ev.id,
-            summary: ev.summary ?? null,
-            description: ev.description ?? null,
-            location: ev.location ?? null,
-            startAt,
-            endAt,
-            attendees: ev.attendees ?? null,
-            raw: ev.raw,
-          })
+          .values(batch)
           .onConflictDoUpdate({
             target: [
               calendarEvents.userId,
@@ -147,7 +152,19 @@ export class CalendarSyncWorker implements OnModuleInit {
               updatedAt: sql`now()`,
             },
           });
+      }
 
+      // Build changed docs and batch upsert
+      const changedDocRows: Array<{
+        userId: number;
+        source: 'calendar_event';
+        sourceId: string;
+        title: string;
+        text: string;
+        meta: Record<string, unknown>;
+      }> = [];
+
+      for (const ev of page.events) {
         const title = ev.summary?.trim() ? `Calendar: ${ev.summary.trim()}` : `Calendar: ${ev.id}`;
 
         const docTextRaw = [
@@ -180,38 +197,41 @@ export class CalendarSyncWorker implements OnModuleInit {
 
         if (!unchanged) {
           changedSourceIds.push(sourceId);
-
-          await this.dbService.db
-            .insert(documents)
-            .values({
-              userId,
-              source: 'calendar_event',
-              sourceId,
-              title,
-              text: docText,
-              meta: {
-                calendarId,
-                googleEventId: ev.id,
-                startIso: ev.startIso ?? null,
-                endIso: ev.endIso ?? null,
-              },
-            })
-            .onConflictDoUpdate({
-              target: [documents.userId, documents.source, documents.sourceId],
-              set: {
-                title: sql`excluded.title`,
-                text: sql`excluded.text`,
-                meta: sql`excluded.meta`,
-                updatedAt: sql`now()`,
-              },
-            });
+          changedDocRows.push({
+            userId,
+            source: 'calendar_event',
+            sourceId,
+            title,
+            text: docText,
+            meta: {
+              calendarId,
+              googleEventId: ev.id,
+              startIso: ev.startIso ?? null,
+              endIso: ev.endIso ?? null,
+            },
+          });
         }
+      }
 
-        processed += 1;
+      for (const batch of chunkArray(changedDocRows, 500)) {
+        await this.dbService.db
+          .insert(documents)
+          .values(batch)
+          .onConflictDoUpdate({
+            target: [documents.userId, documents.source, documents.sourceId],
+            set: {
+              title: sql`excluded.title`,
+              text: sql`excluded.text`,
+              meta: sql`excluded.meta`,
+              updatedAt: sql`now()`,
+            },
+          });
+      }
 
-        if (processed % 100 === 0) {
-          this.logger.log(`[${CALENDAR_SYNC_EVENTS_JOB}] processed=${processed}`);
-        }
+      processed += page.events.length;
+
+      if (processed % 1000 === 0) {
+        this.logger.log(`[${CALENDAR_SYNC_EVENTS_JOB}] processed=${processed}`);
       }
 
       if (!page.nextPageToken) break;
@@ -253,7 +273,7 @@ export class CalendarSyncWorker implements OnModuleInit {
       ],
     });
 
-    // Wake agent for calendar changes (future-proof; currently only gmail waiting is implemented)
+    // Wake agent for calendar changes
     const changed = Array.from(new Set(changedSourceIds)).filter(Boolean);
     for (const batch of chunkArray(changed, 200)) {
       await this.pgBossService.client.send(AGENT_REACT_JOB, {
@@ -366,7 +386,10 @@ export class CalendarSyncWorker implements OnModuleInit {
     userId: number;
     documentIds: number[];
   }): Promise<void> {
-    const unique = Array.from(new Set(input.documentIds)).filter((x) => Number.isFinite(x));
+    const unique = Array.from(new Set(input.documentIds))
+      .map((x) => Number(x))
+      .filter((x) => Number.isFinite(x) && x > 0);
+
     if (unique.length === 0) return;
 
     for (const batch of chunkArray(unique, 1000)) {
