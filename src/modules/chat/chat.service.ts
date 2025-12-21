@@ -116,8 +116,8 @@ export class ChatService {
       }
     }
 
-    // 1) If there is a waiting task asking the advisor for info, treat this message as the reply,
-    // BUT ONLY if the message looks like it answers the prompt.
+    // 1) If there is a waiting task asking the advisor for info IN THIS THREAD,
+    // treat this message as the reply.
     const resumed = await this.tryResumeWaitingUserMessageTask({
       userId,
       threadId,
@@ -162,9 +162,7 @@ export class ChatService {
         userText: text,
       });
 
-      const assistant =
-        `✅ Okay — I’ll handle that as an agent task (email/calendar/HubSpot as needed).\n` +
-        `Task ID: ${taskId}`;
+      const assistant = `Got it — I'll handle that for you. You'll be notified here in this thread when there are updates or when the task is complete.`;
 
       await this.dbService.db.insert(messages).values({
         userId,
@@ -246,33 +244,31 @@ export class ChatService {
     const waiting = await this.agentTasks.listWaitingTasksForUser(input.userId, 50);
 
     // Only resume if:
-    // - waiting.kind === 'user_message'
-    // - and the new text looks like it answers the prompt (heuristic)
+    // 1. waiting.kind === 'user_message'
+    // 2. The task is associated with THIS thread (via chatBridge.threadId)
+    // 3. The new text looks like it answers the prompt (heuristic)
     const match = waiting.find((t) => {
       if (!isRecord(t.waiting)) return false;
       const kind = typeof t.waiting.kind === 'string' ? t.waiting.kind : '';
       if (kind !== 'user_message') return false;
-      return shouldResumeUserMessageWaiting(t.waiting, input.advisorReplyText);
+
+      // Check that this task is associated with the current thread
+      const mem = t.memory ?? {};
+      const chatBridge = isRecord(mem['chatBridge']) ? mem['chatBridge'] : null;
+      const taskThreadId =
+        chatBridge && typeof chatBridge['threadId'] === 'number' ? chatBridge['threadId'] : null;
+
+      // Only resume if the task belongs to this thread
+      if (taskThreadId !== input.threadId) return false;
+
+      return shouldResumeUserMessageWaiting(input.advisorReplyText);
     });
 
     if (!match) return null;
 
-    // Claim waiting->queued so we don’t double enqueue.
+    // Claim waiting->queued so we don't double enqueue.
     const claimed = await this.agentTasks.claimWaitingTask(match.id);
     if (!claimed) return null;
-
-    // IMPORTANT: retarget chat bridge to THIS thread so future agent updates mirror here
-    const full = await this.agentTasks.getTask(match.id);
-    const mem = full?.memory ?? {};
-
-    const existingBridge = isRecord(mem['chatBridge']) ? mem['chatBridge'] : {};
-    const newBridge: Record<string, unknown> = {
-      ...existingBridge,
-      threadId: input.threadId,
-      didPushTerminalStatus: false,
-    };
-
-    await this.agentTasks.mergeMemory(match.id, { chatBridge: newBridge });
 
     // Append the advisor reply into the agent task conversation.
     await this.agentTasks.appendMessage({
@@ -531,7 +527,7 @@ export class ChatService {
   }
 }
 
-// --- helpers below unchanged from your current file ---
+// --- helpers ---
 
 function deriveThreadTitleFromPrompt(prompt: string): string {
   const raw = String(prompt ?? '').trim();
@@ -786,39 +782,13 @@ function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
 }
 
-function shouldResumeUserMessageWaiting(
-  waiting: Record<string, unknown>,
-  replyText: string,
-): boolean {
-  const prompt = typeof waiting.prompt === 'string' ? waiting.prompt : '';
+function shouldResumeUserMessageWaiting(replyText: string): boolean {
+  const text = String(replyText ?? '').trim();
 
-  // If the agent is explicitly asking for an email, only resume when the advisor message contains one.
-  const wantsEmail =
-    /email\b/i.test(prompt) || /email address/i.test(prompt) || /e-mail/i.test(prompt);
+  // If the reply is empty, don't resume
+  if (!text) return false;
 
-  if (wantsEmail) {
-    return containsEmail(replyText);
-  }
-
-  // If the agent is asking for a label choice (A/B/C), only resume if the reply contains one.
-  const wantsLabel =
-    /\breply\b/i.test(prompt) && /\b(A|B|C)\b/i.test(prompt) && /label/i.test(prompt);
-
-  if (wantsLabel) {
-    return containsLabelChoice(replyText);
-  }
-
-  // Default: resume
-  return true;
-}
-
-function containsEmail(text: string): boolean {
-  return /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(String(text ?? ''));
-}
-
-function containsLabelChoice(text: string): boolean {
-  const s = String(text ?? '')
-    .trim()
-    .slice(0, 200);
-  return /\b([A-F])\b/i.test(s) || /\boption\s*([A-F])\b/i.test(s);
+  // For all cases, resume if there's any response
+  // The agent runner will use NLP to properly interpret the response
+  return text.length >= 1;
 }

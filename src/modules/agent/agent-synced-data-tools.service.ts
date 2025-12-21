@@ -17,9 +17,25 @@ export class AgentSyncedDataToolsService {
     const q = (input.query ?? '').trim();
     if (!q) return [];
 
-    // Simplify query matching
-    const like = `%${escapeLike(q)}%`;
+    // Split query into individual words for better matching
+    const queryWords = q
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 1);
 
+    if (queryWords.length === 0) return [];
+
+    // Build conditions for each word to match against firstName, lastName, or email
+    // This ensures we match contacts where ALL words appear somewhere in their name
+    const wordConditions = queryWords.map(
+      (word) => sql`(
+        LOWER(${hubspotContacts.firstName}) LIKE ${`%${escapeLike(word)}%`} OR
+        LOWER(${hubspotContacts.lastName}) LIKE ${`%${escapeLike(word)}%`} OR
+        LOWER(${hubspotContacts.email}) LIKE ${`%${escapeLike(word)}%`}
+      )`,
+    );
+
+    // All words must match
     const rows = await this.dbService.db
       .select({
         id: hubspotContacts.hubspotContactId,
@@ -28,15 +44,7 @@ export class AgentSyncedDataToolsService {
         lastName: hubspotContacts.lastName,
       })
       .from(hubspotContacts)
-      .where(
-        and(
-          eq(hubspotContacts.userId, input.userId),
-          sql`(
-            ${hubspotContacts.email} ILIKE ${like} OR
-            concat_ws(' ', ${hubspotContacts.firstName}, ${hubspotContacts.lastName}) ILIKE ${like}
-          )`,
-        ),
-      )
+      .where(and(eq(hubspotContacts.userId, input.userId), ...wordConditions))
       .limit(clampInt(input.limit, 1, 25));
 
     return rows.map((r) => ({

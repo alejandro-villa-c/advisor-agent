@@ -9,6 +9,7 @@ import { RagModule } from './modules/rag/rag.module';
 import { ChatModule } from './modules/chat/chat.module';
 import { ThreadsModule } from './modules/threads/threads.module';
 import { AgentModule } from './modules/agent/agent.module';
+import { WebSocketModule } from './modules/websocket/websocket.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { AgentModule } from './modules/agent/agent.module';
     ChatModule,
     ThreadsModule,
     AgentModule,
+    WebSocketModule,
   ],
 })
 export class AppModule {}

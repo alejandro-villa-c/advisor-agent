@@ -13,6 +13,8 @@
   if (!contentInner || !textarea) return;
 
   let isSending = false;
+  let socket = null;
+  let thinkingElement = null;
 
   function escapeHtml(s) {
     return String(s)
@@ -69,18 +71,23 @@
   function renderMessage(role, text, opts) {
     const el = createMessageElement(role, text, opts);
     contentInner.appendChild(el);
+    scrollToBottom();
     return el;
   }
 
-  function updateAssistantMessage(el, text) {
-    if (!el) return;
-    el.classList.remove('msg--thinking');
+  function showThinkingPlaceholder() {
+    // Remove any existing thinking placeholder first
+    removeThinkingPlaceholder();
 
-    el.innerHTML = `
-      <div class="msg__text">
-        <div class="msg__content">${escapeHtml(text)}</div>
-      </div>
-    `;
+    thinkingElement = renderMessage('assistant', 'Thinking', { isThinking: true });
+    thinkingElement.querySelector('.msg__content').classList.add('thinking-dots');
+  }
+
+  function removeThinkingPlaceholder() {
+    if (thinkingElement && thinkingElement.parentNode) {
+      thinkingElement.parentNode.removeChild(thinkingElement);
+      thinkingElement = null;
+    }
   }
 
   async function loadMessages() {
@@ -106,36 +113,61 @@
 
     textarea.value = '';
     textarea.focus();
-    scrollToBottom();
 
-    // Thinking placeholder
-    const thinkingEl = renderMessage('assistant', 'Thinking', { isThinking: true });
-    thinkingEl.querySelector('.msg__content').classList.add('thinking-dots');
-    scrollToBottom();
+    // Show thinking placeholder while waiting for agent response
+    showThinkingPlaceholder();
 
     try {
-      const data = await fetchJson('/api/chat/message', {
+      await fetchJson('/api/chat/message', {
         method: 'POST',
         body: JSON.stringify({ threadId, content: text }),
       });
 
-      const assistantText =
-        (data && data.assistant && typeof data.assistant === 'object' && data.assistant.content) ||
-        (data && typeof data.assistant === 'string' && data.assistant) ||
-        '';
-
-      updateAssistantMessage(thinkingEl, assistantText);
-      scrollToBottom();
+      // Messages will arrive via WebSocket and replace the thinking placeholder
     } catch (err) {
-      updateAssistantMessage(
-        thinkingEl,
+      removeThinkingPlaceholder();
+      renderMessage(
+        'assistant',
         `Error: ${err && err.message ? err.message : String(err)}`,
       );
-      scrollToBottom();
     } finally {
       isSending = false;
       updateSendState();
     }
+  }
+
+  function initializeWebSocket() {
+    // Connect to Socket.IO server
+    socket = io({
+      transports: ['websocket', 'polling'],
+    });
+
+    socket.on('connect', () => {
+      console.log('WebSocket connected');
+      
+      // Register this socket for the user
+      socket.emit('register', { threadId });
+    });
+
+    socket.on('disconnect', () => {
+      console.log('WebSocket disconnected');
+    });
+
+    socket.on('new-message', (data) => {
+      console.log('Received new message:', data);
+      
+      // Only render if it's for the current thread
+      if (data.threadId === threadId && data.message) {
+        // Remove thinking placeholder when first real message arrives
+        removeThinkingPlaceholder();
+        
+        renderMessage(data.message.role, data.message.content);
+      }
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error('WebSocket connection error:', error);
+    });
   }
 
   textarea.addEventListener('input', updateSendState);
@@ -175,5 +207,15 @@
         `Error loading messages: ${err && err.message ? err.message : String(err)}`,
       );
     });
+
+    // Initialize WebSocket after loading initial messages
+    initializeWebSocket();
   }
+
+  // Clean up WebSocket on page unload
+  window.addEventListener('beforeunload', () => {
+    if (socket) {
+      socket.disconnect();
+    }
+  });
 })();

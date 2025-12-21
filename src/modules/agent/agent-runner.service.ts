@@ -13,6 +13,13 @@ import { CalendarApiService } from '../integrations/google/calendar-api.service'
 import { HubspotApiService } from '../integrations/hubspot/hubspot-api.service';
 import { PgBossService } from '../../jobs/pgboss.service';
 import { AGENT_REACT_JOB } from '../../jobs/job.constants';
+import { AgentNlpService } from './agent-nlp.service';
+
+type ProposedSlot = {
+  label: string;
+  startIso: string;
+  endIso: string;
+};
 
 type ToolResult =
   | { kind: 'ok'; output: Record<string, unknown> }
@@ -32,6 +39,7 @@ export class AgentRunnerService {
     private readonly calendarApi: CalendarApiService,
     private readonly hubspotApi: HubspotApiService,
     private readonly pgBoss: PgBossService,
+    private readonly nlp: AgentNlpService,
   ) {}
 
   async runTask(taskId: number): Promise<void> {
@@ -52,15 +60,13 @@ export class AgentRunnerService {
       await this.tasks.setWaiting(taskId, null);
       await this.tasks.setStatus(taskId, 'running', null);
 
-      // deterministically kick off scheduling if possible
-      const didStart = await this.tryAutoStartScheduling(taskId, task);
-      if (didStart === 'waiting') return;
+      // Check if this is a scheduling task and handle the multi-step flow
+      const schedulingResult = await this.handleSchedulingFlow(taskId, task);
+      if (schedulingResult !== 'not_scheduling') {
+        return;
+      }
 
-      // Existing auto-resolve when we already have meeting state + incoming reply
-      const didAuto = await this.tryAutoResolveScheduling(taskId, task);
-      if (didAuto === 'completed') return;
-      if (didAuto === 'waiting') return;
-
+      // Fall back to general LLM-driven agent loop
       const systemPrompt = this.agentTools.buildSystemPrompt({
         goal: task.goal,
         memory: task.memory,
@@ -196,19 +202,89 @@ export class AgentRunnerService {
     }
   }
 
-  private async tryAutoStartScheduling(
+  /**
+   * Handles the multi-step scheduling flow:
+   * 1. Check if it's a scheduling request (via NLP)
+   * 2. Find contact
+   * 3. Ask user for duration (if not specified)
+   * 4. Find available slots
+   * 5. Show slots to user for approval
+   * 6. Send email to contact with options
+   * 7. Wait for contact reply
+   * 8. Handle contact response (including "none work")
+   */
+  private async handleSchedulingFlow(
     taskId: number,
     task: AgentTaskRow,
-  ): Promise<'waiting' | 'nope'> {
+  ): Promise<'not_scheduling' | 'handled'> {
     const mem = task.memory ?? {};
     const meeting = isRecord(mem['meeting']) ? mem['meeting'] : null;
-    if (meeting) return 'nope';
+    const phase = meeting ? (typeof meeting['phase'] === 'string' ? meeting['phase'] : null) : null;
 
-    if (!isLikelyScheduleMeetingGoal(task.goal)) return 'nope';
+    // Get the latest user message to understand context
+    const uiMessages = await this.tasks.getMessagesForUi(taskId);
+    const lastUser = [...uiMessages].reverse().find((m) => m.role === 'user');
 
-    const contactName = extractContactNameFromGoal(task.goal);
-    if (!contactName) return 'nope';
+    // PHASE: Initial request - use NLP to parse and find contact
+    if (!meeting) {
+      return await this.startSchedulingFlow(taskId, task);
+    }
 
+    // PHASE: Waiting for duration from user
+    if (phase === 'need_duration') {
+      return await this.handleDurationResponse(taskId, task, lastUser?.content ?? '');
+    }
+
+    // PHASE: Waiting for user approval of proposed slots
+    if (phase === 'need_user_approval') {
+      return await this.handleUserApprovalResponse(taskId, task, lastUser?.content ?? '');
+    }
+
+    // PHASE: Waiting for contact reply
+    if (phase === 'waiting_contact_reply') {
+      return await this.handleContactReply(taskId, task, lastUser?.content ?? '');
+    }
+
+    return 'not_scheduling';
+  }
+
+  private async startSchedulingFlow(
+    taskId: number,
+    task: AgentTaskRow,
+  ): Promise<'handled' | 'not_scheduling'> {
+    // Use NLP to parse the goal
+    const parsed = await this.nlp.parseSchedulingGoal(task.goal);
+
+    if (!parsed.isSchedulingRequest || parsed.confidence < 0.5) {
+      return 'not_scheduling';
+    }
+
+    const contactName = parsed.contactName;
+    if (!contactName) {
+      // Ask user to clarify who they want to meet with
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I'd be happy to help schedule a meeting. Who would you like to meet with?`,
+      });
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_contact',
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'Who would you like to meet with?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // Search for the contact in HubSpot
     const matches = await this.syncedDataTools.findHubspotContactsLocal({
       userId: task.userId,
       query: contactName,
@@ -216,28 +292,229 @@ export class AgentRunnerService {
     });
 
     const best = pickBestContact(matches, contactName);
-    if (!best) return 'nope';
+    if (!best) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I couldn't find a contact matching "${contactName}" in HubSpot. Could you provide their email address?`,
+      });
 
-    if (!best.email) {
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_duration',
+          contact: {
+            name: contactName,
+            email: null,
+            hubspotContactId: null,
+          },
+        },
+      });
+
       await this.tasks.setWaiting(taskId, {
         kind: 'user_message',
-        prompt: `I found the contact "${best.displayName}", but it has no email in HubSpot. Please provide the email address.`,
+        prompt: `Please provide the email address for ${contactName}.`,
         sinceIso: new Date().toISOString(),
       });
       await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    if (!best.email) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I found "${best.displayName}" in HubSpot, but they don't have an email address on file. Please provide their email address.`,
+      });
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_duration',
+          contact: {
+            name: best.displayName,
+            email: null,
+            hubspotContactId: best.hubspotContactId,
+          },
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: `Please provide the email address for ${best.displayName}.`,
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // Use duration from NLP parsing if available
+    const durationFromGoal = parsed.durationMinutes;
+
+    if (durationFromGoal === null) {
+      // Need to ask for duration
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_duration',
+          contact: {
+            name: best.displayName,
+            email: best.email,
+            hubspotContactId: best.hubspotContactId,
+          },
+        },
+      });
 
       await this.tasks.appendMessage({
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `I found "${best.displayName}" but it has no email. Please provide the email address.`,
+        content: `I found ${best.displayName} (${best.email}). How long should the meeting be? (e.g., "30 minutes", "1 hour")`,
       });
 
-      return 'waiting';
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'How long should the meeting be? Please specify the duration.',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
     }
 
+    // Duration was specified, proceed to find slots and ask for approval
+    return await this.findSlotsAndAskApproval(
+      taskId,
+      task,
+      {
+        name: best.displayName,
+        email: best.email,
+        hubspotContactId: best.hubspotContactId,
+      },
+      durationFromGoal,
+    );
+  }
+
+  private async handleDurationResponse(
+    taskId: number,
+    task: AgentTaskRow,
+    userResponse: string,
+  ): Promise<'handled'> {
+    const mem = task.memory ?? {};
+    const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
+    const contact = isRecord(meeting['contact']) ? meeting['contact'] : {};
+    const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
+
+    // Use NLP to parse the response
+    // Determine what we're asking for based on current state
+    const agentAskedFor = contactEmail ? 'duration' : 'email';
+    const parsed = await this.nlp.parseUserResponse({
+      userMessage: userResponse,
+      agentAskedFor,
+    });
+
+    // Check if user provided an email (in case we were waiting for that)
+    if (parsed.type === 'email' && parsed.email) {
+      // Update contact with email
+      const updatedContact = {
+        ...contact,
+        email: parsed.email,
+      };
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          ...meeting,
+          contact: updatedContact,
+        },
+      });
+
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Got it. How long should the meeting be? (e.g., "30 minutes", "1 hour")`,
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'How long should the meeting be? Please specify the duration.',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // Check for duration
+    if (parsed.type === 'duration' && parsed.durationMinutes) {
+      // Make sure we have an email
+      if (!contactEmail) {
+        await this.tasks.appendMessage({
+          taskId,
+          userId: task.userId,
+          role: 'assistant',
+          content: `I still need the email address for this contact. Could you provide it?`,
+        });
+
+        await this.tasks.setWaiting(taskId, {
+          kind: 'user_message',
+          prompt: 'Please provide the email address.',
+          sinceIso: new Date().toISOString(),
+        });
+        await this.tasks.setStatus(taskId, 'waiting', null);
+        return 'handled';
+      }
+
+      return await this.findSlotsAndAskApproval(
+        taskId,
+        task,
+        {
+          name: typeof contact['name'] === 'string' ? contact['name'] : '',
+          email: contactEmail,
+          hubspotContactId:
+            typeof contact['hubspotContactId'] === 'string' ? contact['hubspotContactId'] : '',
+        },
+        parsed.durationMinutes,
+      );
+    }
+
+    // Couldn't understand the response - ask again with context
+    if (!contactEmail) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I didn't quite catch that. Could you please provide the email address for the contact?`,
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'Please provide the email address.',
+        sinceIso: new Date().toISOString(),
+      });
+    } else {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I didn't quite catch that. Could you please specify how long the meeting should be? (e.g., "30 minutes", "1 hour", or "half an hour")`,
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'Please specify the meeting duration.',
+        sinceIso: new Date().toISOString(),
+      });
+    }
+
+    await this.tasks.setStatus(taskId, 'waiting', null);
+    return 'handled';
+  }
+
+  private async findSlotsAndAskApproval(
+    taskId: number,
+    task: AgentTaskRow,
+    contact: { name: string; email: string; hubspotContactId: string },
+    durationMinutes: number,
+  ): Promise<'handled'> {
     const timeZone = 'America/Santo_Domingo';
-    const durationMinutes = 30;
 
     const now = Date.now();
     const startIso = new Date(now + 60 * 60_000).toISOString();
@@ -260,182 +537,180 @@ export class AgentRunnerService {
       endIso: s.endIso,
     }));
 
-    if (proposed.length === 0) return 'nope';
+    if (proposed.length === 0) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I couldn't find any available time slots in the next 2 weeks. Would you like me to check a different date range?`,
+      });
 
-    const body = buildSchedulingOptionsEmail({
-      intro:
-        `Hi ${best.displayName},\n\n` +
-        `I'd like to schedule a quick 30-minute meeting. Please reply with the option label only (A, B, or C):`,
-      options: proposed.map((p) => ({
-        label: p.label,
-        startIso: p.startIso,
-        endIso: p.endIso,
-        timeZone,
-      })),
-    });
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'No available slots found. What would you like to do?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
 
-    const sendRes = await this.gmailApi.sendEmail(task.userId, {
-      to: best.email,
-      subject: `Scheduling — please choose A, B, or C`,
-      bodyText: body,
-    });
-
-    const gmailThreadId = extractThreadIdFromSendResult(sendRes);
-    const sinceIso = new Date().toISOString();
-
+    // Store meeting info and proposed slots
     await this.tasks.mergeMemory(taskId, {
       meeting: {
+        phase: 'need_user_approval',
         timezone: timeZone,
         durationMinutes,
-        contact: {
-          name: best.displayName,
-          email: best.email,
-          hubspotContactId: best.hubspotContactId,
-        },
-        gmailThreadId: gmailThreadId || null,
+        contact,
         proposed,
+        previouslyProposed: [],
       },
     });
 
-    await this.tasks.setWaiting(taskId, {
-      kind: 'gmail_reply',
-      threadId: gmailThreadId || '',
-      fromEmail: best.email,
-      sinceIso,
+    // Format slots for user approval
+    const slotLines = proposed.map((p) => {
+      const start = formatDateTimeForHumans(p.startIso, timeZone);
+      const end = formatTimeForHumans(p.endIso, timeZone);
+      return `  ${p.label}) ${start} – ${end}`;
     });
-    await this.tasks.setStatus(taskId, 'waiting', null);
 
     await this.tasks.appendMessage({
       taskId,
       userId: task.userId,
       role: 'assistant',
-      content: `I emailed ${best.email} with options A/B/C and I'm waiting for their selection.`,
+      content:
+        `I found the following available time slots for a ${durationMinutes}-minute meeting with ${contact.name}:\n\n` +
+        slotLines.join('\n') +
+        `\n\nDo these times look good to send to ${contact.email}? (Reply "yes" to approve, or let me know if you'd like different times)`,
     });
 
-    return 'waiting';
+    await this.tasks.setWaiting(taskId, {
+      kind: 'user_message',
+      prompt: 'Do these times look good to send? Reply yes to approve.',
+      sinceIso: new Date().toISOString(),
+    });
+    await this.tasks.setStatus(taskId, 'waiting', null);
+    return 'handled';
   }
 
-  // ---------------- existing scheduling auto-resolve (unchanged) ----------------
-  private async tryAutoResolveScheduling(
+  private async handleUserApprovalResponse(
     taskId: number,
     task: AgentTaskRow,
-  ): Promise<'completed' | 'waiting' | 'nope'> {
+    userResponse: string,
+  ): Promise<'handled'> {
     const mem = task.memory ?? {};
-    const meeting = isRecord(mem['meeting']) ? mem['meeting'] : null;
-    if (!meeting) return 'nope';
-
-    const proposedRaw = meeting['proposed'];
-    if (!Array.isArray(proposedRaw) || proposedRaw.length === 0) return 'nope';
-
-    const uiMessages = await this.tasks.getMessagesForUi(taskId);
-    const lastUser = [...uiMessages].reverse().find((m) => m.role === 'user');
-    if (!lastUser) return 'nope';
-
-    const parsed = parseIncomingEmailBlock(lastUser.content);
-    if (!parsed) return 'nope';
-
-    const label = extractLabelChoice(parsed.bodyText);
-    if (!label) return 'nope';
-
-    const proposed = proposedRaw
-      .map((p) => {
-        if (!isRecord(p)) return null;
-        const l = typeof p.label === 'string' ? p.label.trim().toUpperCase() : '';
-        const startIso = typeof p.startIso === 'string' ? p.startIso.trim() : '';
-        const endIso = typeof p.endIso === 'string' ? p.endIso.trim() : '';
-        if (!l || !startIso || !endIso) return null;
-        return { label: l, startIso, endIso };
-      })
-      .filter((x): x is NonNullable<typeof x> => Boolean(x));
-
-    const chosen = proposed.find((p) => p.label === label);
-    if (!chosen) return 'nope';
-
-    const timeZone =
-      typeof meeting['timezone'] === 'string' && meeting['timezone'].trim()
-        ? meeting['timezone'].trim()
-        : 'America/Santo_Domingo';
-
-    const durationMinutes =
-      typeof meeting['durationMinutes'] === 'number' && Number.isFinite(meeting['durationMinutes'])
-        ? Math.trunc(meeting['durationMinutes'])
-        : 30;
-
+    const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
     const contact = isRecord(meeting['contact']) ? meeting['contact'] : {};
-    const contactEmail =
-      (typeof contact['email'] === 'string' ? contact['email'].trim() : '') ||
-      extractEmail(parsed.from) ||
-      '';
+    const proposedRaw = Array.isArray(meeting['proposed']) ? meeting['proposed'] : [];
+    const durationMinutes =
+      typeof meeting['durationMinutes'] === 'number' ? meeting['durationMinutes'] : 30;
+    const timeZone =
+      typeof meeting['timezone'] === 'string' ? meeting['timezone'] : 'America/Santo_Domingo';
 
-    if (!contactEmail) return 'nope';
+    // Safely parse proposed slots
+    const proposed: ProposedSlot[] = proposedRaw
+      .filter((p): p is Record<string, unknown> => isRecord(p))
+      .map((p) => ({
+        label: typeof p.label === 'string' ? p.label : '',
+        startIso: typeof p.startIso === 'string' ? p.startIso : '',
+        endIso: typeof p.endIso === 'string' ? p.endIso : '',
+      }))
+      .filter((p) => p.label && p.startIso && p.endIso);
 
-    const busy = await this.calendarApi.getBusyIntervals(task.userId, {
-      calendarId: 'primary',
-      timeMinIso: chosen.startIso,
-      timeMaxIso: chosen.endIso,
-      timeZone,
+    // Use NLP to parse the response
+    const parsed = await this.nlp.parseUserResponse({
+      userMessage: userResponse,
+      agentAskedFor: 'approval',
     });
 
-    const isBusyNow = Array.isArray(busy) && busy.length > 0;
-    const threadId = parsed.threadId;
+    // Check for approval
+    if (parsed.type === 'approval' && parsed.approved === true) {
+      // User approved - send email to contact
+      const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
+      const contactName = typeof contact['name'] === 'string' ? contact['name'] : '';
 
-    if (isBusyNow) {
-      const now = Date.now();
-      const startIso = new Date(now + 60 * 60_000).toISOString();
-      const endIso = new Date(now + 7 * 24 * 60 * 60_000).toISOString();
+      if (!contactEmail) {
+        await this.tasks.appendMessage({
+          taskId,
+          userId: task.userId,
+          role: 'assistant',
+          content: `I don't have an email address for this contact. Could you provide it?`,
+        });
 
-      const slots = await this.syncedDataTools.suggestCalendarTimesLocal({
-        userId: task.userId,
-        startIso,
-        endIso,
-        durationMinutes,
-        workDayStartHour: 9,
-        workDayEndHour: 17,
-        timezoneOffsetMinutes: -240,
-        maxSuggestions: 6,
-      });
-
-      const nextProposed = slots.slice(0, 3).map((s, idx) => ({
-        label: String.fromCharCode('A'.charCodeAt(0) + idx),
-        startIso: s.startIso,
-        endIso: s.endIso,
-      }));
-
-      if (nextProposed.length === 0) return 'nope';
-
-      await this.tasks.mergeMemory(taskId, {
-        meeting: {
-          ...meeting,
-          proposed: nextProposed,
-          gmailThreadId: threadId,
-        },
-      });
+        await this.tasks.setWaiting(taskId, {
+          kind: 'user_message',
+          prompt: 'Please provide the email address.',
+          sinceIso: new Date().toISOString(),
+        });
+        await this.tasks.setStatus(taskId, 'waiting', null);
+        return 'handled';
+      }
 
       const body = buildSchedulingOptionsEmail({
         intro:
-          `Thanks — it looks like the time you picked (${label}) just became unavailable on my calendar.\n\n` +
-          `Here are a few new options. Please reply with A, B, or C:`,
-        options: nextProposed.map((p) => ({
+          `Hi ${contactName},\n\n` +
+          `I'd like to schedule a ${durationMinutes}-minute meeting. Please reply with the letter of your preferred time, or "D" if none of these work:\n`,
+        options: proposed.map((p) => ({
           label: p.label,
           startIso: p.startIso,
           endIso: p.endIso,
           timeZone,
         })),
+        includeNoneOption: true,
       });
 
-      await this.gmailApi.sendEmail(task.userId, {
+      // Send email FIRST
+      const sendRes = await this.gmailApi.sendEmail(task.userId, {
         to: contactEmail,
-        subject: parsed.subject ? `Re: ${parsed.subject}` : 'Re: Scheduling',
+        subject: `Scheduling Request — please choose an option`,
         bodyText: body,
-        threadId,
       });
+
+      const gmailThreadId = extractThreadIdFromSendResult(sendRes);
+
+      // AFTER sending, get the latest timestamp to ensure we only pick up replies
+      // that come after our sent message
+      const threadMessages = await this.gmailApi.getThreadMessages(
+        task.userId,
+        gmailThreadId || '',
+      );
+      const latestInternalDateMs =
+        threadMessages.length > 0
+          ? Math.max(...threadMessages.map((m) => m.internalDateMs ?? 0))
+          : Date.now();
 
       const sinceIso = new Date().toISOString();
+
+      // Track previously proposed times - safely parse existing array
+      const previouslyProposedRaw = Array.isArray(meeting['previouslyProposed'])
+        ? meeting['previouslyProposed']
+        : [];
+      const previouslyProposed: ProposedSlot[] = previouslyProposedRaw
+        .filter((p): p is Record<string, unknown> => isRecord(p))
+        .map((p) => ({
+          label: typeof p.label === 'string' ? p.label : '',
+          startIso: typeof p.startIso === 'string' ? p.startIso : '',
+          endIso: typeof p.endIso === 'string' ? p.endIso : '',
+        }))
+        .filter((p) => p.startIso);
+
+      const updatedPreviouslyProposed: ProposedSlot[] = [...previouslyProposed, ...proposed];
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          ...meeting,
+          phase: 'waiting_contact_reply',
+          gmailThreadId: gmailThreadId || null,
+          proposed,
+          previouslyProposed: updatedPreviouslyProposed,
+        },
+      });
+
       await this.tasks.setWaiting(taskId, {
         kind: 'gmail_reply',
-        threadId,
+        threadId: gmailThreadId || '',
         fromEmail: contactEmail,
         sinceIso,
+        sinceInternalDateMs: latestInternalDateMs,
       });
       await this.tasks.setStatus(taskId, 'waiting', null);
 
@@ -443,37 +718,165 @@ export class AgentRunnerService {
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `I received the client’s reply (${label}), but that slot is now busy. I emailed new options and I’m waiting for their selection.`,
+        content: `I've sent the scheduling options to ${contactEmail}. I'll notify you here when they respond.`,
       });
 
-      return 'waiting';
+      return 'handled';
     }
 
-    const summary =
-      (typeof meeting['summary'] === 'string' && meeting['summary'].trim()) ||
-      `Meeting with ${contactEmail}`;
+    // User rejected or we couldn't understand clearly - ask for different times or clarification
+    if (parsed.type === 'rejection' || parsed.confidence < 0.6) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `No problem. Would you like me to find different time slots, or do you have specific times in mind?`,
+      });
+
+      // Go back to needing approval with potential for new slots
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          ...meeting,
+          phase: 'need_user_approval',
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'What times would work better for you?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // Default: treat as needing clarification
+    await this.tasks.appendMessage({
+      taskId,
+      userId: task.userId,
+      role: 'assistant',
+      content: `I didn't quite catch that. Should I send these time options to the contact? (Reply "yes" to send, or "no" if you'd like different times)`,
+    });
+
+    await this.tasks.setWaiting(taskId, {
+      kind: 'user_message',
+      prompt: 'Please confirm: should I send these times?',
+      sinceIso: new Date().toISOString(),
+    });
+    await this.tasks.setStatus(taskId, 'waiting', null);
+    return 'handled';
+  }
+
+  private async handleContactReply(
+    taskId: number,
+    task: AgentTaskRow,
+    lastMessageContent: string,
+  ): Promise<'handled'> {
+    const mem = task.memory ?? {};
+    const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
+    const contact = isRecord(meeting['contact']) ? meeting['contact'] : {};
+    const proposedRaw = Array.isArray(meeting['proposed']) ? meeting['proposed'] : [];
+    const durationMinutes =
+      typeof meeting['durationMinutes'] === 'number' ? meeting['durationMinutes'] : 30;
+    const timeZone =
+      typeof meeting['timezone'] === 'string' ? meeting['timezone'] : 'America/Santo_Domingo';
+
+    // Safely parse proposed slots
+    const proposed: ProposedSlot[] = proposedRaw
+      .filter((p): p is Record<string, unknown> => isRecord(p))
+      .map((p) => ({
+        label: typeof p.label === 'string' ? p.label : '',
+        startIso: typeof p.startIso === 'string' ? p.startIso : '',
+        endIso: typeof p.endIso === 'string' ? p.endIso : '',
+      }))
+      .filter((p) => p.label && p.startIso && p.endIso);
+
+    // Parse the incoming email
+    const parsed = parseIncomingEmailBlock(lastMessageContent);
+    if (!parsed) {
+      return 'handled';
+    }
+
+    const label = extractLabelChoice(parsed.bodyText);
+
+    // Check if contact selected "D" (none of these work)
+    if (label === 'D') {
+      return await this.handleNoneOfTheseWork(taskId, task, parsed);
+    }
+
+    if (!label) {
+      // Couldn't parse a label - wait for another reply or ask the user
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I received a reply from the contact but couldn't determine their selection. Here's what they said:\n\n"${parsed.bodyText.slice(0, 500)}"\n\nWould you like me to follow up with them?`,
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'How would you like to proceed?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // Find the chosen slot
+    const chosen = proposed.find((p) => p.label.toUpperCase() === label.toUpperCase());
+
+    if (!chosen) {
+      return 'handled';
+    }
+
+    // Check if slot is still available
+    const busy = await this.calendarApi.getBusyIntervals(task.userId, {
+      calendarId: 'primary',
+      timeMinIso: chosen.startIso,
+      timeMaxIso: chosen.endIso,
+      timeZone,
+    });
+
+    const isBusyNow = busy.some((b) => {
+      const busyStart = new Date(b.startIso).getTime();
+      const busyEnd = new Date(b.endIso).getTime();
+      const chosenStart = new Date(chosen.startIso).getTime();
+      const chosenEnd = new Date(chosen.endIso).getTime();
+      return busyStart < chosenEnd && busyEnd > chosenStart;
+    });
+
+    const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
+    const threadId = parsed.threadId;
+
+    if (isBusyNow) {
+      // Slot became unavailable - send new options
+      return await this.sendNewTimesAfterConflict(taskId, task, parsed, 'conflict');
+    }
+
+    // Create the calendar event
+    const contactName = typeof contact['name'] === 'string' ? contact['name'] : contactEmail;
+    const summary = `Meeting with ${contactName}`;
 
     const created = await this.calendarApi.createEvent(task.userId, {
       calendarId: 'primary',
       summary,
-      description: typeof meeting['description'] === 'string' ? meeting['description'] : undefined,
-      location: typeof meeting['location'] === 'string' ? meeting['location'] : undefined,
       startIso: chosen.startIso,
       endIso: chosen.endIso,
       timeZone,
       attendees: [{ email: contactEmail }],
     });
 
+    // Add HubSpot note
     const hubspotContactId =
-      typeof contact['hubspotContactId'] === 'string' ? contact['hubspotContactId'].trim() : '';
-
+      typeof contact['hubspotContactId'] === 'string' ? contact['hubspotContactId'] : '';
     if (hubspotContactId) {
       const noteBody =
         `Scheduled meeting.\n\n` +
         `Client: ${contactEmail}\n` +
         `Chosen option: ${label}\n` +
-        `Start: ${chosen.startIso}\n` +
-        `End: ${chosen.endIso}\n` +
+        `Start: ${formatDateTimeForHumans(chosen.startIso, timeZone)}\n` +
+        `End: ${formatDateTimeForHumans(chosen.endIso, timeZone)}\n` +
+        `Duration: ${durationMinutes} minutes\n` +
         `Calendar event: ${created.id}\n`;
 
       await this.hubspotApi.createNoteOnContact(task.userId, {
@@ -483,15 +886,17 @@ export class AgentRunnerService {
       });
     }
 
+    // Send confirmation email
     const confirmBody =
-      `Confirmed — you’re booked for option ${label}.\n\n` +
-      `Start: ${chosen.startIso}\n` +
-      `End: ${chosen.endIso}\n\n` +
-      `I’ve added it to my calendar and you should receive an invite shortly.`;
+      `Confirmed — you're booked for option ${label}.\n\n` +
+      `Start: ${formatDateTimeForHumans(chosen.startIso, timeZone)}\n` +
+      `End: ${formatDateTimeForHumans(chosen.endIso, timeZone)}\n` +
+      `Duration: ${durationMinutes} minutes\n\n` +
+      `I've added it to my calendar and you should receive an invite shortly.`;
 
     await this.gmailApi.sendEmail(task.userId, {
       to: contactEmail,
-      subject: parsed.subject ? `Re: ${parsed.subject}` : 'Re: Scheduling',
+      subject: parsed.subject ? `Re: ${parsed.subject}` : 'Re: Scheduling Request',
       bodyText: confirmBody,
       threadId,
     });
@@ -499,10 +904,9 @@ export class AgentRunnerService {
     await this.tasks.mergeMemory(taskId, {
       meeting: {
         ...meeting,
-        status: 'scheduled',
+        phase: 'scheduled',
         chosen: { label, startIso: chosen.startIso, endIso: chosen.endIso },
         calendarEventId: created.id,
-        gmailThreadId: threadId,
       },
     });
 
@@ -510,11 +914,194 @@ export class AgentRunnerService {
       taskId,
       userId: task.userId,
       role: 'assistant',
-      content: `Scheduled the meeting (option ${label}) and sent confirmation.`,
+      content:
+        `Meeting scheduled with ${contactName}!\n\n` +
+        `📅 ${formatDateTimeForHumans(chosen.startIso, timeZone)} – ${formatTimeForHumans(chosen.endIso, timeZone)}\n` +
+        `⏱️ ${durationMinutes} minutes\n\n` +
+        `I've created the calendar event and sent a confirmation email.`,
     });
 
     await this.tasks.setStatus(taskId, 'completed', null);
-    return 'completed';
+    return 'handled';
+  }
+
+  private async handleNoneOfTheseWork(
+    taskId: number,
+    task: AgentTaskRow,
+    parsed: {
+      threadId: string;
+      messageId: string;
+      from: string;
+      subject: string;
+      bodyText: string;
+    },
+  ): Promise<'handled'> {
+    await this.tasks.appendMessage({
+      taskId,
+      userId: task.userId,
+      role: 'assistant',
+      content: `The contact indicated none of the proposed times work for them. I'm automatically sending new time options.`,
+    });
+
+    return await this.sendNewTimesAfterConflict(taskId, task, parsed, 'none_work');
+  }
+
+  private async sendNewTimesAfterConflict(
+    taskId: number,
+    task: AgentTaskRow,
+    parsed: {
+      threadId: string;
+      messageId: string;
+      from: string;
+      subject: string;
+      bodyText: string;
+    },
+    reason: 'conflict' | 'none_work',
+  ): Promise<'handled'> {
+    const mem = task.memory ?? {};
+    const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
+    const contact = isRecord(meeting['contact']) ? meeting['contact'] : {};
+    const durationMinutes =
+      typeof meeting['durationMinutes'] === 'number' ? meeting['durationMinutes'] : 30;
+    const timeZone =
+      typeof meeting['timezone'] === 'string' ? meeting['timezone'] : 'America/Santo_Domingo';
+
+    // Safely parse previously proposed slots
+    const previouslyProposedRaw = Array.isArray(meeting['previouslyProposed'])
+      ? meeting['previouslyProposed']
+      : [];
+    const previouslyProposed: ProposedSlot[] = previouslyProposedRaw
+      .filter((p): p is Record<string, unknown> => isRecord(p))
+      .map((p) => ({
+        label: typeof p.label === 'string' ? p.label : '',
+        startIso: typeof p.startIso === 'string' ? p.startIso : '',
+        endIso: typeof p.endIso === 'string' ? p.endIso : '',
+      }))
+      .filter((p) => p.startIso);
+
+    const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
+    const threadId = parsed.threadId;
+
+    // Find new slots that haven't been proposed before
+    const now = Date.now();
+    const startIso = new Date(now + 60 * 60_000).toISOString();
+    const endIso = new Date(now + 21 * 24 * 60 * 60_000).toISOString(); // Extend to 3 weeks
+
+    const allSlots = await this.syncedDataTools.suggestCalendarTimesLocal({
+      userId: task.userId,
+      startIso,
+      endIso,
+      durationMinutes,
+      workDayStartHour: 9,
+      workDayEndHour: 17,
+      timezoneOffsetMinutes: -240,
+      maxSuggestions: 20,
+    });
+
+    // Filter out previously proposed times
+    const previousStartTimes = new Set(previouslyProposed.map((p) => p.startIso));
+
+    const newSlots = allSlots.filter((s) => !previousStartTimes.has(s.startIso));
+
+    const nextProposed: ProposedSlot[] = newSlots.slice(0, 3).map((s, idx) => ({
+      label: String.fromCharCode('A'.charCodeAt(0) + idx),
+      startIso: s.startIso,
+      endIso: s.endIso,
+    }));
+
+    if (nextProposed.length === 0) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I've run out of available time slots to propose. Would you like me to check a different date range or time of day?`,
+      });
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          ...meeting,
+          phase: 'need_user_approval',
+          proposed: [],
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'No more available slots. What would you like to do?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // Send email with new options FIRST
+    const intro =
+      reason === 'conflict'
+        ? `I apologize — the time you selected just became unavailable.\n\nHere are some alternative times. Please reply with A, B, C, or D if none of these work:\n`
+        : `No problem! Here are some additional times that might work better.\n\nPlease reply with A, B, C, or D if none of these work:\n`;
+
+    const body = buildSchedulingOptionsEmail({
+      intro,
+      options: nextProposed.map((p) => ({
+        label: p.label,
+        startIso: p.startIso,
+        endIso: p.endIso,
+        timeZone,
+      })),
+      includeNoneOption: true,
+    });
+
+    await this.gmailApi.sendEmail(task.userId, {
+      to: contactEmail,
+      subject: parsed.subject ? `Re: ${parsed.subject}` : 'Re: Scheduling Request',
+      bodyText: body,
+      threadId,
+    });
+
+    // AFTER sending, get the latest message timestamp
+    // This ensures we capture our newly sent message's timestamp
+    const threadMessages = await this.gmailApi.getThreadMessages(task.userId, threadId);
+    const latestInternalDateMs =
+      threadMessages.length > 0
+        ? Math.max(...threadMessages.map((m) => m.internalDateMs ?? 0))
+        : Date.now();
+
+    // Update memory with new proposed times
+    const updatedPreviouslyProposed: ProposedSlot[] = [...previouslyProposed, ...nextProposed];
+
+    await this.tasks.mergeMemory(taskId, {
+      meeting: {
+        ...meeting,
+        phase: 'waiting_contact_reply',
+        proposed: nextProposed,
+        previouslyProposed: updatedPreviouslyProposed,
+        gmailThreadId: threadId,
+      },
+    });
+
+    const sinceIso = new Date().toISOString();
+    await this.tasks.setWaiting(taskId, {
+      kind: 'gmail_reply',
+      threadId,
+      fromEmail: contactEmail,
+      sinceIso,
+      sinceInternalDateMs: latestInternalDateMs,
+    });
+    await this.tasks.setStatus(taskId, 'waiting', null);
+
+    const messageContent =
+      reason === 'conflict'
+        ? `The selected time became unavailable. I've sent new options to ${contactEmail}.`
+        : `I've sent new time options to ${contactEmail}.`;
+
+    await this.tasks.appendMessage({
+      taskId,
+      userId: task.userId,
+      role: 'assistant',
+      content: messageContent,
+    });
+
+    return 'handled';
   }
 
   private async handleToolCall(
@@ -608,12 +1195,19 @@ export class AgentRunnerService {
             return { kind: 'error', error: err };
           }
 
+          const threadMessages = await this.gmailApi.getThreadMessages(userId, gmailThreadId);
+          const latestInternalDateMs =
+            threadMessages.length > 0
+              ? Math.max(...threadMessages.map((m) => m.internalDateMs ?? 0))
+              : Date.now();
+
           const sinceIso = new Date().toISOString();
           const waiting: Record<string, unknown> = {
             kind: 'gmail_reply',
             threadId: gmailThreadId,
             fromEmail: fromEmail || null,
             sinceIso,
+            sinceInternalDateMs: latestInternalDateMs,
           };
 
           await this.tasks.setWaiting(taskId, waiting);
@@ -624,6 +1218,7 @@ export class AgentRunnerService {
             gmailThreadId,
             fromEmail: fromEmail || null,
             sinceIso,
+            sinceInternalDateMs: latestInternalDateMs,
           };
 
           await this.tasks.logToolCall({
@@ -639,7 +1234,6 @@ export class AgentRunnerService {
           return { kind: 'await', output: out };
         }
 
-        // Local mirror tools
         case 'hubspot_find_contacts_local': {
           const query = typeof args.query === 'string' ? args.query : '';
           const limit = typeof args.limit === 'number' ? args.limit : 10;
@@ -729,7 +1323,6 @@ export class AgentRunnerService {
           return { kind: 'ok', output: out };
         }
 
-        // Action tools
         case 'gmail_send_email': {
           const to = typeof args.to === 'string' ? args.to : '';
           const subject = typeof args.subject === 'string' ? args.subject : '';
@@ -793,11 +1386,9 @@ export class AgentRunnerService {
 
         case 'calendar_create_event': {
           const calendarId = typeof args.calendarId === 'string' ? args.calendarId : undefined;
-
           const summary = typeof args.summary === 'string' ? args.summary : '';
           const description = typeof args.description === 'string' ? args.description : undefined;
           const location = typeof args.location === 'string' ? args.location : undefined;
-
           const startIso = typeof args.startIso === 'string' ? args.startIso : '';
           const endIso = typeof args.endIso === 'string' ? args.endIso : '';
           const timeZone = typeof args.timeZone === 'string' ? args.timeZone : undefined;
@@ -981,25 +1572,9 @@ export class AgentRunnerService {
   }
 }
 
-function isLikelyScheduleMeetingGoal(goal: string): boolean {
-  const g = String(goal ?? '').toLowerCase();
-  return g.includes('schedule') && g.includes('meeting');
-}
+// HELPER FUNCTIONS
 
-function extractContactNameFromGoal(goal: string): string | null {
-  const g = String(goal ?? '').trim();
-  if (!g) return null;
-
-  const m =
-    g.match(/schedule\s+(?:a\s+)?meeting\s+with\s+(.+)$/i) ??
-    g.match(/schedule\s+meeting\s+with\s+(.+)$/i) ??
-    g.match(/set\s+up\s+(?:a\s+)?meeting\s+with\s+(.+)$/i);
-
-  const name = (m?.[1] ?? '').trim();
-  if (!name) return null;
-
-  return name.replace(/[.?!]+$/g, '').trim();
-}
+// HELPER FUNCTIONS
 
 function pickBestContact(
   matches: Array<{
@@ -1109,44 +1684,154 @@ function extractLabelChoice(body: string): string | null {
   const s = (body ?? '').trim();
   if (!s) return null;
 
-  const head = s.slice(0, 400);
+  // Take first 300 chars for analysis
+  const head = s.slice(0, 300);
+  const headUpper = head.toUpperCase();
 
-  const patterns = [
-    /\boption\s*([A-F])\b/i,
-    /\bchoose\s*([A-F])\b/i,
-    /\b([A-F])\)/i,
-    /\b([A-F])\b/i,
+  // FIRST: Check for explicit letter choices A, B, C at the very start
+  // This is the most common case: contact just replies "C" or "C." or "Option C"
+  
+  // Check if response starts with a single letter (most common case)
+  const startsWithLetter = head.match(/^([A-Ca-c])\b/);
+  if (startsWithLetter) {
+    return startsWithLetter[1].toUpperCase();
+  }
+
+  // Check for "Option X" pattern at the start
+  const optionAtStart = headUpper.match(/^OPTION\s*([A-C])\b/);
+  if (optionAtStart) {
+    return optionAtStart[1];
+  }
+
+  // Check for letter with parenthesis like "A)" or "(A)" at start
+  const parenAtStart = head.match(/^\(?([A-Ca-c])\)/);
+  if (parenAtStart) {
+    return parenAtStart[1].toUpperCase();
+  }
+
+  // SECOND: Check for choice phrases that indicate A, B, or C
+  const choicePatterns = [
+    /\bOPTION\s+([A-C])\b/i,
+    /\bCHOOSE\s+([A-C])\b/i,
+    /\bSELECT\s+([A-C])\b/i,
+    /\bPICK\s+([A-C])\b/i,
+    /\bPREFER\s+([A-C])\b/i,
+    /\bWANT\s+([A-C])\b/i,
+    /\b([A-C])\s+(?:WORKS?|PLEASE|IS\s+(?:GOOD|FINE|GREAT|PERFECT|BEST))\b/i,
+    /\bGO\s+(?:WITH|FOR)\s+(?:OPTION\s+)?([A-C])\b/i,
+    /\bLET'?S?\s+(?:DO|GO\s+WITH)\s+(?:OPTION\s+)?([A-C])\b/i,
+    /\bI'?LL?\s+(?:TAKE|DO)\s+(?:OPTION\s+)?([A-C])\b/i,
+    /\b([A-C])\s+(?:IS\s+)?(?:MY\s+)?(?:CHOICE|PREFERENCE)\b/i,
   ];
 
-  for (const re of patterns) {
-    const m = head.match(re);
-    if (m && m[1]) return String(m[1]).toUpperCase();
+  for (const pattern of choicePatterns) {
+    const match = head.match(pattern);
+    if (match && match[1]) {
+      return match[1].toUpperCase();
+    }
+  }
+
+  // THIRD: Check for standalone A, B, or C with clear word boundaries
+  // Be careful not to match letters that are part of words
+  const standaloneABC = headUpper.match(/(?:^|[\s.,:;!?()])([A-C])(?:[\s.,:;!?()]|$)/);
+  if (standaloneABC) {
+    return standaloneABC[1];
+  }
+
+  // FOURTH: Now check for explicit "D" or "none of these" ONLY if no A/B/C was found
+  
+  // Check if starts with D
+  const startsWithD = head.match(/^([Dd])\b/);
+  if (startsWithD) {
+    return 'D';
+  }
+
+  // Check for explicit "Option D"
+  const optionD = headUpper.match(/\bOPTION\s*D\b/);
+  if (optionD) {
+    return 'D';
+  }
+
+  // Check for standalone D
+  const standaloneD = headUpper.match(/(?:^|[\s.,:;!?()])D(?:[\s.,:;!?()]|$)/);
+  if (standaloneD) {
+    return 'D';
+  }
+
+  // Check for explicit "none of these" type phrases
+  // Be very specific to avoid false positives
+  const nonePatterns = [
+    /\bNONE\s+OF\s+(?:THESE|THEM|THE(?:SE)?\s+(?:TIMES?|OPTIONS?))\s+WORK/i,
+    /\bNONE\s+(?:OF\s+(?:THESE|THEM))?\s*WORK/i,
+    /\b(?:THESE|THEY)\s+DON'?T\s+WORK/i,
+    /\bCAN'?T\s+(?:MAKE|DO)\s+ANY\s+OF\s+(?:THESE|THEM|THOSE)/i,
+    /\bNONE\s+OF\s+(?:THESE|THEM|THOSE)\b/i,
+    /\bNEITHER\s+(?:OF\s+)?(?:THESE|THEM|THOSE)\b/i,
+  ];
+
+  for (const pattern of nonePatterns) {
+    if (pattern.test(head)) {
+      return 'D';
+    }
   }
 
   return null;
 }
 
-function extractEmail(s: string): string | null {
-  const m = String(s ?? '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-  return m ? m[0] : null;
-}
-
 function buildSchedulingOptionsEmail(input: {
   intro: string;
   options: Array<{ label: string; startIso: string; endIso: string; timeZone: string }>;
+  includeNoneOption?: boolean;
 }): string {
   const lines: string[] = [];
   lines.push(input.intro);
   lines.push('');
 
   for (const opt of input.options) {
-    lines.push(`${opt.label}) ${opt.startIso} – ${opt.endIso} (${opt.timeZone})`);
+    const start = formatDateTimeForHumans(opt.startIso, opt.timeZone);
+    const end = formatTimeForHumans(opt.endIso, opt.timeZone);
+    lines.push(`${opt.label}) ${start} – ${end}`);
+  }
+
+  if (input.includeNoneOption) {
+    lines.push(`D) None of these times work for me`);
   }
 
   lines.push('');
-  lines.push('Reply with A, B, or C.');
+  lines.push('Please reply with just the letter of your choice.');
 
   return lines.join('\n');
+}
+
+function formatDateTimeForHumans(isoString: string, timeZone: string): string {
+  try {
+    const date = new Date(isoString);
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }).format(date);
+  } catch {
+    return isoString;
+  }
+}
+
+function formatTimeForHumans(isoString: string, timeZone: string): string {
+  try {
+    const date = new Date(isoString);
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }).format(date);
+  } catch {
+    return isoString;
+  }
 }
 
 function safeJson(text: string): unknown {

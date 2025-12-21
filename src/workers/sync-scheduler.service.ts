@@ -17,8 +17,8 @@ export class SyncSchedulerService implements OnModuleInit {
       this.logger.log(`Enqueued ${SYNC_TICK_JOB} immediately (startup)`);
 
       // Agent tick scheduler
-      await this.pgBoss.client.schedule(AGENT_TICK_JOB, '*/2 * * * *', {});
-      this.logger.log(`Scheduled ${AGENT_TICK_JOB} every 2 minutes`);
+      await this.pgBoss.client.schedule(AGENT_TICK_JOB, '*/1 * * * *', {});
+      this.logger.log(`Scheduled ${AGENT_TICK_JOB} every 1 minute`);
 
       await this.pgBoss.client.send(AGENT_TICK_JOB, { reason: 'startup' });
       this.logger.log(`Enqueued ${AGENT_TICK_JOB} immediately (startup)`);

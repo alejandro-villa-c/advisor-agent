@@ -9,6 +9,7 @@ import { GoogleModule } from '../integrations/google/google.module';
 import { HubspotModule } from '../integrations/hubspot/hubspot.module';
 import { AgentIntentService } from './agent-intent.service';
 import { OpenAiModule } from '../integrations/openai/openai.module';
+import { AgentNlpService } from './agent-nlp.service';
 
 @Module({
   imports: [DbModule, JobsModule, GoogleModule, HubspotModule, OpenAiModule],
@@ -18,7 +19,8 @@ import { OpenAiModule } from '../integrations/openai/openai.module';
     AgentTasksService,
     AgentRunnerService,
     AgentIntentService,
+    AgentNlpService,
   ],
-  exports: [AgentTasksService, AgentRunnerService, AgentIntentService],
+  exports: [AgentTasksService, AgentRunnerService, AgentIntentService, AgentNlpService],
 })
 export class AgentModule {}

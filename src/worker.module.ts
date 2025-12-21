@@ -16,9 +16,18 @@ import { AgentReactWorker } from './workers/agent-react.worker';
 import { AgentRunTaskWorker } from './workers/agent-run-task.worker';
 import { AgentTickWorker } from './workers/agent-tick.worker';
 import { AgentModule } from './modules/agent/agent.module';
+import { WebSocketModule } from './modules/websocket/websocket.module';
 
 @Module({
-  imports: [DbModule, JobsModule, HubspotModule, RagModule, GoogleModule, AgentModule],
+  imports: [
+    DbModule,
+    JobsModule,
+    HubspotModule,
+    RagModule,
+    GoogleModule,
+    AgentModule,
+    WebSocketModule,
+  ],
   providers: [
     HubspotContactsSyncWorker,
     HubspotNotesSyncWorker,

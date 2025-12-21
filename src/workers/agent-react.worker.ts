@@ -5,6 +5,7 @@ import { AGENT_REACT_JOB } from '../jobs/job.constants';
 import { DbService } from '../db/db.service';
 import { agentTaskMessages, agentTasks, messages, threads } from '../db/schema';
 import { AgentTasksService } from '../modules/agent/agent-tasks.service';
+import { WebSocketEmitterService } from '../modules/websocket/websocket-emitter.service';
 
 type PgBossJob<T> = { id: string | number; data: T };
 
@@ -20,6 +21,7 @@ export class AgentReactWorker implements OnModuleInit {
     private readonly pgBoss: PgBossService,
     private readonly dbService: DbService,
     private readonly tasks: AgentTasksService,
+    private readonly wsEmitter: WebSocketEmitterService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -111,6 +113,12 @@ export class AgentReactWorker implements OnModuleInit {
         },
       });
 
+      // Emit WebSocket event via HTTP to web server
+      await this.wsEmitter.emitNewMessage(task.userId, threadId, {
+        role: 'assistant',
+        content,
+      });
+
       newestAgentMessageId = r.id;
     }
 
@@ -119,24 +127,40 @@ export class AgentReactWorker implements OnModuleInit {
 
     if (newAssistantRows.length === 0 && !terminalPushed) {
       if (task.status === 'failed' && task.lastError) {
+        const failureContent = `⚠️ Agent task failed: ${task.lastError}`;
+
         await this.dbService.db.insert(messages).values({
           userId: task.userId,
           threadId,
           role: 'assistant',
-          content: `⚠️ Agent task failed: ${task.lastError}`,
+          content: failureContent,
           meta: { agentTaskId: taskId, agentStatus: task.status },
         });
+
+        await this.wsEmitter.emitNewMessage(task.userId, threadId, {
+          role: 'assistant',
+          content: failureContent,
+        });
+
         didPushTerminalStatus = true;
       }
 
       if (task.status === 'completed') {
+        const completedContent = `✅ Done.`;
+
         await this.dbService.db.insert(messages).values({
           userId: task.userId,
           threadId,
           role: 'assistant',
-          content: `✅ Done.`,
+          content: completedContent,
           meta: { agentTaskId: taskId, agentStatus: task.status },
         });
+
+        await this.wsEmitter.emitNewMessage(task.userId, threadId, {
+          role: 'assistant',
+          content: completedContent,
+        });
+
         didPushTerminalStatus = true;
       }
     }
