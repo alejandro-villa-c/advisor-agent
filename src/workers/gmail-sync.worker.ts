@@ -12,25 +12,11 @@ import {
 
 export type GmailSyncJobData = {
   userId: number;
-
-  /**
-   * incremental: recent sync, uses after:lastSyncedAt (or newer_than:30d)
-   * initial: bounded historical sync (defaults to newer_than:90d)
-   * backfill: NO time filter; paginates through the mailbox using pageToken
-   */
   mode?: 'initial' | 'incremental' | 'backfill';
-
   daysBack?: number;
   q?: string;
-
-  maxPages?: number; // default varies by mode
-  maxMessages?: number; // default varies by mode
-
-  /**
-   * For backfill paging:
-   * - pass the last stored token to continue where you left off
-   * - worker writes next token to integration state
-   */
+  maxPages?: number;
+  maxMessages?: number;
   pageToken?: string | null;
 };
 
@@ -43,6 +29,23 @@ type BackfillState = {
   done: boolean;
   nextPageToken: string | null;
   lastRunAt: string | null;
+};
+
+type GmailMessageResult = {
+  id: string;
+  threadId?: string;
+  snippet?: string;
+  internalDateMs?: number;
+  headers: {
+    from?: string;
+    to?: string;
+    cc?: string;
+    bcc?: string;
+    subject?: string;
+    date?: string;
+  };
+  bodyText?: string;
+  bodyHtml?: string;
 };
 
 @Injectable()
@@ -89,15 +92,15 @@ export class GmailSyncWorker implements OnModuleInit {
 
   private async handleOne(job: PgBossJob<GmailSyncJobData>): Promise<void> {
     const userId = job.data.userId;
-
     const mode = job.data.mode ?? 'incremental';
 
-    // Aggressive defaults (big speed-up)
-    const maxPagesDefault = mode === 'backfill' ? 25 : mode === 'initial' ? 25 : 10;
-    const maxMessagesDefault = mode === 'backfill' ? 4000 : mode === 'initial' ? 2000 : 500;
+    // MEMORY FIX: Reduced batch sizes to prevent OOM
+    // Process fewer messages per job, but chain jobs faster
+    const maxPagesDefault = mode === 'backfill' ? 10 : mode === 'initial' ? 10 : 5;
+    const maxMessagesDefault = mode === 'backfill' ? 500 : mode === 'initial' ? 500 : 200;
 
-    const maxPages = clampInt(job.data.maxPages ?? maxPagesDefault, 1, 50);
-    const maxMessages = clampInt(job.data.maxMessages ?? maxMessagesDefault, 1, 20000);
+    const maxPages = clampInt(job.data.maxPages ?? maxPagesDefault, 1, 20);
+    const maxMessages = clampInt(job.data.maxMessages ?? maxMessagesDefault, 1, 1000);
 
     this.logger.log(
       `[${GMAIL_SYNC_MESSAGES_JOB}] start job=${String(job.id)} userId=${userId} mode=${mode} maxPages=${maxPages} maxMessages=${maxMessages}`,
@@ -126,8 +129,6 @@ export class GmailSyncWorker implements OnModuleInit {
       `[${GMAIL_SYNC_MESSAGES_JOB}] using query="${query}" pageToken=${startPageToken ? 'YES' : 'NO'}`,
     );
 
-    // Safety-first speed: stay under a budget and backoff on 429/403-quota errors.
-    // If you want faster, raise these carefully (unitsPerMinute first, then burst, then concurrency).
     const quota = new QuotaLimiter({ unitsPerMinute: 10_000, burstUnits: 2_000 });
 
     let pageToken: string | null = startPageToken;
@@ -136,6 +137,7 @@ export class GmailSyncWorker implements OnModuleInit {
     const messageIds: string[] = [];
     let lastNextPageToken: string | undefined;
 
+    // Phase 1: Collect message IDs (lightweight)
     while (pages < maxPages && messageIds.length < maxMessages) {
       pages += 1;
 
@@ -144,7 +146,7 @@ export class GmailSyncWorker implements OnModuleInit {
       const page = await withRetry(this.logger, 'listMessagesPage', async () =>
         this.gmailApi.listMessagesPage(userId, {
           q: query,
-          maxResults: Math.min(500, maxMessages - messageIds.length),
+          maxResults: Math.min(100, maxMessages - messageIds.length),
           pageToken,
         }),
       );
@@ -152,7 +154,6 @@ export class GmailSyncWorker implements OnModuleInit {
       if (page.ids.length === 0) break;
 
       messageIds.push(...page.ids);
-
       lastNextPageToken = page.nextPageToken;
 
       this.logger.log(
@@ -165,84 +166,147 @@ export class GmailSyncWorker implements OnModuleInit {
 
     const uniqueIds = Array.from(new Set(messageIds)).slice(0, maxMessages);
 
-    // Fetch existing docs once (for changed detection)
-    const existingBySourceId = await this.loadExistingDocsMap({
+    // Phase 2: Process messages in small batches to limit memory
+    // MEMORY FIX: Process in chunks of 50 instead of all at once
+    const PROCESS_BATCH_SIZE = 50;
+    const concurrency = mode === 'backfill' ? 5 : 3;
+
+    const touchedThreadIds = new Set<string>();
+    const changedSourceIds: string[] = [];
+    let totalProcessed = 0;
+    let totalMirrorInserted = 0;
+
+    for (const idBatch of chunkArray(uniqueIds, PROCESS_BATCH_SIZE)) {
+      // Fetch existing docs for this batch
+      const existingBySourceId = await this.loadExistingDocsMap({
+        userId,
+        source: 'gmail_email',
+        sourceIds: idBatch,
+      });
+
+      // Fetch messages for this batch
+      const messages = await mapWithConcurrency(idBatch, concurrency, async (id) => {
+        await quota.takeUnits(5);
+        const msg = await withRetry(this.logger, 'getMessage', async () =>
+          this.gmailApi.getMessage(userId, id),
+        );
+        if (msg.threadId) touchedThreadIds.add(msg.threadId);
+        return msg;
+      });
+
+      // Process and upsert this batch
+      const { mirrorInserted, changedIds } = await this.processMessageBatch({
+        userId,
+        messages,
+        existingBySourceId,
+      });
+
+      totalMirrorInserted += mirrorInserted;
+      changedSourceIds.push(...changedIds);
+      totalProcessed += messages.length;
+
+      this.logger.log(
+        `[${GMAIL_SYNC_MESSAGES_JOB}] batch processed=${totalProcessed}/${uniqueIds.length} mirrorUpserts=${totalMirrorInserted}`,
+      );
+
+      // MEMORY FIX: Allow GC between batches
+      await sleep(10);
+    }
+
+    const nowIso = new Date().toISOString();
+
+    const backfillState: BackfillState | null =
+      mode === 'backfill'
+        ? {
+            done: !lastNextPageToken,
+            nextPageToken: lastNextPageToken ?? null,
+            lastRunAt: nowIso,
+          }
+        : null;
+
+    await this.setIntegrationState(userId, {
+      ...(state ?? {}),
+      baseQuery: baseQueryFromState,
+      lastSyncedAt: nowIso,
+      lastQueryUsed: query,
+      ...(backfillState ? { backfill: backfillState } : {}),
+      lastRun: {
+        at: nowIso,
+        mode,
+        pages,
+        idsFetched: uniqueIds.length,
+        processed: totalProcessed,
+        changedDocuments: Array.from(new Set(changedSourceIds)).length,
+        mirrorUpserts: totalMirrorInserted,
+        backfillNextPageToken: backfillState?.nextPageToken ?? null,
+        backfillDone: backfillState?.done ?? null,
+      },
+    });
+
+    // Repair + embed (process in smaller batches)
+    const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'gmail_email',
       sourceIds: uniqueIds,
     });
 
-    const touchedThreadIds = new Set<string>();
-
-    // Parallelize Gmail message fetch for speed (budgeted by quota limiter)
-    const concurrency = mode === 'backfill' ? 20 : 10;
-
-    const messages = await mapWithConcurrency(uniqueIds, concurrency, async (id) => {
-      await quota.takeUnits(5);
-
-      const msg = await withRetry(this.logger, 'getMessage', async () =>
-        this.gmailApi.getMessage(userId, id),
-      );
-
-      if (msg.threadId) touchedThreadIds.add(msg.threadId);
-      return msg;
+    const changedDocIds = await this.loadDocumentIdsForSourceIds({
+      userId,
+      source: 'gmail_email',
+      sourceIds: changedSourceIds,
     });
 
-    // Batch upsert mirror table
-    let mirrorInserted = 0;
-    for (const batch of chunkArray(messages, 500)) {
-      const rows = batch.map((msg) => {
-        const sentAt =
-          typeof msg.internalDateMs === 'number' && Number.isFinite(msg.internalDateMs)
-            ? new Date(msg.internalDateMs)
-            : null;
+    await this.enqueueEmbedForDocumentIds({
+      userId,
+      documentIds: [...changedDocIds, ...repairDocIds],
+    });
 
-        return {
-          userId,
-          gmailMessageId: msg.id,
-          gmailThreadId: msg.threadId ?? null,
-          from: msg.headers.from ?? null,
-          to: msg.headers.to ?? null,
-          cc: msg.headers.cc ?? null,
-          bcc: msg.headers.bcc ?? null,
-          subject: msg.headers.subject ?? null,
-          snippet: msg.snippet ?? null,
-          sentAt,
-          raw: {
-            id: msg.id,
-            threadId: msg.threadId ?? null,
-            internalDateMs: msg.internalDateMs ?? null,
-            headers: msg.headers,
-            snippet: msg.snippet ?? null,
-            bodyText: msg.bodyText ?? null,
-            bodyHtml: msg.bodyHtml ?? null,
-          },
-        };
+    // Wake agent for touched threads (batch to avoid large payloads)
+    const threads = Array.from(touchedThreadIds).filter(Boolean);
+    for (const batch of chunkArray(threads, 50)) {
+      await this.pgBossService.client.send(AGENT_REACT_JOB, {
+        userId,
+        gmailThreadIds: batch,
       });
-
-      await this.dbService.db
-        .insert(gmailMessages)
-        .values(rows)
-        .onConflictDoUpdate({
-          target: [gmailMessages.userId, gmailMessages.gmailMessageId],
-          set: {
-            gmailThreadId: sql`excluded.gmail_thread_id`,
-            from: sql`excluded."from"`,
-            to: sql`excluded."to"`,
-            cc: sql`excluded.cc`,
-            bcc: sql`excluded.bcc`,
-            subject: sql`excluded.subject`,
-            snippet: sql`excluded.snippet`,
-            sentAt: sql`excluded.sent_at`,
-            raw: sql`excluded.raw`,
-            updatedAt: sql`now()`,
-          },
-        });
-
-      mirrorInserted += rows.length;
     }
 
-    const changedSourceIds: string[] = [];
+    // Chain next backfill page immediately if more pages exist
+    let didEnqueueNextBackfill = false;
+
+    if (mode === 'backfill' && lastNextPageToken) {
+      const tokenKeyPart = hashSingletonKeyPart(lastNextPageToken);
+
+      await this.pgBossService.client.send(
+        GMAIL_SYNC_MESSAGES_JOB,
+        {
+          userId,
+          mode: 'backfill',
+          maxPages,
+          maxMessages,
+          pageToken: lastNextPageToken,
+        },
+        {
+          singletonKey: `gmail_backfill_page:${userId}:${tokenKeyPart}`,
+          singletonSeconds: 3600,
+        },
+      );
+
+      didEnqueueNextBackfill = true;
+    }
+
+    this.logger.log(
+      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} mode=${mode} processed=${totalProcessed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} touchedThreads=${threads.length} backfillDone=${backfillState?.done ?? 'n/a'} enqueuedNextBackfill=${didEnqueueNextBackfill}`,
+    );
+  }
+
+  private async processMessageBatch(input: {
+    userId: number;
+    messages: GmailMessageResult[];
+    existingBySourceId: Map<string, { title: string; text: string }>;
+  }): Promise<{ mirrorInserted: number; changedIds: string[] }> {
+    const { userId, messages, existingBySourceId } = input;
+
+    const changedIds: string[] = [];
     const changedDocRows: Array<{
       userId: number;
       source: 'gmail_email';
@@ -252,8 +316,56 @@ export class GmailSyncWorker implements OnModuleInit {
       meta: Record<string, unknown>;
     }> = [];
 
-    let processed = 0;
+    // Batch upsert mirror table
+    const mirrorRows = messages.map((msg) => {
+      const sentAt =
+        typeof msg.internalDateMs === 'number' && Number.isFinite(msg.internalDateMs)
+          ? new Date(msg.internalDateMs)
+          : null;
 
+      return {
+        userId,
+        gmailMessageId: msg.id,
+        gmailThreadId: msg.threadId ?? null,
+        from: msg.headers.from ?? null,
+        to: msg.headers.to ?? null,
+        cc: msg.headers.cc ?? null,
+        bcc: msg.headers.bcc ?? null,
+        subject: msg.headers.subject ?? null,
+        snippet: msg.snippet ?? null,
+        sentAt,
+        raw: {
+          id: msg.id,
+          threadId: msg.threadId ?? null,
+          internalDateMs: msg.internalDateMs ?? null,
+          headers: msg.headers,
+          snippet: msg.snippet ?? null,
+          bodyText: msg.bodyText ?? null,
+          bodyHtml: msg.bodyHtml ?? null,
+        },
+      };
+    });
+
+    await this.dbService.db
+      .insert(gmailMessages)
+      .values(mirrorRows)
+      .onConflictDoUpdate({
+        target: [gmailMessages.userId, gmailMessages.gmailMessageId],
+        set: {
+          gmailThreadId: sql`excluded.gmail_thread_id`,
+          from: sql`excluded."from"`,
+          to: sql`excluded."to"`,
+          cc: sql`excluded.cc`,
+          bcc: sql`excluded.bcc`,
+          subject: sql`excluded.subject`,
+          snippet: sql`excluded.snippet`,
+          sentAt: sql`excluded.sent_at`,
+          raw: sql`excluded.raw`,
+          updatedAt: sql`now()`,
+        },
+      });
+
+    // Build document rows
     for (const msg of messages) {
       const sentAt =
         typeof msg.internalDateMs === 'number' && Number.isFinite(msg.internalDateMs)
@@ -287,7 +399,7 @@ export class GmailSyncWorker implements OnModuleInit {
       const unchanged = existing && existing.title === docTitle && existing.text === docText;
 
       if (!unchanged) {
-        changedSourceIds.push(msg.id);
+        changedIds.push(msg.id);
         changedDocRows.push({
           userId,
           source: 'gmail_email',
@@ -304,20 +416,13 @@ export class GmailSyncWorker implements OnModuleInit {
           },
         });
       }
-
-      processed += 1;
-      if (processed % 250 === 0) {
-        this.logger.log(
-          `[${GMAIL_SYNC_MESSAGES_JOB}] processed=${processed}/${messages.length} mirrorUpserts=${mirrorInserted}`,
-        );
-      }
     }
 
-    // Batch upsert changed documents
-    for (const batch of chunkArray(changedDocRows, 500)) {
+    // Batch upsert documents
+    if (changedDocRows.length > 0) {
       await this.dbService.db
         .insert(documents)
-        .values(batch)
+        .values(changedDocRows)
         .onConflictDoUpdate({
           target: [documents.userId, documents.source, documents.sourceId],
           set: {
@@ -329,99 +434,7 @@ export class GmailSyncWorker implements OnModuleInit {
         });
     }
 
-    const nowIso = new Date().toISOString();
-
-    // Backfill progress (only meaningful in backfill mode)
-    const backfillState: BackfillState | null =
-      mode === 'backfill'
-        ? {
-            done: !lastNextPageToken,
-            nextPageToken: lastNextPageToken ?? null,
-            lastRunAt: nowIso,
-          }
-        : null;
-
-    await this.setIntegrationState(userId, {
-      ...(state ?? {}),
-      baseQuery: baseQueryFromState,
-      lastSyncedAt: nowIso,
-      lastQueryUsed: query,
-      ...(backfillState
-        ? {
-            backfill: backfillState,
-          }
-        : {}),
-      lastRun: {
-        at: nowIso,
-        mode,
-        pages,
-        idsFetched: uniqueIds.length,
-        processed,
-        changedDocuments: Array.from(new Set(changedSourceIds)).length,
-        mirrorUpserts: mirrorInserted,
-        backfillNextPageToken: backfillState?.nextPageToken ?? null,
-        backfillDone: backfillState?.done ?? null,
-      },
-    });
-
-    // Repair behavior: include docs missing chunkIndex=0 even if unchanged
-    const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
-      userId,
-      source: 'gmail_email',
-      sourceIds: uniqueIds,
-    });
-
-    await this.enqueueEmbedForDocumentIds({
-      userId,
-      documentIds: [
-        ...(await this.loadDocumentIdsForSourceIds({
-          userId,
-          source: 'gmail_email',
-          sourceIds: changedSourceIds,
-        })),
-        ...repairDocIds,
-      ],
-    });
-
-    // Wake agent waiting tasks for touched threads
-    const threads = Array.from(touchedThreadIds).filter(Boolean);
-    for (const batch of chunkArray(threads, 200)) {
-      await this.pgBossService.client.send(AGENT_REACT_JOB, {
-        userId,
-        gmailThreadIds: batch,
-      });
-    }
-
-    // Key speed fix: if backfill has more pages, enqueue the next page immediately.
-    // This removes the "wait for tick + singleton window" delay between pages.
-    let didEnqueueNextBackfill = false;
-
-    if (mode === 'backfill' && lastNextPageToken) {
-      const tokenKeyPart = hashSingletonKeyPart(lastNextPageToken);
-
-      // Use bound method call instead of extracted function to preserve `this` context
-      await this.pgBossService.client.send(
-        GMAIL_SYNC_MESSAGES_JOB,
-        {
-          userId,
-          mode: 'backfill',
-          maxPages,
-          maxMessages,
-          pageToken: lastNextPageToken,
-        },
-        {
-          // Dedupe per (user, token-hash) to avoid enqueue storms if something retries.
-          singletonKey: `gmail_backfill_page:${userId}:${tokenKeyPart}`,
-          singletonSeconds: 3600,
-        },
-      );
-
-      didEnqueueNextBackfill = true;
-    }
-
-    this.logger.log(
-      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} mode=${mode} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} touchedThreads=${threads.length} backfillDone=${backfillState?.done ?? 'n/a'} enqueuedNextBackfill=${didEnqueueNextBackfill}`,
-    );
+    return { mirrorInserted: mirrorRows.length, changedIds };
   }
 
   private async loadExistingDocsMap(input: {
@@ -434,7 +447,7 @@ export class GmailSyncWorker implements OnModuleInit {
     const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
     if (ids.length === 0) return map;
 
-    for (const chunk of chunkArray(ids, 1000)) {
+    for (const chunk of chunkArray(ids, 500)) {
       const rows = await this.dbService.db
         .select({ sourceId: documents.sourceId, title: documents.title, text: documents.text })
         .from(documents)
@@ -464,7 +477,7 @@ export class GmailSyncWorker implements OnModuleInit {
 
     const out: number[] = [];
 
-    for (const chunk of chunkArray(ids, 1000)) {
+    for (const chunk of chunkArray(ids, 500)) {
       const rows = await this.dbService.db
         .select({ id: documents.id })
         .from(documents)
@@ -492,7 +505,7 @@ export class GmailSyncWorker implements OnModuleInit {
 
     const out: number[] = [];
 
-    for (const chunk of chunkArray(ids, 1000)) {
+    for (const chunk of chunkArray(ids, 500)) {
       const rows = await this.dbService.db
         .select({ id: documents.id })
         .from(documents)
@@ -529,7 +542,8 @@ export class GmailSyncWorker implements OnModuleInit {
 
     if (unique.length === 0) return;
 
-    for (const batch of chunkArray(unique, 1000)) {
+    // MEMORY FIX: Smaller batches for embed jobs
+    for (const batch of chunkArray(unique, 200)) {
       await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
         userId: input.userId,
         documentIds: batch,
@@ -577,9 +591,7 @@ function buildGmailQuery(input: {
     input.baseQuery?.trim() ||
     'in:inbox -in:spam -in:trash -in:chats';
 
-  // backfill explicitly means "no time filter"
   if (input.mode === 'backfill') return base;
-
   if (hasTimeFilter(base)) return base;
 
   if (input.mode === 'initial') {
@@ -587,7 +599,6 @@ function buildGmailQuery(input: {
     return `${base} newer_than:${daysBack}d`;
   }
 
-  // incremental
   if (input.lastSyncedAt) {
     const lastMs = Date.parse(input.lastSyncedAt);
     if (Number.isFinite(lastMs)) {
@@ -648,7 +659,6 @@ async function mapWithConcurrency<T, R>(
   if (list.length === 0) return [];
 
   const out = new Array<R>(list.length);
-
   let index = 0;
 
   const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
@@ -668,21 +678,18 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null;
-}
-
 function isRateLimitLikeError(err: unknown): boolean {
-  if (!isRecord(err)) return false;
+  if (typeof err !== 'object' || err === null) return false;
+  const e = err as Record<string, unknown>;
 
-  const status = typeof err['status'] === 'number' ? err['status'] : undefined;
-  const code = typeof err['code'] === 'number' ? err['code'] : undefined;
+  const status = typeof e['status'] === 'number' ? e['status'] : undefined;
+  const code = typeof e['code'] === 'number' ? e['code'] : undefined;
   const httpStatus = status ?? code;
 
   if (httpStatus === 429) return true;
 
   if (httpStatus === 403) {
-    const message = typeof err['message'] === 'string' ? err['message'] : '';
+    const message = typeof e['message'] === 'string' ? e['message'] : '';
     if (/rate limit|userRateLimitExceeded|quota|resource has been exhausted/i.test(message)) {
       return true;
     }
@@ -699,11 +706,8 @@ async function withRetry<T>(logger: Logger, label: string, fn: () => Promise<T>)
       return await fn();
     } catch (err: unknown) {
       attempt += 1;
-
-      // Only retry the stuff that is usually transient (rate/quota).
       if (!isRateLimitLikeError(err) || attempt >= 8) throw err;
 
-      // 250ms, 500ms, 1s, 2s, 4s... capped + jitter
       const base = Math.min(10_000, 250 * 2 ** (attempt - 1));
       const jitter = Math.floor(Math.random() * 250);
       const waitMs = base + jitter;
@@ -758,7 +762,6 @@ class QuotaLimiter {
 }
 
 function hashSingletonKeyPart(value: string): string {
-  // Simple 32-bit hash -> base36 string (short, pg-boss singletonKey-friendly)
   let hash = 2166136261;
 
   for (let i = 0; i < value.length; i += 1) {
@@ -766,7 +769,6 @@ function hashSingletonKeyPart(value: string): string {
     hash = Math.imul(hash, 16777619);
   }
 
-  // Force unsigned 32-bit
   const unsigned = hash >>> 0;
   return unsigned.toString(36);
 }

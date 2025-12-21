@@ -142,6 +142,20 @@ export class SyncTickWorker implements OnModuleInit {
                   singletonSeconds: 600,
                 },
               );
+              await this.enqueueJob(
+                GMAIL_SYNC_MESSAGES_JOB,
+                {
+                  userId,
+                  mode: 'backfill',
+                  maxPages: 10,
+                  maxMessages: 500,
+                  pageToken: gmailBackfill.nextPageToken,
+                },
+                {
+                  singletonKey: `gmail_backfill:${userId}`,
+                  singletonSeconds: 300,
+                },
+              );
               enqueued += 1;
             }
           }
