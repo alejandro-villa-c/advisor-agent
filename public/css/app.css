@@ -361,7 +361,8 @@ body {
 }
 
 .msg--user .msg__text {
-  background: var(--chip);
+  background: #e0e7ef;
+  border-color: #d0d9e4;
 }
 
 .msg__content {
