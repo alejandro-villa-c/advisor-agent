@@ -119,25 +119,31 @@ export class SyncTickWorker implements OnModuleInit {
 
         if (flags.hasGoogle) {
           const gmailBackfill = readGmailBackfill(stateByKey.get(`${userId}:gmail`));
-          const backfillLast = gmailBackfill.lastRunAt ?? lastSyncedAtByKey.get(`${userId}:gmail`);
 
-          // Keep your existing "best-effort" gating; once Gmail worker chains, this is just a safety net.
-          if (!gmailBackfill.done && shouldRun(backfillLast, 10)) {
-            await this.enqueueJob(
-              GMAIL_SYNC_MESSAGES_JOB,
-              {
-                userId,
-                mode: 'backfill',
-                maxPages: 25,
-                maxMessages: 4000,
-                pageToken: gmailBackfill.nextPageToken,
-              },
-              {
-                singletonKey: `gmail_backfill:${userId}`,
-                singletonSeconds: 600,
-              },
-            );
-            enqueued += 1;
+          // FIX: Only use backfill.lastRunAt for backfill scheduling, NOT lastSyncedAt.
+          // If backfill has never run (lastRunAt is null), always trigger it.
+          // This prevents incremental sync from blocking backfill from ever starting.
+          if (!gmailBackfill.done) {
+            const shouldRunBackfill =
+              gmailBackfill.lastRunAt === null || shouldRun(gmailBackfill.lastRunAt, 10);
+
+            if (shouldRunBackfill) {
+              await this.enqueueJob(
+                GMAIL_SYNC_MESSAGES_JOB,
+                {
+                  userId,
+                  mode: 'backfill',
+                  maxPages: 25,
+                  maxMessages: 4000,
+                  pageToken: gmailBackfill.nextPageToken,
+                },
+                {
+                  singletonKey: `gmail_backfill:${userId}`,
+                  singletonSeconds: 600,
+                },
+              );
+              enqueued += 1;
+            }
           }
 
           if (shouldRun(lastSyncedAtByKey.get(`${userId}:gmail`), 3)) {
