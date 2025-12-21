@@ -64,22 +64,42 @@ export class AgentTickWorker implements OnModuleInit {
 
     const threadId = typeof waiting.threadId === 'string' ? waiting.threadId.trim() : '';
     const fromEmailRaw = typeof waiting.fromEmail === 'string' ? waiting.fromEmail.trim() : '';
+
+    // Prefer Gmail internal baseline
+    const sinceInternalDateMsRaw =
+      typeof waiting.sinceInternalDateMs === 'number' ? waiting.sinceInternalDateMs : NaN;
+
+    // Fallback for older rows that only have sinceIso
     const sinceIso = typeof waiting.sinceIso === 'string' ? waiting.sinceIso.trim() : '';
+    const sinceIsoMs = sinceIso ? Date.parse(sinceIso) : NaN;
 
-    if (!threadId || !sinceIso) return false;
-
-    const sinceMs = Date.parse(sinceIso);
-    if (!Number.isFinite(sinceMs)) return false;
+    if (!threadId) return false;
 
     const messages = await this.gmailApi.getThreadMessages(task.userId, threadId);
 
-    // Find newest matching message after sinceMs, optionally from fromEmail
     const fromEmail = fromEmailRaw ? fromEmailRaw.toLowerCase() : '';
+
+    const baselineInternalMs = Number.isFinite(sinceInternalDateMsRaw)
+      ? sinceInternalDateMsRaw
+      : null;
+    const baselineIsoMs = Number.isFinite(sinceIsoMs) ? sinceIsoMs : null;
+
     let best: { msgId: string; internalDateMs: number; content: string } | null = null;
 
     for (const m of messages) {
       const internalDateMs = typeof m.internalDateMs === 'number' ? m.internalDateMs : NaN;
-      if (!Number.isFinite(internalDateMs) || internalDateMs <= sinceMs) continue;
+      if (!Number.isFinite(internalDateMs)) continue;
+
+      // Compare using Gmail timeline when possible
+      if (baselineInternalMs !== null) {
+        if (internalDateMs <= baselineInternalMs) continue;
+      } else if (baselineIsoMs !== null) {
+        // fallback only
+        if (internalDateMs <= baselineIsoMs) continue;
+      } else {
+        // no baseline at all -> be conservative and do nothing
+        continue;
+      }
 
       const fromHeader = (m.headers.from ?? '').toLowerCase();
       if (fromEmail && !fromHeader.includes(fromEmail)) continue;

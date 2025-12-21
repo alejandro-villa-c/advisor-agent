@@ -1,17 +1,15 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, gt, sql } from 'drizzle-orm';
 import { PgBossService } from '../jobs/pgboss.service';
-import { AGENT_REACT_JOB, AGENT_RUN_TASK_JOB } from '../jobs/job.constants';
-import { AgentTasksService, type AgentTaskRow } from '../modules/agent/agent-tasks.service';
-import { GmailApiService } from '../modules/integrations/google/gmail-api.service';
+import { AGENT_REACT_JOB } from '../jobs/job.constants';
 import { DbService } from '../db/db.service';
-import { agentTasks } from '../db/schema';
+import { agentTaskMessages, agentTasks, messages, threads } from '../db/schema';
+import { AgentTasksService } from '../modules/agent/agent-tasks.service';
 
 type PgBossJob<T> = { id: string | number; data: T };
 
-export type AgentReactJobData = {
-  userId: number;
-  reason?: string;
+type AgentReactJobData = {
+  taskId: number;
 };
 
 @Injectable()
@@ -20,12 +18,19 @@ export class AgentReactWorker implements OnModuleInit {
 
   constructor(
     private readonly pgBoss: PgBossService,
-    private readonly tasks: AgentTasksService,
-    private readonly gmailApi: GmailApiService,
     private readonly dbService: DbService,
+    private readonly tasks: AgentTasksService,
   ) {}
 
   async onModuleInit(): Promise<void> {
+    try {
+      await this.pgBoss.client.createQueue(AGENT_REACT_JOB);
+    } catch (err: unknown) {
+      this.logger.warn(
+        `createQueue(${AGENT_REACT_JOB}) failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
     await this.pgBoss.client.work(
       AGENT_REACT_JOB,
       { batchSize: 1 },
@@ -38,151 +43,128 @@ export class AgentReactWorker implements OnModuleInit {
   }
 
   private async handleOne(job: PgBossJob<AgentReactJobData>): Promise<void> {
-    const userId = Number(job.data?.userId);
-    if (!Number.isFinite(userId) || userId <= 0) {
-      this.logger.warn(`[${AGENT_REACT_JOB}] invalid userId in job=${String(job.id)}`);
+    const taskId = Number(job.data?.taskId);
+    if (!Number.isFinite(taskId) || taskId <= 0) {
+      this.logger.warn(`[${AGENT_REACT_JOB}] invalid taskId in job=${String(job.id)}`);
       return;
     }
 
-    const reason = typeof job.data?.reason === 'string' ? job.data.reason : '';
-    this.logger.log(
-      `[${AGENT_REACT_JOB}] start job=${String(job.id)} userId=${userId} reason=${reason}`,
-    );
+    const task = await this.tasks.getTask(taskId);
+    if (!task) return;
 
-    const waitingTasks = await this.tasks.listWaitingTasksForUser(userId, 250);
+    const chatBridge = isRecord(task.memory?.['chatBridge']) ? task.memory['chatBridge'] : null;
+    const threadId =
+      chatBridge && typeof chatBridge['threadId'] === 'number' ? chatBridge['threadId'] : null;
 
-    let resumed = 0;
-    for (const t of waitingTasks) {
-      const didResume = await this.tryResumeWaitingTask(t);
-      if (didResume) resumed += 1;
-    }
+    if (!threadId || !Number.isFinite(threadId) || threadId <= 0) return;
 
-    this.logger.log(
-      `[${AGENT_REACT_JOB}] done job=${String(job.id)} userId=${userId} waiting=${waitingTasks.length} resumed=${resumed}`,
-    );
-  }
+    // Safety: ensure thread belongs to user.
+    const owned = await this.dbService.db
+      .select({ id: threads.id })
+      .from(threads)
+      .where(and(eq(threads.id, threadId), eq(threads.userId, task.userId)))
+      .limit(1);
 
-  private async tryResumeWaitingTask(task: AgentTaskRow): Promise<boolean> {
-    const waiting = task.waiting;
-    if (!isRecord(waiting)) return false;
+    if (!owned[0]) return;
 
-    const kind = typeof waiting.kind === 'string' ? waiting.kind : '';
-    if (kind !== 'gmail_reply') return false;
+    const lastPushed =
+      chatBridge && typeof chatBridge['lastPushedAgentMessageId'] === 'number'
+        ? chatBridge['lastPushedAgentMessageId']
+        : 0;
 
-    const threadId = typeof waiting.threadId === 'string' ? waiting.threadId.trim() : '';
-    const fromEmailRaw = typeof waiting.fromEmail === 'string' ? waiting.fromEmail.trim() : '';
-    const sinceIso = typeof waiting.sinceIso === 'string' ? waiting.sinceIso.trim() : '';
-    if (!threadId || !sinceIso) return false;
+    const terminalPushed =
+      chatBridge && typeof chatBridge['didPushTerminalStatus'] === 'boolean'
+        ? chatBridge['didPushTerminalStatus']
+        : false;
 
-    const sinceMs = Date.parse(sinceIso);
-    if (!Number.isFinite(sinceMs)) return false;
+    const newAssistantRows = await this.dbService.db
+      .select({
+        id: agentTaskMessages.id,
+        content: agentTaskMessages.content,
+      })
+      .from(agentTaskMessages)
+      .where(
+        and(
+          eq(agentTaskMessages.taskId, taskId),
+          eq(agentTaskMessages.role, 'assistant'),
+          gt(agentTaskMessages.id, lastPushed),
+        ),
+      )
+      .orderBy(agentTaskMessages.id)
+      .limit(100);
 
-    const messages = await this.gmailApi.getThreadMessages(task.userId, threadId);
+    let newestAgentMessageId = lastPushed;
 
-    const fromEmail = fromEmailRaw ? fromEmailRaw.toLowerCase() : '';
-    let best: { msgId: string; internalDateMs: number; content: string } | null = null;
+    for (const r of newAssistantRows) {
+      const content = String(r.content ?? '').trim();
+      if (!content) continue;
 
-    for (const m of messages) {
-      const internalDateMs = typeof m.internalDateMs === 'number' ? m.internalDateMs : NaN;
-      if (!Number.isFinite(internalDateMs) || internalDateMs <= sinceMs) continue;
-
-      const fromHeader = (m.headers.from ?? '').toLowerCase();
-      if (fromEmail && !fromHeader.includes(fromEmail)) continue;
-
-      const content = formatIncomingEmailForAgent({
+      await this.dbService.db.insert(messages).values({
+        userId: task.userId,
         threadId,
-        messageId: m.id,
-        from: m.headers.from,
-        to: m.headers.to,
-        subject: m.headers.subject,
-        date: m.headers.date,
-        snippet: m.snippet,
-        bodyText: m.bodyText,
+        role: 'assistant',
+        content,
+        meta: {
+          agentTaskId: taskId,
+          agentTaskMessageId: r.id,
+          agentStatus: task.status,
+        },
       });
 
-      if (!best || internalDateMs > best.internalDateMs) {
-        best = { msgId: m.id, internalDateMs, content };
+      newestAgentMessageId = r.id;
+    }
+
+    // If the task ended but produced no assistant text, push a terminal status once.
+    let didPushTerminalStatus = terminalPushed;
+
+    if (newAssistantRows.length === 0 && !terminalPushed) {
+      if (task.status === 'failed' && task.lastError) {
+        await this.dbService.db.insert(messages).values({
+          userId: task.userId,
+          threadId,
+          role: 'assistant',
+          content: `⚠️ Agent task failed: ${task.lastError}`,
+          meta: { agentTaskId: taskId, agentStatus: task.status },
+        });
+        didPushTerminalStatus = true;
+      }
+
+      if (task.status === 'completed') {
+        await this.dbService.db.insert(messages).values({
+          userId: task.userId,
+          threadId,
+          role: 'assistant',
+          content: `✅ Done.`,
+          meta: { agentTaskId: taskId, agentStatus: task.status },
+        });
+        didPushTerminalStatus = true;
       }
     }
 
-    if (!best) return false;
+    // Update task memory with new bridge pointer.
+    const currentMemory = isRecord(task.memory) ? task.memory : {};
+    const currentBridge = isRecord(currentMemory['chatBridge']) ? currentMemory['chatBridge'] : {};
 
-    const claimed = await this.claimWaitingTask(task.id);
-    if (!claimed) return false;
-
-    await this.tasks.appendMessage({
-      taskId: task.id,
-      userId: task.userId,
-      role: 'user',
-      content: best.content,
-    });
-
-    await this.pgBoss.client.send(
-      AGENT_RUN_TASK_JOB,
-      { taskId: task.id },
-      {
-        singletonKey: `agent.runTask:${task.id}`,
-        singletonSeconds: 60,
+    const nextMemory: Record<string, unknown> = {
+      ...currentMemory,
+      chatBridge: {
+        ...currentBridge,
+        threadId,
+        lastPushedAgentMessageId: newestAgentMessageId,
+        didPushTerminalStatus,
       },
-    );
+    };
 
-    this.logger.log(
-      `[${AGENT_REACT_JOB}] resumed taskId=${task.id} via gmail_reply threadId=${threadId} msgId=${best.msgId}`,
-    );
-
-    return true;
-  }
-
-  private async claimWaitingTask(taskId: number): Promise<boolean> {
-    const db = this.dbService.db;
-
-    const res = await db
+    await this.dbService.db
       .update(agentTasks)
       .set({
-        status: 'queued',
-        waiting: null,
-        lastError: null,
+        memory: nextMemory,
         updatedAt: sql`now()`,
       })
-      .where(and(eq(agentTasks.id, taskId), eq(agentTasks.status, 'waiting')))
-      .returning({ id: agentTasks.id });
-
-    return res.length > 0;
+      .where(eq(agentTasks.id, taskId));
   }
 }
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
-}
-
-function formatIncomingEmailForAgent(input: {
-  threadId: string;
-  messageId: string;
-  from?: string;
-  to?: string;
-  subject?: string;
-  date?: string;
-  snippet?: string;
-  bodyText?: string;
-}): string {
-  const lines: string[] = [];
-  lines.push('INCOMING_EMAIL_REPLY');
-  lines.push(`threadId: ${input.threadId}`);
-  lines.push(`messageId: ${input.messageId}`);
-  if (input.from) lines.push(`from: ${input.from}`);
-  if (input.to) lines.push(`to: ${input.to}`);
-  if (input.subject) lines.push(`subject: ${input.subject}`);
-  if (input.date) lines.push(`date: ${input.date}`);
-  lines.push('');
-
-  const body = (input.bodyText ?? '').trim();
-  if (body) {
-    lines.push(body.length > 8000 ? body.slice(0, 8000) : body);
-  } else if (input.snippet?.trim()) {
-    lines.push(input.snippet.trim());
-  } else {
-    lines.push('(no body text available)');
-  }
-
-  return lines.join('\n');
 }

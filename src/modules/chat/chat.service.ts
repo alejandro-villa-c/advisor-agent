@@ -3,7 +3,14 @@ import { and, asc, desc, eq, inArray } from 'drizzle-orm';
 import { DbService } from '../../db/db.service';
 import { agentInstructions, messages, threads } from '../../db/schema';
 import { RagService, type RagSearchRow } from '../rag/rag.service';
-import { OpenAiChatService, type OpenAiChatMessage } from './openai-chat.service';
+import {
+  OpenAiChatService,
+  type OpenAiChatMessage,
+} from '../integrations/openai/openai-chat.service';
+import { AgentIntentService } from '../agent/agent-intent.service';
+import { AgentTasksService } from '../agent/agent-tasks.service';
+import { PgBossService } from '../../jobs/pgboss.service';
+import { AGENT_RUN_TASK_JOB } from '../../jobs/job.constants';
 
 type ChatCitation = {
   chunkId: number;
@@ -14,13 +21,11 @@ type ChatCitation = {
   excerpt: string;
 };
 
-// Stored in DB only (minimal, no excerpt bloat)
-// Now includes similarity + distance for debugging + ranking.
 type ChatDebugCitation = {
   chunkId: number;
   documentId: number;
-  similarity: number | null; // higher = better match (when available)
-  distance: number | null; // lower = better match (when available)
+  similarity: number | null;
+  distance: number | null;
 };
 
 type RetrievalPlan = {
@@ -35,6 +40,9 @@ export class ChatService {
     private readonly dbService: DbService,
     private readonly rag: RagService,
     private readonly llm: OpenAiChatService,
+    private readonly agentIntent: AgentIntentService,
+    private readonly agentTasks: AgentTasksService,
+    private readonly pgBoss: PgBossService,
   ) {}
 
   async sendMessage(input: {
@@ -70,7 +78,7 @@ export class ChatService {
       isNewThread = true;
     }
 
-    // Store user message
+    // Store user message in thread
     const insertedUser = await this.dbService.db
       .insert(messages)
       .values({
@@ -108,6 +116,25 @@ export class ChatService {
       }
     }
 
+    // 1) If there is a waiting task asking the advisor for info, treat this message as the reply.
+    const resumed = await this.tryResumeWaitingUserMessageTask({
+      userId,
+      threadId,
+      advisorReplyText: text,
+    });
+
+    if (resumed) {
+      const assistant = `Got it — continuing that task now.`;
+      await this.dbService.db.insert(messages).values({
+        userId,
+        threadId,
+        role: 'assistant',
+        content: assistant,
+        meta: { agentTaskId: resumed.taskId, kind: 'agent_resume' },
+      });
+      return { threadId, assistant };
+    }
+
     // Memory (ongoing instructions)
     const instrRows = await this.dbService.db
       .select({ instruction: agentInstructions.instruction })
@@ -124,7 +151,33 @@ export class ChatService {
       maxCharsPerMessage: readHistoryMaxCharsPerMessage(),
     });
 
-    // Build a better RAG query from recent USER turns (so follow-ups work)
+    // 2) Decide: agent workflow vs normal chat
+    const intent = await this.agentIntent.classify({ userText: text, history });
+
+    if (intent.intent === 'agent') {
+      const taskId = await this.startAgentTask({
+        userId,
+        threadId,
+        userText: text,
+      });
+
+      const assistant =
+        `✅ Okay — I’ll handle that as an agent task (email/calendar/HubSpot as needed).\n` +
+        `Task ID: ${taskId}`;
+
+      await this.dbService.db.insert(messages).values({
+        userId,
+        threadId,
+        role: 'assistant',
+        content: assistant,
+        meta: { agentTaskId: taskId, kind: 'agent_started', intent },
+      });
+
+      return { threadId, assistant };
+    }
+
+    // ---------------- existing RAG flow below (unchanged) ----------------
+
     const ragQuery = await this.buildRagQueryFromRecentUserTurns({
       userId,
       threadId,
@@ -133,7 +186,6 @@ export class ChatService {
       maxChars: readRagQueryMaxChars(),
     });
 
-    // General-purpose retrieval plan (LLM chooses standard vs bulk)
     const plan = await this.planRetrieval({
       userText: text,
       ragQuery,
@@ -142,7 +194,6 @@ export class ChatService {
 
     const retrievalTake = plan.mode === 'bulk' ? readRagBulkTake() : readRagStandardTake();
 
-    // Hybrid retrieval
     const base = await this.rag.searchHybrid({
       userId,
       query: plan.query,
@@ -151,28 +202,20 @@ export class ChatService {
       lexicalCandidates: readRagLexicalCandidates(),
     });
 
-    // Optional query expansion (still general-purpose)
     const expanded = await this.runExpandedQueries({
       userId,
       expandedQueries: plan.expandedQueries,
       takeEach: Math.max(25, Math.floor(retrievalTake / 3)),
     });
 
-    // Merge duplicates but prefer "better-scored" row for a given chunk
     const merged = mergeUniqueByChunkIdPreferBest([...base, ...expanded]);
-
-    // Rank by closest match -> lowest match for BOTH:
-    // - prompt citations
-    // - DB debug citations
     const ranked = rankRowsBestToWorst(merged);
 
-    // Rich citations only for building the system prompt context (not stored to DB)
     const systemCitations = toCitations(
       ranked.slice(0, readSystemCitationsMax()),
       readSystemExcerptMaxChars(),
     );
 
-    // Minimal debug citations stored to DB (no excerpts to avoid bloat)
     const debugCitations = toDebugCitations(ranked.slice(0, readDebugCitationsMax()));
 
     const system = buildSystemPrompt({ instructions, citations: systemCitations });
@@ -192,6 +235,85 @@ export class ChatService {
     });
 
     return { threadId, assistant };
+  }
+
+  private async tryResumeWaitingUserMessageTask(input: {
+    userId: number;
+    threadId: number;
+    advisorReplyText: string;
+  }): Promise<{ taskId: number } | null> {
+    const waiting = await this.agentTasks.listWaitingTasksForUser(input.userId, 50);
+
+    const match = waiting.find((t) => {
+      if (!isRecord(t.waiting)) return false;
+      const kind = typeof t.waiting.kind === 'string' ? t.waiting.kind : '';
+      return kind === 'user_message';
+    });
+
+    if (!match) return null;
+
+    // Claim waiting->queued so we don’t double enqueue.
+    const claimed = await this.agentTasks.claimWaitingTask(match.id);
+    if (!claimed) return null;
+
+    // Append the advisor reply into the agent task conversation.
+    await this.agentTasks.appendMessage({
+      taskId: match.id,
+      userId: input.userId,
+      role: 'user',
+      content: input.advisorReplyText,
+    });
+
+    // Enqueue the agent run.
+    await this.pgBoss.client.send(
+      AGENT_RUN_TASK_JOB,
+      { taskId: match.id },
+      {
+        singletonKey: `agent.runTask:${match.id}`,
+        singletonSeconds: 60,
+      },
+    );
+
+    return { taskId: match.id };
+  }
+
+  private async startAgentTask(input: {
+    userId: number;
+    threadId: number;
+    userText: string;
+  }): Promise<number> {
+    const memory: Record<string, unknown> = {
+      chatBridge: {
+        threadId: input.threadId,
+        lastPushedAgentMessageId: 0,
+        didPushTerminalStatus: false,
+      },
+    };
+
+    const taskId = await this.agentTasks.createTask({
+      userId: input.userId,
+      goal: input.userText,
+      memory,
+    });
+
+    // Seed the agent conversation with the same user request.
+    await this.agentTasks.appendMessage({
+      taskId,
+      userId: input.userId,
+      role: 'user',
+      content: input.userText,
+    });
+
+    await this.pgBoss.client.send(
+      AGENT_RUN_TASK_JOB,
+      { taskId },
+      {
+        singletonKey: `agent.runTask:${taskId}`,
+        singletonSeconds: 60,
+      },
+    );
+
+    return taskId;
   }
 
   private async runExpandedQueries(input: {
@@ -391,6 +513,8 @@ export class ChatService {
   }
 }
 
+// --- helpers below unchanged from your current file ---
+
 function deriveThreadTitleFromPrompt(prompt: string): string {
   const raw = String(prompt ?? '').trim();
   if (!raw) return 'New thread';
@@ -459,19 +583,10 @@ function toDebugCitations(rows: RagSearchRow[]): ChatDebugCitation[] {
   });
 }
 
-/**
- * Rank rows best -> worst.
- * Prefers semantic distance when present (lower distance = better),
- * otherwise falls back to similarity-like scores when present (higher = better).
- */
 function rankRowsBestToWorst(rows: RagSearchRow[]): RagSearchRow[] {
   return rows.slice().sort((a, b) => compareRowsBestFirst(a, b));
 }
 
-/**
- * Merge by chunkId but keep the "better" row when duplicates exist
- * (important because expansions can find the same chunk via different retrieval paths).
- */
 function mergeUniqueByChunkIdPreferBest(rows: RagSearchRow[]): RagSearchRow[] {
   const m = new Map<number, RagSearchRow>();
 
@@ -482,7 +597,6 @@ function mergeUniqueByChunkIdPreferBest(rows: RagSearchRow[]): RagSearchRow[] {
       continue;
     }
 
-    // Replace if the new row is "better"
     if (compareRowsBestFirst(r, existing) < 0) {
       m.set(r.chunkId, r);
     }
@@ -498,14 +612,11 @@ function compareRowsBestFirst(a: RagSearchRow, b: RagSearchRow): number {
   const aHasD = typeof ad === 'number';
   const bHasD = typeof bd === 'number';
 
-  // Prefer semantic-scored rows (distance-based) over non-semantic rows
   if (aHasD && !bHasD) return -1;
   if (!aHasD && bHasD) return 1;
 
-  // Both semantic: lower distance is better
   if (aHasD && bHasD) {
     if (ad !== bd) return ad - bd;
-    // stable tie-breakers
     return a.chunkId - b.chunkId;
   }
 
@@ -515,24 +626,17 @@ function compareRowsBestFirst(a: RagSearchRow, b: RagSearchRow): number {
   const aHasS = typeof as === 'number';
   const bHasS = typeof bs === 'number';
 
-  // Prefer similarity-scored rows over unknown
   if (aHasS && !bHasS) return -1;
   if (!aHasS && bHasS) return 1;
 
-  // Both have similarity: higher is better
   if (aHasS && bHasS) {
     if (as !== bs) return bs - as;
     return a.chunkId - b.chunkId;
   }
 
-  // Fallback stable ordering
   return a.chunkId - b.chunkId;
 }
 
-/**
- * Extract a vector distance if present on RagSearchRow.
- * We intentionally access as "any" because RagSearchRow shape can vary.
- */
 function extractDistance(row: RagSearchRow): number | null {
   const r = row as unknown as Record<string, unknown>;
 
@@ -545,11 +649,6 @@ function extractDistance(row: RagSearchRow): number | null {
   return null;
 }
 
-/**
- * Extract a similarity-like score if present.
- * If we have distance, we also compute cosine-sim style value: similarity = 1 - distance
- * (still useful for debugging even if the underlying metric differs).
- */
 function extractSimilarity(row: RagSearchRow, distance: number | null): number | null {
   const r = row as unknown as Record<string, unknown>;
 
@@ -603,7 +702,6 @@ function readSystemCitationsMax(): number {
   return Number.isFinite(raw) ? clampInt(raw, 1, 400) : 40;
 }
 
-// Debug citations stored on messages.meta (minimal only)
 function readDebugCitationsMax(): number {
   const raw = Number(process.env.RAG_DEBUG_CITATIONS_MAX ?? '300');
   return Number.isFinite(raw) ? clampInt(raw, 0, 5000) : 300;

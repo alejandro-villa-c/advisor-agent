@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import type { OpenAiToolDefinition } from '../chat/openai-tool-chat.service';
+import type { OpenAiToolDefinition } from '../integrations/openai/openai-tool-chat.service';
 
 @Injectable()
 export class AgentToolsService {
@@ -24,6 +24,7 @@ export class AgentToolsService {
       `- Use the available tools when you need data or to take actions (email, calendar, hubspot).`,
       `- You may call multiple tools. Be persistent and finish the task.`,
       `- If you need to wait for an email reply, call await_gmail_reply with the Gmail threadId and (ideally) fromEmail.`,
+      `  (await_gmail_reply automatically uses Gmail's internal timestamps to avoid clock-skew issues.)`,
       `- If you need clarification from the advisor (the app user), call await_user_message.`,
       `- When you have completed the goal, respond normally (no tool calls) with what you did.`,
       ``,

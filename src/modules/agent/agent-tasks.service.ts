@@ -2,7 +2,10 @@ import { Injectable } from '@nestjs/common';
 import { and, eq, sql } from 'drizzle-orm';
 import { DbService } from '../../db/db.service';
 import { agentTaskMessages, agentTaskToolCalls, agentTasks } from '../../db/schema';
-import type { OpenAiChatMessage, OpenAiChatMessageRole } from '../chat/openai-tool-chat.service';
+import type {
+  OpenAiChatMessage,
+  OpenAiChatMessageRole,
+} from '../integrations/openai/openai-tool-chat.service';
 
 export type AgentTaskRow = {
   id: number;
@@ -26,7 +29,11 @@ export type AgentUiMessage = {
 export class AgentTasksService {
   constructor(private readonly dbService: DbService) {}
 
-  async createTask(input: { userId: number; goal: string }): Promise<number> {
+  async createTask(input: {
+    userId: number;
+    goal: string;
+    memory?: Record<string, unknown>;
+  }): Promise<number> {
     const goal = String(input.goal ?? '').trim();
     if (!goal) throw new Error('createTask: goal is required');
 
@@ -36,7 +43,7 @@ export class AgentTasksService {
         userId: input.userId,
         status: 'queued',
         goal,
-        memory: {},
+        memory: isRecord(input.memory) ? input.memory : {},
         waiting: null,
         lastError: null,
         updatedAt: sql`now()`,
@@ -100,6 +107,25 @@ export class AgentTasksService {
       .where(eq(agentTasks.id, taskId));
   }
 
+  /**
+   * Used when resuming a waiting task (gmail tick, or advisor reply in UI).
+   * Atomically flips waiting->queued so duplicate enqueues are avoided.
+   */
+  async claimWaitingTask(taskId: number): Promise<boolean> {
+    const res = await this.dbService.db
+      .update(agentTasks)
+      .set({
+        status: 'queued',
+        waiting: null,
+        lastError: null,
+        updatedAt: sql`now()`,
+      })
+      .where(and(eq(agentTasks.id, taskId), eq(agentTasks.status, 'waiting')))
+      .returning({ id: agentTasks.id });
+
+    return res.length > 0;
+  }
+
   async mergeMemory(
     taskId: number,
     patch: Record<string, unknown>,
@@ -156,9 +182,6 @@ export class AgentTasksService {
     });
   }
 
-  /**
-   * UI-friendly list of raw stored messages.
-   */
   async getMessagesForUi(taskId: number): Promise<AgentUiMessage[]> {
     const rows = await this.dbService.db
       .select({
@@ -227,7 +250,6 @@ export class AgentTasksService {
       const content = String(r.content ?? '');
 
       if (role !== 'tool') {
-        // keep assistant empty messages because they may be the placeholder before tools
         if (content.trim().length === 0 && role !== 'assistant') continue;
         out.push({ role, content });
         continue;
@@ -236,7 +258,6 @@ export class AgentTasksService {
       const toolName = typeof r.toolName === 'string' ? r.toolName : '';
       const toolCallId = typeof r.toolCallId === 'string' ? r.toolCallId : '';
 
-      // Ensure we have an assistant message right before tools
       const prev = out[out.length - 1];
       if (!prev || prev.role !== 'assistant') {
         out.push({ role: 'assistant', content: '', tool_calls: [] });

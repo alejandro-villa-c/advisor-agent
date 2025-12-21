@@ -33,7 +33,14 @@ export class AgentTasksController {
       content: goal,
     });
 
-    await this.boss.client.send(AGENT_RUN_TASK_JOB, { taskId });
+    await this.boss.client.send(
+      AGENT_RUN_TASK_JOB,
+      { taskId },
+      {
+        singletonKey: `agent.runTask:${taskId}`,
+        singletonSeconds: 60,
+      },
+    );
 
     return { taskId };
   }
@@ -70,7 +77,14 @@ export class AgentTasksController {
     await this.tasks.setWaiting(taskId, null);
     await this.tasks.setStatus(taskId, 'queued', null);
 
-    await this.boss.client.send(AGENT_RUN_TASK_JOB, { taskId });
+    await this.boss.client.send(
+      AGENT_RUN_TASK_JOB,
+      { taskId },
+      {
+        singletonKey: `agent.runTask:${taskId}`,
+        singletonSeconds: 60,
+      },
+    );
 
     return { ok: true };
   }

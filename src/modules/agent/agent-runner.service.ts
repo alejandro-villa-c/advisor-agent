@@ -6,15 +6,17 @@ import type {
   OpenAiChatMessage,
   OpenAiToolCall,
   OpenAiChatToolCall,
-} from '../chat/openai-tool-chat.service';
-import { OpenAiToolChatService } from '../chat/openai-tool-chat.service';
+} from '../integrations/openai/openai-tool-chat.service';
+import { OpenAiToolChatService } from '../integrations/openai/openai-tool-chat.service';
 import { GmailApiService } from '../integrations/google/gmail-api.service';
 import { CalendarApiService } from '../integrations/google/calendar-api.service';
 import { HubspotApiService } from '../integrations/hubspot/hubspot-api.service';
+import { PgBossService } from '../../jobs/pgboss.service';
+import { AGENT_REACT_JOB } from '../../jobs/job.constants';
 
 type ToolResult =
   | { kind: 'ok'; output: Record<string, unknown> }
-  | { kind: 'await'; output: Record<string, unknown> }
+  | { kind: 'await'; output: Record<string, unknown>; userVisiblePrompt?: string }
   | { kind: 'error'; error: string };
 
 @Injectable()
@@ -29,6 +31,7 @@ export class AgentRunnerService {
     private readonly gmailApi: GmailApiService,
     private readonly calendarApi: CalendarApiService,
     private readonly hubspotApi: HubspotApiService,
+    private readonly pgBoss: PgBossService,
   ) {}
 
   async runTask(taskId: number): Promise<void> {
@@ -38,131 +41,158 @@ export class AgentRunnerService {
       return;
     }
 
-    if (task.status === 'completed' || task.status === 'failed') return;
+    try {
+      if (task.status === 'completed' || task.status === 'failed') return;
 
-    if (!this.openAi.isConfigured()) {
-      await this.tasks.setStatus(taskId, 'failed', 'OPENAI_API_KEY is not set.');
-      return;
-    }
-
-    // Clear waiting (we’ll re-set if needed)
-    await this.tasks.setWaiting(taskId, null);
-    await this.tasks.setStatus(taskId, 'running', null);
-
-    const didAuto = await this.tryAutoResolveScheduling(taskId, task);
-    if (didAuto === 'completed') return;
-    if (didAuto === 'waiting') return;
-
-    const systemPrompt = this.agentTools.buildSystemPrompt({
-      goal: task.goal,
-      memory: task.memory,
-    });
-    const toolDefs = this.agentTools.getToolDefinitions();
-
-    const history = await this.tasks.getMessagesForOpenAi(taskId);
-    const messages: OpenAiChatMessage[] = [{ role: 'system', content: systemPrompt }, ...history];
-
-    const maxTurns = 12;
-    const maxToolCallsTotal = 20;
-
-    let toolCallsUsed = 0;
-
-    for (let turn = 0; turn < maxTurns; turn += 1) {
-      const resp = await this.openAi.completeWithTools({
-        messages,
-        tools: toolDefs,
-        temperature: 0.2,
-      });
-
-      if (resp.kind === 'final') {
-        const text = resp.text.trim();
-        if (text) {
-          await this.tasks.appendMessage({
-            taskId,
-            userId: task.userId,
-            role: 'assistant',
-            content: text,
-          });
-        }
-        await this.tasks.setStatus(taskId, 'completed', null);
+      if (!this.openAi.isConfigured()) {
+        await this.tasks.setStatus(taskId, 'failed', 'OPENAI_API_KEY is not set.');
         return;
       }
 
-      const toolCalls: OpenAiChatToolCall[] = resp.toolCalls.map((tc) => ({
-        id: tc.id,
-        type: 'function',
-        function: { name: tc.name, arguments: tc.argumentsJson },
-      }));
+      await this.tasks.setWaiting(taskId, null);
+      await this.tasks.setStatus(taskId, 'running', null);
 
-      const assistantText = resp.assistantText?.trim() ?? '';
+      const didAuto = await this.tryAutoResolveScheduling(taskId, task);
+      if (didAuto === 'completed') return;
+      if (didAuto === 'waiting') return;
 
-      await this.tasks.appendMessage({
-        taskId,
-        userId: task.userId,
-        role: 'assistant',
-        content: assistantText,
+      const systemPrompt = this.agentTools.buildSystemPrompt({
+        goal: task.goal,
+        memory: task.memory,
       });
+      const toolDefs = this.agentTools.getToolDefinitions();
 
-      messages.push({
-        role: 'assistant',
-        content: assistantText,
-        tool_calls: toolCalls,
-      });
+      const history = await this.tasks.getMessagesForOpenAi(taskId);
+      const messages: OpenAiChatMessage[] = [{ role: 'system', content: systemPrompt }, ...history];
 
-      for (const tc of resp.toolCalls) {
-        toolCallsUsed += 1;
-        if (toolCallsUsed > maxToolCallsTotal) {
-          await this.tasks.setStatus(taskId, 'failed', 'Too many tool calls in one run.');
+      const maxTurns = 12;
+      const maxToolCallsTotal = 20;
+
+      let toolCallsUsed = 0;
+
+      for (let turn = 0; turn < maxTurns; turn += 1) {
+        const resp = await this.openAi.completeWithTools({
+          messages,
+          tools: toolDefs,
+          temperature: 0.2,
+        });
+
+        if (resp.kind === 'final') {
+          const text = resp.text.trim();
+          if (text) {
+            await this.tasks.appendMessage({
+              taskId,
+              userId: task.userId,
+              role: 'assistant',
+              content: text,
+            });
+          } else {
+            await this.tasks.appendMessage({
+              taskId,
+              userId: task.userId,
+              role: 'assistant',
+              content: 'Done.',
+            });
+          }
+
+          await this.tasks.setStatus(taskId, 'completed', null);
           return;
         }
 
-        const toolRes = await this.handleToolCall(taskId, task.userId, tc);
+        const toolCalls: OpenAiChatToolCall[] = resp.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.name, arguments: tc.argumentsJson },
+        }));
 
-        if (toolRes.kind === 'error') {
-          await this.tasks.setStatus(taskId, 'failed', toolRes.error);
-          return;
-        }
-
-        const toolOutputText = safeJsonStringify(toolRes.output);
+        const assistantText = resp.assistantText?.trim() ?? '';
 
         await this.tasks.appendMessage({
           taskId,
           userId: task.userId,
-          role: 'tool',
-          content: toolOutputText,
-          toolName: tc.name,
-          toolCallId: tc.id,
+          role: 'assistant',
+          content: assistantText,
         });
 
         messages.push({
-          role: 'tool',
-          name: tc.name,
-          tool_call_id: tc.id,
-          content: toolOutputText,
+          role: 'assistant',
+          content: assistantText,
+          tool_calls: toolCalls,
         });
 
-        if (toolRes.kind === 'await') {
-          await this.tasks.setStatus(taskId, 'waiting', null);
-          return;
+        for (const tc of resp.toolCalls) {
+          toolCallsUsed += 1;
+          if (toolCallsUsed > maxToolCallsTotal) {
+            await this.tasks.setStatus(taskId, 'failed', 'Too many tool calls in one run.');
+            return;
+          }
+
+          const toolRes = await this.handleToolCall(taskId, task.userId, tc);
+
+          if (toolRes.kind === 'error') {
+            await this.tasks.setStatus(taskId, 'failed', toolRes.error);
+            return;
+          }
+
+          const toolOutputText = safeJsonStringify(toolRes.output);
+
+          await this.tasks.appendMessage({
+            taskId,
+            userId: task.userId,
+            role: 'tool',
+            content: toolOutputText,
+            toolName: tc.name,
+            toolCallId: tc.id,
+          });
+
+          messages.push({
+            role: 'tool',
+            name: tc.name,
+            tool_call_id: tc.id,
+            content: toolOutputText,
+          });
+
+          if (toolRes.kind === 'await') {
+            if (toolRes.userVisiblePrompt?.trim()) {
+              await this.tasks.appendMessage({
+                taskId,
+                userId: task.userId,
+                role: 'assistant',
+                content: toolRes.userVisiblePrompt.trim(),
+              });
+            }
+
+            await this.tasks.setStatus(taskId, 'waiting', null);
+            return;
+          }
         }
       }
-    }
 
-    await this.tasks.setStatus(taskId, 'failed', 'Max turns reached without completion.');
+      await this.tasks.setStatus(taskId, 'failed', 'Max turns reached without completion.');
+    } finally {
+      // Always try to mirror any newly-added agent messages into the chat thread.
+      await this.enqueueReact(taskId);
+    }
   }
 
-  /**
-   * Deterministic scheduling flow:
-   * - Detect client chose label A/B/C in an INCOMING_EMAIL_REPLY
-   * - Validate chosen slot is still free via calendar_get_busy
-   * - If free: create event + hubspot note + confirmation email -> complete
-   * - If busy: propose new labeled options -> await_gmail_reply again
-   *
-   * Returns:
-   * - 'completed' => runner finishes now
-   * - 'waiting'   => runner put task back into waiting
-   * - 'nope'      => runner should continue to LLM
-   */
+  private async enqueueReact(taskId: number): Promise<void> {
+    try {
+      await this.pgBoss.client.send(
+        AGENT_REACT_JOB,
+        { taskId },
+        {
+          singletonKey: `agent.react:${taskId}`,
+          singletonSeconds: 30,
+        },
+      );
+    } catch (err: unknown) {
+      this.logger.warn(
+        `[${AGENT_REACT_JOB}] enqueue failed taskId=${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // ---------------- scheduling auto-resolve ----------------
   private async tryAutoResolveScheduling(
     taskId: number,
     task: AgentTaskRow,
@@ -208,7 +238,6 @@ export class AgentRunnerService {
         ? Math.trunc(meeting['durationMinutes'])
         : 30;
 
-    // Contact email: prefer memory.meeting.contact.email, else parse email from incoming "from"
     const contact = isRecord(meeting['contact']) ? meeting['contact'] : {};
     const contactEmail =
       (typeof contact['email'] === 'string' ? contact['email'].trim() : '') ||
@@ -217,7 +246,6 @@ export class AgentRunnerService {
 
     if (!contactEmail) return 'nope';
 
-    // Guardrail: authoritative busy check
     const busy = await this.calendarApi.getBusyIntervals(task.userId, {
       calendarId: 'primary',
       timeMinIso: chosen.startIso,
@@ -226,11 +254,9 @@ export class AgentRunnerService {
     });
 
     const isBusyNow = Array.isArray(busy) && busy.length > 0;
-
     const threadId = parsed.threadId;
 
     if (isBusyNow) {
-      // Propose new options and await again
       const now = Date.now();
       const startIso = new Date(now + 60 * 60_000).toISOString();
       const endIso = new Date(now + 7 * 24 * 60 * 60_000).toISOString();
@@ -252,10 +278,7 @@ export class AgentRunnerService {
         endIso: s.endIso,
       }));
 
-      if (nextProposed.length === 0) {
-        // Fall back to LLM if we can’t propose anything.
-        return 'nope';
-      }
+      if (nextProposed.length === 0) return 'nope';
 
       await this.tasks.mergeMemory(taskId, {
         meeting: {
@@ -284,13 +307,21 @@ export class AgentRunnerService {
         threadId,
       });
 
-      const sinceIso = new Date().toISOString();
+      // Use Gmail's internal timeline as baseline (not server clock)
+      const baseline = await getGmailThreadBaselineInternalDateMs(
+        this.gmailApi,
+        task.userId,
+        threadId,
+      );
+
       await this.tasks.setWaiting(taskId, {
         kind: 'gmail_reply',
         threadId,
         fromEmail: contactEmail,
-        sinceIso,
+        sinceIso: new Date().toISOString(), // keep for debugging
+        sinceInternalDateMs: baseline.sinceInternalDateMs,
       });
+
       await this.tasks.setStatus(taskId, 'waiting', null);
 
       await this.tasks.appendMessage({
@@ -303,7 +334,6 @@ export class AgentRunnerService {
       return 'waiting';
     }
 
-    // Create event
     const summary =
       (typeof meeting['summary'] === 'string' && meeting['summary'].trim()) ||
       `Meeting with ${contactEmail}`;
@@ -319,7 +349,6 @@ export class AgentRunnerService {
       attendees: [{ email: contactEmail }],
     });
 
-    // HubSpot note (best-effort)
     const hubspotContactId =
       typeof contact['hubspotContactId'] === 'string' ? contact['hubspotContactId'].trim() : '';
 
@@ -339,7 +368,6 @@ export class AgentRunnerService {
       });
     }
 
-    // Confirmation email
     const confirmBody =
       `Confirmed — you’re booked for option ${label}.\n\n` +
       `Start: ${chosen.startIso}\n` +
@@ -439,7 +467,11 @@ export class AgentRunnerService {
             outputJson: out,
           });
 
-          return { kind: 'await', output: out };
+          return {
+            kind: 'await',
+            output: out,
+            userVisiblePrompt: prompt,
+          };
         }
 
         case 'await_gmail_reply': {
@@ -461,12 +493,19 @@ export class AgentRunnerService {
             return { kind: 'error', error: err };
           }
 
-          const sinceIso = new Date().toISOString();
+          // baseline using Gmail internalDateMs
+          const baseline = await getGmailThreadBaselineInternalDateMs(
+            this.gmailApi,
+            userId,
+            gmailThreadId,
+          );
+
           const waiting: Record<string, unknown> = {
             kind: 'gmail_reply',
             threadId: gmailThreadId,
             fromEmail: fromEmail || null,
-            sinceIso,
+            sinceIso: new Date().toISOString(), // keep for debug/visibility
+            sinceInternalDateMs: baseline.sinceInternalDateMs,
           };
 
           await this.tasks.setWaiting(taskId, waiting);
@@ -476,7 +515,8 @@ export class AgentRunnerService {
             kind: 'gmail_reply',
             gmailThreadId,
             fromEmail: fromEmail || null,
-            sinceIso,
+            sinceIso: waiting.sinceIso,
+            sinceInternalDateMs: baseline.sinceInternalDateMs,
           };
 
           await this.tasks.logToolCall({
@@ -492,9 +532,7 @@ export class AgentRunnerService {
           return { kind: 'await', output: out };
         }
 
-        // --------------------
         // Local mirror tools
-        // --------------------
         case 'hubspot_find_contacts_local': {
           const query = typeof args.query === 'string' ? args.query : '';
           const limit = typeof args.limit === 'number' ? args.limit : 10;
@@ -584,9 +622,7 @@ export class AgentRunnerService {
           return { kind: 'ok', output: out };
         }
 
-        // --------------------
-        // Action tools (APIs)
-        // --------------------
+        // Action tools
         case 'gmail_send_email': {
           const to = typeof args.to === 'string' ? args.to : '';
           const subject = typeof args.subject === 'string' ? args.subject : '';
@@ -838,6 +874,27 @@ export class AgentRunnerService {
   }
 }
 
+async function getGmailThreadBaselineInternalDateMs(
+  gmailApi: GmailApiService,
+  userId: number,
+  threadId: string,
+): Promise<{ sinceInternalDateMs: number }> {
+  try {
+    const msgs = await gmailApi.getThreadMessages(userId, threadId);
+    let max = 0;
+
+    for (const m of msgs) {
+      const v = typeof m.internalDateMs === 'number' ? m.internalDateMs : NaN;
+      if (Number.isFinite(v) && v > max) max = v;
+    }
+
+    return { sinceInternalDateMs: max };
+  } catch {
+    // If Gmail read fails, keep baseline at 0 (still better than mixing server clock with Gmail clock).
+    return { sinceInternalDateMs: 0 };
+  }
+}
+
 function parseIncomingEmailBlock(content: string): {
   threadId: string;
   messageId: string;
@@ -851,7 +908,6 @@ function parseIncomingEmailBlock(content: string): {
   const lines = text.split('\n');
   const kv: Record<string, string> = {};
 
-  // Find first blank line; header section is above it.
   let blankIdx = -1;
   for (let i = 0; i < lines.length; i += 1) {
     if (lines[i].trim() === '') {
@@ -888,7 +944,7 @@ function extractLabelChoice(body: string): string | null {
   const s = (body ?? '').trim();
   if (!s) return null;
 
-  const head = s.slice(0, 400); // keep it tight; reduces false matches
+  const head = s.slice(0, 400);
 
   const patterns = [
     /\boption\s*([A-F])\b/i,
