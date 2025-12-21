@@ -1690,7 +1690,7 @@ function extractLabelChoice(body: string): string | null {
 
   // FIRST: Check for explicit letter choices A, B, C at the very start
   // This is the most common case: contact just replies "C" or "C." or "Option C"
-  
+
   // Check if response starts with a single letter (most common case)
   const startsWithLetter = head.match(/^([A-Ca-c])\b/);
   if (startsWithLetter) {
@@ -1739,7 +1739,7 @@ function extractLabelChoice(body: string): string | null {
   }
 
   // FOURTH: Now check for explicit "D" or "none of these" ONLY if no A/B/C was found
-  
+
   // Check if starts with D
   const startsWithD = head.match(/^([Dd])\b/);
   if (startsWithD) {
