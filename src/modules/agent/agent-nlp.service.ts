@@ -45,6 +45,12 @@ export type ContactSelectionResult = {
   reason?: string;
 };
 
+export type ContactReplyChoice = {
+  choice: 'A' | 'B' | 'C' | 'D' | 'YES' | 'NO' | null;
+  confidence: number;
+  reason?: string;
+};
+
 @Injectable()
 export class AgentNlpService {
   private readonly logger = new Logger(AgentNlpService.name);
@@ -831,6 +837,200 @@ Examples:
         confidence: Math.min(1, Math.max(0, s.score / 100)),
       })),
     };
+  }
+
+  /**
+   * Parse a contact's email reply to extract their choice.
+   * Used for both multi-option (A/B/C/D) and single-option (Yes/No) modes.
+   */
+  async parseContactReplyChoice(input: {
+    emailBody: string;
+    isSingleOption: boolean;
+    optionCount: number;
+  }): Promise<ContactReplyChoice> {
+    const { emailBody, isSingleOption, optionCount } = input;
+
+    if (!this.llm.isConfigured()) {
+      return this.parseContactReplyChoiceHeuristic(emailBody, isSingleOption, optionCount);
+    }
+
+    const validChoices = isSingleOption
+      ? ['YES', 'NO']
+      : ['A', 'B', 'C', 'D'].slice(0, optionCount + 1); // +1 for "none of these" option
+
+    const systemPrompt = isSingleOption
+      ? `You are parsing an email reply to a meeting request.
+
+The contact was asked if a specific meeting time works for them.
+They should reply Yes (time works) or No (need different time).
+
+Analyze their response and determine their choice.
+
+Return ONLY valid JSON:
+{
+  "choice": "YES" | "NO" | null,
+  "confidence": number (0-1),
+  "reason": string
+}
+
+Guidelines:
+- "YES": Any positive confirmation (yes, yep, sure, ok, sounds good, that works, perfect, confirmed, see you then, I'm available, etc.)
+- "NO": Any negative response (no, nope, can't make it, doesn't work, not available, need different time, have a conflict, sorry, unfortunately, etc.)
+- null: If you truly cannot determine their intent
+
+Examples:
+- "Yes" -> {"choice": "YES", "confidence": 0.95, "reason": "Explicit yes"}
+- "Sounds good!" -> {"choice": "YES", "confidence": 0.9, "reason": "Positive confirmation"}
+- "See you then" -> {"choice": "YES", "confidence": 0.85, "reason": "Implies acceptance"}
+- "That works for me" -> {"choice": "YES", "confidence": 0.9, "reason": "Confirms availability"}
+- "No" -> {"choice": "NO", "confidence": 0.95, "reason": "Explicit no"}
+- "Sorry, I have a conflict" -> {"choice": "NO", "confidence": 0.9, "reason": "Has conflict"}
+- "Can we do a different time?" -> {"choice": "NO", "confidence": 0.85, "reason": "Requesting alternative"}
+- "I'm not available then" -> {"choice": "NO", "confidence": 0.9, "reason": "Not available"}`
+      : `You are parsing an email reply to a scheduling request.
+
+The contact was given ${optionCount} time slot options labeled ${validChoices.slice(0, optionCount).join(', ')}.
+The last option (${validChoices[optionCount - 1] || 'D'}) or phrases like "none of these work" mean they need different times.
+
+Analyze their response and determine which option they selected.
+
+Return ONLY valid JSON:
+{
+  "choice": "${validChoices.join('" | "')}" | null,
+  "confidence": number (0-1),
+  "reason": string
+}
+
+Guidelines:
+- Look for explicit letter choices (A, B, C, etc.)
+- Look for phrases like "option A", "I'll take B", "C works"
+- Look for "none of these", "different times", "none work" -> this means the last option (none of these work)
+- The contact might describe the time instead of using a letter - try to match it
+- null: Only if you truly cannot determine their choice
+
+Examples:
+- "A" -> {"choice": "A", "confidence": 0.95, "reason": "Explicit A"}
+- "Option B please" -> {"choice": "B", "confidence": 0.95, "reason": "Selected option B"}
+- "Let's do C" -> {"choice": "C", "confidence": 0.9, "reason": "Selected C"}
+- "The first one works" -> {"choice": "A", "confidence": 0.8, "reason": "First option = A"}
+- "None of these work for me" -> {"choice": "${validChoices[optionCount] || 'D'}", "confidence": 0.9, "reason": "None of the times work"}
+- "I need different times" -> {"choice": "${validChoices[optionCount] || 'D'}", "confidence": 0.85, "reason": "Requesting alternatives"}
+- "D" -> {"choice": "D", "confidence": 0.95, "reason": "Explicit D - none work"}`;
+
+    try {
+      // Only use first 500 chars to save tokens
+      const truncatedBody = emailBody.slice(0, 500);
+
+      const raw = await this.llm.complete({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Email reply:\n\n${truncatedBody}` },
+        ],
+        temperature: 0.0,
+      });
+
+      const parsed = safeJsonParse(raw);
+      if (!isRecord(parsed)) {
+        return this.parseContactReplyChoiceHeuristic(emailBody, isSingleOption, optionCount);
+      }
+
+      const choice = parsed.choice;
+      const validChoiceValues = isSingleOption ? ['YES', 'NO', null] : ['A', 'B', 'C', 'D', null];
+
+      if (!validChoiceValues.includes(choice as string | null)) {
+        return this.parseContactReplyChoiceHeuristic(emailBody, isSingleOption, optionCount);
+      }
+
+      return {
+        choice: choice as ContactReplyChoice['choice'],
+        confidence: typeof parsed.confidence === 'number' ? clamp01(parsed.confidence) : 0.5,
+        reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
+      };
+    } catch (err) {
+      this.logger.warn(`parseContactReplyChoice LLM failed, using heuristic: ${String(err)}`);
+      return this.parseContactReplyChoiceHeuristic(emailBody, isSingleOption, optionCount);
+    }
+  }
+
+  private parseContactReplyChoiceHeuristic(
+    emailBody: string,
+    isSingleOption: boolean,
+    optionCount: number,
+  ): ContactReplyChoice {
+    const s = (emailBody ?? '').trim();
+    if (!s) return { choice: null, confidence: 0 };
+
+    const head = s.slice(0, 300).toUpperCase();
+
+    if (isSingleOption) {
+      // Check for yes patterns
+      const yesPatterns = [
+        /^YES\b/,
+        /^YEP\b/,
+        /^YEAH\b/,
+        /^YUP\b/,
+        /^SURE\b/,
+        /^OK\b/,
+        /^OKAY\b/,
+        /^SOUNDS?\s+GOOD/,
+        /^THAT\s+WORKS?/,
+        /^WORKS?\s+FOR\s+ME/,
+        /^PERFECT/,
+        /^GREAT/,
+        /^CONFIRMED?/,
+        /^SEE\s+YOU\s+THEN/,
+      ];
+      for (const p of yesPatterns) {
+        if (p.test(head)) return { choice: 'YES', confidence: 0.8 };
+      }
+
+      // Check for no patterns
+      const noPatterns = [
+        /^NO\b/,
+        /^NOPE\b/,
+        /^NAH\b/,
+        /^SORRY\b/,
+        /^CAN'?T\b/,
+        /^(?:THAT\s+)?(?:DOESN'?T|WON'?T)\s+WORK/,
+        /^NOT\s+(?:AVAILABLE|FREE)/,
+        /^UNFORTUNATELY/,
+        /^(?:NEED|WANT)\s+(?:A\s+)?DIFFERENT/,
+      ];
+      for (const p of noPatterns) {
+        if (p.test(head)) return { choice: 'NO', confidence: 0.8 };
+      }
+
+      return { choice: null, confidence: 0 };
+    }
+
+    // Multi-option mode
+    // Check for letter at start
+    const letterMatch = head.match(/^([A-D])\b/);
+    if (letterMatch) {
+      return { choice: letterMatch[1] as 'A' | 'B' | 'C' | 'D', confidence: 0.9 };
+    }
+
+    // Check for "option X" pattern
+    const optionMatch = head.match(/\bOPTION\s*([A-D])\b/);
+    if (optionMatch) {
+      return { choice: optionMatch[1] as 'A' | 'B' | 'C' | 'D', confidence: 0.85 };
+    }
+
+    // Check for "none of these" patterns
+    const nonePatterns = [
+      /\bNONE\s+OF\s+(?:THESE|THEM|THOSE)/,
+      /\bNONE\s+WORK/,
+      /\bDIFFERENT\s+TIME/,
+      /\bCAN'?T\s+(?:MAKE|DO)\s+ANY/,
+    ];
+    for (const p of nonePatterns) {
+      if (p.test(head)) {
+        const noneChoice = String.fromCharCode('A'.charCodeAt(0) + optionCount) as 'D';
+        return { choice: noneChoice, confidence: 0.8 };
+      }
+    }
+
+    return { choice: null, confidence: 0 };
   }
 }
 

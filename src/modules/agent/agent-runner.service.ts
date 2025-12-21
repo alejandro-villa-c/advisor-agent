@@ -1557,7 +1557,13 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    const choice = extractLabelChoice(parsed.bodyText);
+    const isSingleOption = meeting['isSingleOption'] === true;
+    const choiceResult = await this.nlp.parseContactReplyChoice({
+      emailBody: parsed.bodyText,
+      isSingleOption,
+      optionCount: proposed.length,
+    });
+    const choice = choiceResult.choice;
     const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
     const contactName = typeof contact['name'] === 'string' ? contact['name'] : contactEmail;
     const threadId = parsed.threadId;
@@ -2842,149 +2848,6 @@ function parseIncomingEmailBlock(content: string): {
   if (!threadId) return null;
 
   return { threadId, messageId, from, subject, bodyText };
-}
-
-function extractLabelChoice(body: string): string | null {
-  const s = (body ?? '').trim();
-  if (!s) return null;
-
-  // Take first 300 chars for analysis
-  const head = s.slice(0, 300);
-  const headUpper = head.toUpperCase();
-
-  // FIRST: Check for Yes/No responses (for single-option mode)
-  const yesPatterns = [
-    /^YES\b/i,
-    /^YEP\b/i,
-    /^YEAH\b/i,
-    /^YUP\b/i,
-    /^SURE\b/i,
-    /^OK\b/i,
-    /^OKAY\b/i,
-    /^SOUNDS?\s+GOOD\b/i,
-    /^THAT\s+WORKS?\b/i,
-    /^WORKS?\s+FOR\s+ME\b/i,
-    /^PERFECT\b/i,
-    /^GREAT\b/i,
-    /^CONFIRMED?\b/i,
-    /^I'?M?\s+(?:GOOD|IN|AVAILABLE|FREE)\b/i,
-    /^(?:THAT'?S?\s+)?(?:GOOD|FINE|GREAT|PERFECT)\b/i,
-    /^SEE\s+YOU\s+THEN\b/i,
-  ];
-
-  for (const pattern of yesPatterns) {
-    if (pattern.test(head)) {
-      return 'YES';
-    }
-  }
-
-  const noPatterns = [
-    /^NO\b/i,
-    /^NOPE\b/i,
-    /^NAH\b/i,
-    /^SORRY\b/i,
-    /^(?:I\s+)?CAN'?T\b/i,
-    /^(?:THAT\s+)?(?:DOESN'?T|DOES\s+NOT|WON'?T|WILL\s+NOT)\s+WORK\b/i,
-    /^(?:I'?M?\s+)?NOT\s+(?:AVAILABLE|FREE)\b/i,
-    /^(?:I\s+)?(?:HAVE|GOT)\s+(?:A\s+)?(?:CONFLICT|SOMETHING)\b/i,
-    /^UNFORTUNATELY\b/i,
-    /^(?:NEED|WANT)\s+(?:A\s+)?DIFFERENT\s+TIME\b/i,
-  ];
-
-  for (const pattern of noPatterns) {
-    if (pattern.test(head)) {
-      return 'NO';
-    }
-  }
-
-  // SECOND: Check for explicit letter choices A, B, C at the very start
-  // This is the most common case: contact just replies "C" or "C." or "Option C"
-
-  // Check if response starts with a single letter (most common case)
-  const startsWithLetter = head.match(/^([A-Ca-c])\b/);
-  if (startsWithLetter) {
-    return startsWithLetter[1].toUpperCase();
-  }
-
-  // Check for "Option X" pattern at the start
-  const optionAtStart = headUpper.match(/^OPTION\s*([A-C])\b/);
-  if (optionAtStart) {
-    return optionAtStart[1];
-  }
-
-  // Check for letter with parenthesis like "A)" or "(A)" at start
-  const parenAtStart = head.match(/^\(?([A-Ca-c])\)/);
-  if (parenAtStart) {
-    return parenAtStart[1].toUpperCase();
-  }
-
-  // THIRD: Check for choice phrases that indicate A, B, or C
-  const choicePatterns = [
-    /\bOPTION\s+([A-C])\b/i,
-    /\bCHOOSE\s+([A-C])\b/i,
-    /\bSELECT\s+([A-C])\b/i,
-    /\bPICK\s+([A-C])\b/i,
-    /\bPREFER\s+([A-C])\b/i,
-    /\bWANT\s+([A-C])\b/i,
-    /\b([A-C])\s+(?:WORKS?|PLEASE|IS\s+(?:GOOD|FINE|GREAT|PERFECT|BEST))\b/i,
-    /\bGO\s+(?:WITH|FOR)\s+(?:OPTION\s+)?([A-C])\b/i,
-    /\bLET'?S?\s+(?:DO|GO\s+WITH)\s+(?:OPTION\s+)?([A-C])\b/i,
-    /\bI'?LL?\s+(?:TAKE|DO)\s+(?:OPTION\s+)?([A-C])\b/i,
-    /\b([A-C])\s+(?:IS\s+)?(?:MY\s+)?(?:CHOICE|PREFERENCE)\b/i,
-  ];
-
-  for (const pattern of choicePatterns) {
-    const match = head.match(pattern);
-    if (match && match[1]) {
-      return match[1].toUpperCase();
-    }
-  }
-
-  // FOURTH: Check for standalone A, B, or C with clear word boundaries
-  // Be careful not to match letters that are part of words
-  const standaloneABC = headUpper.match(/(?:^|[\s.,:;!?()])([A-C])(?:[\s.,:;!?()]|$)/);
-  if (standaloneABC) {
-    return standaloneABC[1];
-  }
-
-  // FIFTH: Now check for explicit "D" or "none of these" ONLY if no A/B/C was found
-
-  // Check if starts with D
-  const startsWithD = head.match(/^([Dd])\b/);
-  if (startsWithD) {
-    return 'D';
-  }
-
-  // Check for explicit "Option D"
-  const optionD = headUpper.match(/\bOPTION\s*D\b/);
-  if (optionD) {
-    return 'D';
-  }
-
-  // Check for standalone D
-  const standaloneD = headUpper.match(/(?:^|[\s.,:;!?()])D(?:[\s.,:;!?()]|$)/);
-  if (standaloneD) {
-    return 'D';
-  }
-
-  // Check for explicit "none of these" type phrases
-  // Be very specific to avoid false positives
-  const nonePatterns = [
-    /\bNONE\s+OF\s+(?:THESE|THEM|THE(?:SE)?\s+(?:TIMES?|OPTIONS?))\s+WORK/i,
-    /\bNONE\s+(?:OF\s+(?:THESE|THEM))?\s*WORK/i,
-    /\b(?:THESE|THEY)\s+DON'?T\s+WORK/i,
-    /\bCAN'?T\s+(?:MAKE|DO)\s+ANY\s+OF\s+(?:THESE|THEM|THOSE)/i,
-    /\bNONE\s+OF\s+(?:THESE|THEM|THOSE)\b/i,
-    /\bNEITHER\s+(?:OF\s+)?(?:THESE|THEM|THOSE)\b/i,
-  ];
-
-  for (const pattern of nonePatterns) {
-    if (pattern.test(head)) {
-      return 'D';
-    }
-  }
-
-  return null;
 }
 
 function buildSchedulingOptionsEmail(input: {
