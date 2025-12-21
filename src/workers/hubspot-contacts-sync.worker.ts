@@ -57,7 +57,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
     let page = 0;
 
     const changedSourceIds: string[] = [];
-    const processedSourceIds: string[] = [];
+    const allHubspotIds: string[] = [];
 
     while (true) {
       page += 1;
@@ -75,12 +75,10 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
 
       if (results.length > 0) {
         const pageIds = results.map((r) => r.id).filter(Boolean);
-        processedSourceIds.push(...pageIds);
+        allHubspotIds.push(...pageIds);
 
-        // 1) Upsert raw contacts (already batch)
         await this.upsertContacts(userId, results);
 
-        // 2) Upsert documents, but ONLY when changed (now batch)
         const pageChanged = await this.upsertContactDocumentsIfChanged(userId, results);
         changedSourceIds.push(...pageChanged);
       }
@@ -88,13 +86,16 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
       if (!nextAfter) break;
       after = nextAfter;
 
-      if (page >= 50) {
+      if (page >= 100) {
         this.logger.warn(`[${HUBSPOT_SYNC_CONTACTS_JOB}] safety stop at page=${page}`);
         break;
       }
     }
 
-    // 3) Save integration state
+    // DELETION HANDLING: Remove contacts that no longer exist in HubSpot
+    const deletedCount = await this.deleteRemovedContacts(userId, allHubspotIds);
+
+    // Save integration state
     await this.dbService.db
       .insert(integrationStates)
       .values({
@@ -105,6 +106,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
           totalImported: total,
           page,
           changedDocuments: Array.from(new Set(changedSourceIds)).length,
+          deletedContacts: deletedCount,
         },
       })
       .onConflictDoUpdate({
@@ -115,11 +117,11 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
         },
       });
 
-    // 4) Enqueue embed for changed docs OR docs missing chunkIndex=0 (repair behavior)
+    // Enqueue embed for changed docs OR docs missing chunkIndex=0 (repair behavior)
     const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'hubspot_contact',
-      sourceIds: processedSourceIds,
+      sourceIds: allHubspotIds,
     });
 
     await this.enqueueEmbedForDocumentIds({
@@ -135,8 +137,95 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
     });
 
     this.logger.log(
-      `[${HUBSPOT_SYNC_CONTACTS_JOB}] done job=${String(job.id)} totalContacts=${total} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length}`,
+      `[${HUBSPOT_SYNC_CONTACTS_JOB}] done job=${String(job.id)} totalContacts=${total} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} deletedContacts=${deletedCount}`,
     );
+  }
+
+  /**
+   * Delete contacts (and their documents/chunks) that no longer exist in HubSpot.
+   * This does a full reconciliation against the list of IDs we just fetched.
+   */
+  private async deleteRemovedContacts(
+    userId: number,
+    currentHubspotIds: string[],
+  ): Promise<number> {
+    const uniqueIds = Array.from(new Set(currentHubspotIds)).filter(Boolean);
+
+    // If we got zero contacts from HubSpot, don't delete everything - something might be wrong
+    if (uniqueIds.length === 0) {
+      this.logger.warn(
+        `[${HUBSPOT_SYNC_CONTACTS_JOB}] skipping deletion - received 0 contacts from HubSpot`,
+      );
+      return 0;
+    }
+
+    // Find local contacts not in the current HubSpot list
+    const localContacts = await this.dbService.db
+      .select({ hubspotContactId: hubspotContacts.hubspotContactId })
+      .from(hubspotContacts)
+      .where(eq(hubspotContacts.userId, userId));
+
+    const localIds = localContacts.map((c) => c.hubspotContactId);
+    const hubspotIdSet = new Set(uniqueIds);
+    const toDelete = localIds.filter((id) => !hubspotIdSet.has(id));
+
+    if (toDelete.length === 0) return 0;
+
+    // Safety check: don't delete more than 50% of contacts in one sync
+    // This protects against API issues returning partial data
+    const deletionRatio = toDelete.length / localIds.length;
+    if (deletionRatio > 0.5 && toDelete.length > 10) {
+      this.logger.warn(
+        `[${HUBSPOT_SYNC_CONTACTS_JOB}] skipping deletion - would delete ${toDelete.length}/${localIds.length} contacts (${Math.round(deletionRatio * 100)}%)`,
+      );
+      return 0;
+    }
+
+    // Delete in batches
+    let deletedCount = 0;
+
+    for (const batch of chunkArray(toDelete, 100)) {
+      // 1. Delete document chunks for these contacts
+      const docIds = await this.loadDocumentIdsForSourceIds({
+        userId,
+        source: 'hubspot_contact',
+        sourceIds: batch,
+      });
+
+      if (docIds.length > 0) {
+        await this.dbService.db
+          .delete(documentChunks)
+          .where(
+            and(eq(documentChunks.userId, userId), inArray(documentChunks.documentId, docIds)),
+          );
+      }
+
+      // 2. Delete documents
+      await this.dbService.db
+        .delete(documents)
+        .where(
+          and(
+            eq(documents.userId, userId),
+            eq(documents.source, 'hubspot_contact'),
+            inArray(documents.sourceId, batch),
+          ),
+        );
+
+      // 3. Delete contacts from mirror table
+      await this.dbService.db
+        .delete(hubspotContacts)
+        .where(
+          and(eq(hubspotContacts.userId, userId), inArray(hubspotContacts.hubspotContactId, batch)),
+        );
+
+      deletedCount += batch.length;
+
+      this.logger.log(
+        `[${HUBSPOT_SYNC_CONTACTS_JOB}] deleted batch of ${batch.length} removed contacts`,
+      );
+    }
+
+    return deletedCount;
   }
 
   private async upsertContacts(
@@ -259,7 +348,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
     const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
     if (ids.length === 0) return map;
 
-    for (const chunk of chunkArray(ids, 1000)) {
+    for (const chunk of chunkArray(ids, 500)) {
       const rows = await this.dbService.db
         .select({ sourceId: documents.sourceId, title: documents.title, text: documents.text })
         .from(documents)
@@ -289,7 +378,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
 
     const out: number[] = [];
 
-    for (const chunk of chunkArray(ids, 1000)) {
+    for (const chunk of chunkArray(ids, 500)) {
       const rows = await this.dbService.db
         .select({ id: documents.id })
         .from(documents)
@@ -317,7 +406,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
 
     const out: number[] = [];
 
-    for (const chunk of chunkArray(ids, 1000)) {
+    for (const chunk of chunkArray(ids, 500)) {
       const rows = await this.dbService.db
         .select({ id: documents.id })
         .from(documents)
@@ -354,7 +443,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
 
     if (unique.length === 0) return;
 
-    for (const batch of chunkArray(unique, 1000)) {
+    for (const batch of chunkArray(unique, 200)) {
       await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
         userId: input.userId,
         documentIds: batch,
