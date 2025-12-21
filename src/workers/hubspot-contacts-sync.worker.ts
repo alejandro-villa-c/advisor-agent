@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { PgBossService } from '../jobs/pgboss.service';
 import { DbService } from '../db/db.service';
-import { documents, hubspotContacts, integrationStates } from '../db/schema';
+import { documentChunks, documents, hubspotContacts, integrationStates } from '../db/schema';
 import { HubspotApiService } from '../modules/integrations/hubspot/hubspot-api.service';
 import { HUBSPOT_SYNC_CONTACTS_JOB, RAG_EMBED_DOCUMENTS_JOB } from '../jobs/job.constants';
 
@@ -57,6 +57,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
     let page = 0;
 
     const changedSourceIds: string[] = [];
+    const processedSourceIds: string[] = [];
 
     while (true) {
       page += 1;
@@ -73,6 +74,9 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
       );
 
       if (results.length > 0) {
+        const pageIds = results.map((r) => r.id).filter(Boolean);
+        processedSourceIds.push(...pageIds);
+
         // 1) Upsert raw contacts
         await this.upsertContacts(userId, results);
 
@@ -112,15 +116,27 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
         },
       });
 
-    // 4) Enqueue embed ONLY for changed docs
-    await this.enqueueEmbedForChangedDocs({
+    // 4) Enqueue embed for changed docs OR docs that are missing chunks (repair behavior)
+    const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'hubspot_contact',
-      changedSourceIds,
+      sourceIds: processedSourceIds,
+    });
+
+    await this.enqueueEmbedForDocumentIds({
+      userId,
+      documentIds: [
+        ...(await this.loadDocumentIdsForSourceIds({
+          userId,
+          source: 'hubspot_contact',
+          sourceIds: changedSourceIds,
+        })),
+        ...repairDocIds,
+      ],
     });
 
     this.logger.log(
-      `[${HUBSPOT_SYNC_CONTACTS_JOB}] done job=${String(job.id)} totalContacts=${total} changedDocs=${Array.from(new Set(changedSourceIds)).length}`,
+      `[${HUBSPOT_SYNC_CONTACTS_JOB}] done job=${String(job.id)} totalContacts=${total} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length}`,
     );
   }
 
@@ -253,17 +269,17 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
     return map;
   }
 
-  private async enqueueEmbedForChangedDocs(input: {
+  private async loadDocumentIdsForSourceIds(input: {
     userId: number;
     source: 'hubspot_contact' | 'hubspot_note' | 'gmail_email' | 'calendar_event';
-    changedSourceIds: string[];
-  }): Promise<void> {
-    const uniqueChanged = Array.from(new Set(input.changedSourceIds)).filter(Boolean);
-    if (uniqueChanged.length === 0) return;
+    sourceIds: string[];
+  }): Promise<number[]> {
+    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
+    if (ids.length === 0) return [];
 
-    const documentIds: number[] = [];
+    const out: number[] = [];
 
-    for (const chunk of chunkArray(uniqueChanged, 1000)) {
+    for (const chunk of chunkArray(ids, 1000)) {
       const rows = await this.dbService.db
         .select({ id: documents.id })
         .from(documents)
@@ -275,15 +291,62 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
           ),
         );
 
-      for (const r of rows) documentIds.push(r.id);
+      for (const r of rows) out.push(r.id);
     }
 
-    if (documentIds.length === 0) return;
+    return out;
+  }
 
-    await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
-      userId: input.userId,
-      documentIds,
-    });
+  private async loadDocumentIdsMissingChunksForSourceIds(input: {
+    userId: number;
+    source: 'hubspot_contact' | 'hubspot_note' | 'gmail_email' | 'calendar_event';
+    sourceIds: string[];
+  }): Promise<number[]> {
+    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
+    if (ids.length === 0) return [];
+
+    const out: number[] = [];
+
+    for (const chunk of chunkArray(ids, 1000)) {
+      const rows = await this.dbService.db
+        .select({ id: documents.id })
+        .from(documents)
+        .leftJoin(
+          documentChunks,
+          and(
+            eq(documentChunks.userId, documents.userId),
+            eq(documentChunks.documentId, documents.id),
+          ),
+        )
+        .where(
+          and(
+            eq(documents.userId, input.userId),
+            eq(documents.source, input.source),
+            inArray(documents.sourceId, chunk),
+          ),
+        )
+        .groupBy(documents.id)
+        .having(sql`count(${documentChunks.id}) = 0`);
+
+      for (const r of rows) out.push(r.id);
+    }
+
+    return out;
+  }
+
+  private async enqueueEmbedForDocumentIds(input: {
+    userId: number;
+    documentIds: number[];
+  }): Promise<void> {
+    const unique = Array.from(new Set(input.documentIds)).filter((x) => Number.isFinite(x));
+    if (unique.length === 0) return;
+
+    for (const batch of chunkArray(unique, 1000)) {
+      await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
+        userId: input.userId,
+        documentIds: batch,
+      });
+    }
   }
 }
 
@@ -294,8 +357,9 @@ function capText(s: string, maxLen: number): string {
 }
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
-  if (arr.length <= size) return [arr];
+  const a = arr ?? [];
+  if (a.length <= size) return [a];
   const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  for (let i = 0; i < a.length; i += size) out.push(a.slice(i, i + size));
   return out;
 }

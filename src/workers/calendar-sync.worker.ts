@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { PgBossService } from '../jobs/pgboss.service';
 import { DbService } from '../db/db.service';
-import { calendarEvents, documents, integrationStates } from '../db/schema';
+import { calendarEvents, documentChunks, documents, integrationStates } from '../db/schema';
 import { CalendarApiService } from '../modules/integrations/google/calendar-api.service';
 import { CALENDAR_SYNC_EVENTS_JOB, RAG_EMBED_DOCUMENTS_JOB } from '../jobs/job.constants';
 
@@ -34,7 +34,9 @@ export class CalendarSyncWorker implements OnModuleInit {
       await this.pgBossService.client.createQueue(CALENDAR_SYNC_EVENTS_JOB);
     } catch (err: unknown) {
       this.logger.warn(
-        `createQueue(${CALENDAR_SYNC_EVENTS_JOB}) failed: ${err instanceof Error ? err.message : String(err)}`,
+        `createQueue(${CALENDAR_SYNC_EVENTS_JOB}) failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
       );
     }
 
@@ -82,6 +84,7 @@ export class CalendarSyncWorker implements OnModuleInit {
     let processed = 0;
 
     const changedSourceIds: string[] = [];
+    const processedSourceIds: string[] = [];
 
     while (pages < maxPages) {
       pages += 1;
@@ -97,6 +100,7 @@ export class CalendarSyncWorker implements OnModuleInit {
       if (page.events.length === 0) break;
 
       const pageSourceIds = page.events.map((ev) => `${calendarId}:${ev.id}`);
+      processedSourceIds.push(...pageSourceIds);
 
       const existingBySourceId = await this.loadExistingDocsMap({
         userId,
@@ -210,11 +214,13 @@ export class CalendarSyncWorker implements OnModuleInit {
       pageToken = page.nextPageToken;
     }
 
+    const nowIso = new Date().toISOString();
+
     await this.setIntegrationState(userId, {
       ...(state ?? {}),
-      lastSyncedAt: new Date().toISOString(),
+      lastSyncedAt: nowIso,
       lastRun: {
-        at: new Date().toISOString(),
+        at: nowIso,
         pages,
         processed,
         calendarId,
@@ -224,14 +230,27 @@ export class CalendarSyncWorker implements OnModuleInit {
       },
     });
 
-    await this.enqueueEmbedForChangedDocs({
+    // Repair behavior: include docs that are missing chunks, even if unchanged
+    const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'calendar_event',
-      changedSourceIds,
+      sourceIds: processedSourceIds,
+    });
+
+    await this.enqueueEmbedForDocumentIds({
+      userId,
+      documentIds: [
+        ...(await this.loadDocumentIdsForSourceIds({
+          userId,
+          source: 'calendar_event',
+          sourceIds: changedSourceIds,
+        })),
+        ...repairDocIds,
+      ],
     });
 
     this.logger.log(
-      `[${CALENDAR_SYNC_EVENTS_JOB}] done job=${String(job.id)} userId=${userId} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length}`,
+      `[${CALENDAR_SYNC_EVENTS_JOB}] done job=${String(job.id)} userId=${userId} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length}`,
     );
   }
 
@@ -265,17 +284,17 @@ export class CalendarSyncWorker implements OnModuleInit {
     return map;
   }
 
-  private async enqueueEmbedForChangedDocs(input: {
+  private async loadDocumentIdsForSourceIds(input: {
     userId: number;
     source: 'gmail_email' | 'calendar_event' | 'hubspot_contact' | 'hubspot_note';
-    changedSourceIds: string[];
-  }): Promise<void> {
-    const uniqueChanged = Array.from(new Set(input.changedSourceIds)).filter(Boolean);
-    if (uniqueChanged.length === 0) return;
+    sourceIds: string[];
+  }): Promise<number[]> {
+    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
+    if (ids.length === 0) return [];
 
-    const documentIds: number[] = [];
+    const out: number[] = [];
 
-    for (const chunk of chunkArray(uniqueChanged, 1000)) {
+    for (const chunk of chunkArray(ids, 1000)) {
       const rows = await this.dbService.db
         .select({ id: documents.id })
         .from(documents)
@@ -287,15 +306,62 @@ export class CalendarSyncWorker implements OnModuleInit {
           ),
         );
 
-      for (const r of rows) documentIds.push(r.id);
+      for (const r of rows) out.push(r.id);
     }
 
-    if (documentIds.length === 0) return;
+    return out;
+  }
 
-    await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
-      userId: input.userId,
-      documentIds,
-    });
+  private async loadDocumentIdsMissingChunksForSourceIds(input: {
+    userId: number;
+    source: 'gmail_email' | 'calendar_event' | 'hubspot_contact' | 'hubspot_note';
+    sourceIds: string[];
+  }): Promise<number[]> {
+    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
+    if (ids.length === 0) return [];
+
+    const out: number[] = [];
+
+    for (const chunk of chunkArray(ids, 1000)) {
+      const rows = await this.dbService.db
+        .select({ id: documents.id })
+        .from(documents)
+        .leftJoin(
+          documentChunks,
+          and(
+            eq(documentChunks.userId, documents.userId),
+            eq(documentChunks.documentId, documents.id),
+          ),
+        )
+        .where(
+          and(
+            eq(documents.userId, input.userId),
+            eq(documents.source, input.source),
+            inArray(documents.sourceId, chunk),
+          ),
+        )
+        .groupBy(documents.id)
+        .having(sql`count(${documentChunks.id}) = 0`);
+
+      for (const r of rows) out.push(r.id);
+    }
+
+    return out;
+  }
+
+  private async enqueueEmbedForDocumentIds(input: {
+    userId: number;
+    documentIds: number[];
+  }): Promise<void> {
+    const unique = Array.from(new Set(input.documentIds)).filter((x) => Number.isFinite(x));
+    if (unique.length === 0) return;
+
+    for (const batch of chunkArray(unique, 1000)) {
+      await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
+        userId: input.userId,
+        documentIds: batch,
+      });
+    }
   }
 
   private async getIntegrationState(userId: number): Promise<Record<string, unknown> | null> {
@@ -349,8 +415,9 @@ function capText(s: string, maxLen: number): string {
 }
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
-  if (arr.length <= size) return [arr];
+  const a = arr ?? [];
+  if (a.length <= size) return [a];
   const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  for (let i = 0; i < a.length; i += size) out.push(a.slice(i, i + size));
   return out;
 }
