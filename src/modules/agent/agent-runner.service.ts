@@ -650,73 +650,158 @@ export class AgentRunnerService {
     contact: { name: string; email: string; hubspotContactId: string },
     durationMinutes: number,
   ): Promise<'handled'> {
-    const timeZone = 'America/Santo_Domingo';
+    const timezone = 'America/Santo_Domingo';
 
-    const now = Date.now();
-    const startIso = new Date(now + 60 * 60_000).toISOString();
-    const endIso = new Date(now + 14 * 24 * 60 * 60_000).toISOString();
+    const now = new Date();
+    let timezoneOffsetMinutes = 0;
+    try {
+      const formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        timeZoneName: 'shortOffset',
+      });
+      const parts = formatter.formatToParts(now);
+      const offsetPart = parts.find((p) => p.type === 'timeZoneName');
+      if (offsetPart?.value) {
+        const match = offsetPart.value.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+        if (match) {
+          const sign = match[1] === '+' ? 1 : -1;
+          const hours = parseInt(match[2], 10);
+          const minutes = parseInt(match[3] ?? '0', 10);
+          timezoneOffsetMinutes = sign * (hours * 60 + minutes);
+        }
+      }
+    } catch {
+      timezoneOffsetMinutes = -now.getTimezoneOffset();
+    }
 
+    // Get previously proposed times from memory to exclude
+    const mem = task.memory ?? {};
+    const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
+    const previouslyProposedRaw = Array.isArray(meeting['previouslyProposed'])
+      ? meeting['previouslyProposed']
+      : [];
+
+    const previouslyProposed: ProposedSlot[] = previouslyProposedRaw
+      .filter((p): p is Record<string, unknown> => isRecord(p))
+      .map((p) => ({
+        label: typeof p.label === 'string' ? p.label : '',
+        startIso: typeof p.startIso === 'string' ? p.startIso : '',
+        endIso: typeof p.endIso === 'string' ? p.endIso : '',
+      }))
+      .filter((p) => p.startIso);
+
+    this.logger.debug(
+      `findSlotsAndAskApproval: excluding ${previouslyProposed.length} previously proposed times`,
+    );
+
+    // Get more slots than needed so we have room after filtering
     const slots = await this.syncedDataTools.suggestCalendarTimesLocal({
       userId: task.userId,
-      startIso,
-      endIso,
+      startIso: now.toISOString(),
+      endIso: new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000).toISOString(),
       durationMinutes,
       workDayStartHour: 9,
       workDayEndHour: 17,
-      timezoneOffsetMinutes: -240,
-      maxSuggestions: 6,
+      timezoneOffsetMinutes,
+      maxSuggestions: 20,
     });
 
-    const proposed = slots.slice(0, 3).map((s, idx) => ({
-      label: String.fromCharCode('A'.charCodeAt(0) + idx),
-      startIso: s.startIso,
-      endIso: s.endIso,
-    }));
+    // Filter out slots that overlap with previously proposed times
+    const availableSlots = slots.filter((slot) => {
+      const slotStart = new Date(slot.startIso).getTime();
+      const slotEnd = new Date(slot.endIso).getTime();
 
-    if (proposed.length === 0) {
+      // Check if this slot overlaps with any previously proposed slot
+      const overlaps = previouslyProposed.some((prev) => {
+        const prevStart = new Date(prev.startIso).getTime();
+        const prevEnd = new Date(prev.endIso).getTime();
+
+        // Slots overlap if one starts before the other ends
+        return slotStart < prevEnd && slotEnd > prevStart;
+      });
+
+      return !overlaps;
+    });
+
+    this.logger.debug(
+      `findSlotsAndAskApproval: ${slots.length} total slots, ${availableSlots.length} after filtering`,
+    );
+
+    if (availableSlots.length === 0) {
       await this.tasks.appendMessage({
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `I couldn't find any available time slots in the next 2 weeks. Would you like me to check a different date range?`,
+        content: `I couldn't find any more available time slots in the next 2 weeks. Would you like to cancel or try a different meeting duration?`,
       });
 
       await this.tasks.setWaiting(taskId, {
         kind: 'user_message',
-        prompt: 'No available slots found. What would you like to do?',
+        prompt: 'What would you like to do?',
         sinceIso: new Date().toISOString(),
       });
       await this.tasks.setStatus(taskId, 'waiting', null);
       return 'handled';
     }
 
-    // Store meeting info and proposed slots
+    const topSlots = availableSlots.slice(0, 3);
+
+    const labels = ['A', 'B', 'C'];
+    const proposed = topSlots.map((slot, i) => ({
+      label: labels[i],
+      startIso: slot.startIso,
+      endIso: slot.endIso,
+    }));
+
+    const formattedSlots = proposed
+      .map((slot) => {
+        const start = new Date(slot.startIso);
+        const end = new Date(slot.endIso);
+
+        const dateStr = start.toLocaleDateString('en-US', {
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+          timeZone: timezone,
+        });
+
+        const startTime = start.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+
+        const endTime = end.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+
+        return `  ${slot.label}) ${dateStr}, ${startTime} – ${endTime}`;
+      })
+      .join('\n');
+
+    // Preserve previouslyProposed when saving
     await this.tasks.mergeMemory(taskId, {
       meeting: {
+        ...meeting,
         phase: 'need_user_approval',
-        timezone: timeZone,
+        contact: {
+          name: contact.name,
+          email: contact.email,
+          hubspotContactId: contact.hubspotContactId,
+        },
         durationMinutes,
-        contact,
         proposed,
-        previouslyProposed: [],
+        timezone,
       },
-    });
-
-    // Format slots for user approval
-    const slotLines = proposed.map((p) => {
-      const start = formatDateTimeForHumans(p.startIso, timeZone);
-      const end = formatTimeForHumans(p.endIso, timeZone);
-      return `  ${p.label}) ${start} – ${end}`;
     });
 
     await this.tasks.appendMessage({
       taskId,
       userId: task.userId,
       role: 'assistant',
-      content:
-        `I found the following available time slots for a ${durationMinutes}-minute meeting with ${contact.name}:\n\n` +
-        slotLines.join('\n') +
-        `\n\nDo these times look good to send to ${contact.email}? (Reply "yes" to approve, or let me know if you'd like different times)`,
+      content: `I found the following available time slots for a ${durationMinutes}-minute meeting with ${contact.name}:\n\n${formattedSlots}\n\nDo these times look good to send to ${contact.email}? (Reply "yes" to approve, or let me know if you'd like different times)`,
     });
 
     await this.tasks.setWaiting(taskId, {
@@ -904,29 +989,52 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    // User rejected or we couldn't understand clearly - ask for different times or clarification
+    // User rejected - find new time slots immediately
     if (parsed.type === 'rejection' || parsed.confidence < 0.6) {
-      await this.tasks.appendMessage({
-        taskId,
-        userId: task.userId,
-        role: 'assistant',
-        content: `No problem. Would you like me to find different time slots, or do you have specific times in mind? (Say "cancel" if you'd like to stop)`,
-      });
+      const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
+      const hubspotContactId =
+        typeof contact['hubspotContactId'] === 'string' ? contact['hubspotContactId'] : '';
+
+      // Track previously proposed times so we don't show them again
+      const previouslyProposedRaw = Array.isArray(meeting['previouslyProposed'])
+        ? meeting['previouslyProposed']
+        : [];
+
+      const previouslyProposed: ProposedSlot[] = previouslyProposedRaw
+        .filter((p): p is Record<string, unknown> => isRecord(p))
+        .map((p) => ({
+          label: typeof p.label === 'string' ? p.label : '',
+          startIso: typeof p.startIso === 'string' ? p.startIso : '',
+          endIso: typeof p.endIso === 'string' ? p.endIso : '',
+        }))
+        .filter((p) => p.startIso);
+
+      const allPreviouslyProposed: ProposedSlot[] = [...previouslyProposed, ...proposed];
 
       await this.tasks.mergeMemory(taskId, {
         meeting: {
           ...meeting,
-          phase: 'need_user_approval',
+          previouslyProposed: allPreviouslyProposed,
         },
       });
 
-      await this.tasks.setWaiting(taskId, {
-        kind: 'user_message',
-        prompt: 'What times would work better for you?',
-        sinceIso: new Date().toISOString(),
-      });
-      await this.tasks.setStatus(taskId, 'waiting', null);
-      return 'handled';
+      // Re-fetch task to get updated memory
+      const updatedTask = await this.tasks.getTask(taskId);
+      if (!updatedTask) {
+        return 'handled';
+      }
+
+      // Find new slots
+      return await this.findSlotsAndAskApproval(
+        taskId,
+        updatedTask,
+        {
+          name: contactName,
+          email: contactEmail,
+          hubspotContactId,
+        },
+        durationMinutes,
+      );
     }
 
     // Default: treat as needing clarification
