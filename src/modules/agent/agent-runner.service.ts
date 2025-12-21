@@ -235,6 +235,11 @@ export class AgentRunnerService {
       return await this.startSchedulingFlow(taskId, task);
     }
 
+    // PHASE: Need contact (user was asked who they want to meet with)
+    if (phase === 'need_contact') {
+      return await this.handleNeedContactResponse(taskId, task, lastUser?.content ?? '');
+    }
+
     // PHASE: Need contact clarification
     if (phase === 'need_contact_clarification') {
       return await this.handleContactClarificationResponse(taskId, task, lastUser?.content ?? '');
@@ -255,6 +260,355 @@ export class AgentRunnerService {
     return 'not_scheduling';
   }
 
+  private async handleNeedContactResponse(
+    taskId: number,
+    task: AgentTaskRow,
+    userResponse: string,
+  ): Promise<'handled'> {
+    const mem = task.memory ?? {};
+    const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
+    const durationMinutes =
+      typeof meeting['durationMinutes'] === 'number' ? meeting['durationMinutes'] : null;
+    const preferredTime =
+      typeof meeting['preferredTime'] === 'string' ? meeting['preferredTime'] : null;
+    const preferredTimeIso =
+      typeof meeting['preferredTimeIso'] === 'string' ? meeting['preferredTimeIso'] : null;
+
+    // Only check for explicit cancellation, NOT change_contact
+    // because in this phase the user IS providing a contact name
+    const flowControl = await this.nlp.parseFlowControlIntent({
+      userMessage: userResponse,
+      currentPhase: 'need_contact',
+      currentContactName: undefined, // No contact selected yet
+    });
+
+    // Only handle cancel/restart, ignore change_contact since user is providing the contact
+    if (flowControl.intent === 'cancel' && flowControl.confidence > 0.7) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `No problem, I've cancelled the scheduling request.`,
+      });
+      await this.tasks.setStatus(taskId, 'completed', null);
+      return 'handled';
+    }
+
+    if (flowControl.intent === 'restart' && flowControl.confidence > 0.7) {
+      await this.tasks.mergeMemory(taskId, { meeting: null });
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Let's start over. What would you like to schedule?`,
+      });
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'What would you like to schedule?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // Treat the response as the contact name
+    const contactName = userResponse.trim();
+
+    if (!contactName) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I didn't catch the name. Who would you like to schedule a meeting with?`,
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'Who would you like to meet with?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // Search for the contact in BOTH HubSpot AND Gmail senders
+    const [hubspotMatches, gmailSenders] = await Promise.all([
+      this.syncedDataTools.findHubspotContactsLocal({
+        userId: task.userId,
+        query: contactName,
+        limit: 10,
+      }),
+      this.syncedDataTools.findGmailSendersLocal({
+        userId: task.userId,
+        query: contactName,
+        limit: 20,
+      }),
+    ]);
+
+    // Build candidate list
+    const candidates: Array<{
+      source: 'hubspot' | 'gmail';
+      displayName: string;
+      email: string | null;
+      hubspotContactId: string | null;
+    }> = [];
+
+    for (const h of hubspotMatches) {
+      const displayName = `${h.firstName ?? ''} ${h.lastName ?? ''}`.trim() || h.email || 'Unknown';
+      candidates.push({
+        source: 'hubspot',
+        displayName,
+        email: h.email,
+        hubspotContactId: h.id,
+      });
+    }
+
+    for (const g of gmailSenders) {
+      const emailLower = g.email.toLowerCase();
+      const alreadyHave = candidates.some((c) => c.email && c.email.toLowerCase() === emailLower);
+      if (!alreadyHave) {
+        candidates.push({
+          source: 'gmail',
+          displayName: g.displayName || g.email,
+          email: g.email,
+          hubspotContactId: null,
+        });
+      }
+    }
+
+    if (candidates.length === 0) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I couldn't find a contact matching "${contactName}" in HubSpot or your email history. Could you provide their email address?`,
+      });
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_email',
+          contact: {
+            name: contactName,
+            email: null,
+            hubspotContactId: null,
+          },
+          durationMinutes,
+          preferredTime,
+          preferredTimeIso,
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: `Please provide the email address for ${contactName}.`,
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // Get unique emails
+    const uniqueEmails = new Set(
+      candidates.filter((c) => c.email).map((c) => c.email!.toLowerCase()),
+    );
+
+    // If we have multiple email options, ask user to clarify
+    if (uniqueEmails.size > 1) {
+      const optionsToShow = candidates.filter((c) => c.email);
+
+      const optionsList = optionsToShow
+        .map((c, i) => `${i + 1}. ${c.displayName} (${c.email})`)
+        .join('\n');
+
+      const candidateOptions = optionsToShow.map((c, i) => ({
+        index: i + 1,
+        displayName: c.displayName,
+        email: c.email,
+        source: c.source,
+        hubspotContactId: c.hubspotContactId,
+      }));
+
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I found multiple email addresses for "${contactName}". Which one should I use?\n\n${optionsList}\n\nPlease reply with the number.`,
+      });
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_contact_clarification',
+          contactQuery: contactName,
+          candidateOptions,
+          durationMinutes,
+          preferredTime,
+          preferredTimeIso,
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'Which contact did you mean? Reply with the number.',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // We have one unique email - pick the first candidate with an email
+    const best = candidates.find((c) => c.email) ?? candidates[0];
+
+    if (!best || !best.email) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I found "${contactName}" but I don't have an email address on file. Please provide their email address.`,
+      });
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_email',
+          contact: {
+            name: best?.displayName ?? contactName,
+            email: null,
+            hubspotContactId: best?.hubspotContactId ?? null,
+          },
+          durationMinutes,
+          preferredTime,
+          preferredTimeIso,
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: `Please provide the email address.`,
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    const contact = {
+      name: best.displayName,
+      email: best.email,
+      hubspotContactId: best.hubspotContactId ?? '',
+    };
+
+    // If we don't have duration, ask for it
+    if (durationMinutes === null) {
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_duration',
+          contact,
+          preferredTime,
+          preferredTimeIso,
+        },
+      });
+
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I found ${best.displayName} (${best.email}). How long should the meeting be? (e.g., "30 minutes", "1 hour")`,
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'How long should the meeting be? Please specify the duration.',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // We have contact AND duration - check if we have a preferred time
+    if (preferredTimeIso) {
+      const timezone = 'America/Santo_Domingo';
+      const preferredStart = new Date(preferredTimeIso);
+      const preferredEnd = new Date(preferredStart.getTime() + durationMinutes * 60 * 1000);
+
+      const busy = await this.calendarApi.getBusyIntervals(task.userId, {
+        calendarId: 'primary',
+        timeMinIso: preferredStart.toISOString(),
+        timeMaxIso: preferredEnd.toISOString(),
+        timeZone: timezone,
+      });
+
+      const isAvailable = !busy.some((b) => {
+        const busyStart = new Date(b.startIso).getTime();
+        const busyEnd = new Date(b.endIso).getTime();
+        const slotStart = preferredStart.getTime();
+        const slotEnd = preferredEnd.getTime();
+        return busyStart < slotEnd && busyEnd > slotStart;
+      });
+
+      if (isAvailable) {
+        const proposed = [
+          {
+            label: 'A',
+            startIso: preferredStart.toISOString(),
+            endIso: preferredEnd.toISOString(),
+          },
+        ];
+
+        const dateStr = preferredStart.toLocaleDateString('en-US', {
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+          timeZone: timezone,
+        });
+        const startTime = preferredStart.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+        const endTime = preferredEnd.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+
+        await this.tasks.mergeMemory(taskId, {
+          meeting: {
+            phase: 'need_user_approval',
+            contact,
+            durationMinutes,
+            proposed,
+            previouslyProposed: [],
+            timezone,
+          },
+        });
+
+        await this.tasks.appendMessage({
+          taskId,
+          userId: task.userId,
+          role: 'assistant',
+          content: `Great! ${dateStr}, ${startTime} – ${endTime} is available for a ${durationMinutes}-minute meeting with ${contact.name}.\n\nShould I send this time to ${contact.email}? (Reply "yes" to approve, or let me know if you'd like different times)`,
+        });
+
+        await this.tasks.setWaiting(taskId, {
+          kind: 'user_message',
+          prompt: 'Approve this time?',
+          sinceIso: new Date().toISOString(),
+        });
+        await this.tasks.setStatus(taskId, 'waiting', null);
+        return 'handled';
+      }
+
+      // Time is NOT free
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Unfortunately, ${preferredTime || 'that time'} isn't available. Let me find some alternative times...`,
+      });
+    }
+
+    // No preferred time OR preferred time wasn't available - find slots
+    return await this.findSlotsAndAskApproval(taskId, task, contact, durationMinutes);
+  }
+
   private async startSchedulingFlow(
     taskId: number,
     task: AgentTaskRow,
@@ -267,6 +621,10 @@ export class AgentRunnerService {
     }
 
     const contactName = parsed.contactName;
+    const durationMinutes = parsed.durationMinutes;
+    const preferredTime = parsed.preferredTimeframe;
+    const preferredTimeIso = parsed.preferredTimeIso;
+
     if (!contactName) {
       await this.tasks.appendMessage({
         taskId,
@@ -278,6 +636,9 @@ export class AgentRunnerService {
       await this.tasks.mergeMemory(taskId, {
         meeting: {
           phase: 'need_contact',
+          durationMinutes,
+          preferredTime,
+          preferredTimeIso,
         },
       });
 
@@ -346,12 +707,15 @@ export class AgentRunnerService {
 
       await this.tasks.mergeMemory(taskId, {
         meeting: {
-          phase: 'need_duration',
+          phase: 'need_email',
           contact: {
             name: contactName,
             email: null,
             hubspotContactId: null,
           },
+          durationMinutes,
+          preferredTime,
+          preferredTimeIso,
         },
       });
 
@@ -398,6 +762,9 @@ export class AgentRunnerService {
           phase: 'need_contact_clarification',
           contactQuery: contactName,
           candidateOptions,
+          durationMinutes,
+          preferredTime,
+          preferredTimeIso,
         },
       });
 
@@ -423,12 +790,15 @@ export class AgentRunnerService {
 
       await this.tasks.mergeMemory(taskId, {
         meeting: {
-          phase: 'need_duration',
+          phase: 'need_email',
           contact: {
             name: best?.displayName ?? contactName,
             email: null,
             hubspotContactId: best?.hubspotContactId ?? null,
           },
+          durationMinutes,
+          preferredTime,
+          preferredTimeIso,
         },
       });
 
@@ -441,19 +811,22 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    // Use duration from NLP parsing if available
-    const durationFromGoal = parsed.durationMinutes;
-    const sourceNote = best.source === 'hubspot' ? '' : ' (from your email history)';
+    const contact = {
+      name: best.displayName,
+      email: best.email,
+      hubspotContactId: best.hubspotContactId ?? '',
+    };
 
-    if (durationFromGoal === null) {
+    // If we don't have duration, ask for it
+    if (durationMinutes === null) {
+      const sourceNote = best.source === 'hubspot' ? '' : ' (from your email history)';
+
       await this.tasks.mergeMemory(taskId, {
         meeting: {
           phase: 'need_duration',
-          contact: {
-            name: best.displayName,
-            email: best.email,
-            hubspotContactId: best.hubspotContactId,
-          },
+          contact,
+          preferredTime,
+          preferredTimeIso,
         },
       });
 
@@ -473,16 +846,93 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    return await this.findSlotsAndAskApproval(
-      taskId,
-      task,
-      {
-        name: best.displayName,
-        email: best.email,
-        hubspotContactId: best.hubspotContactId ?? '',
-      },
-      durationFromGoal,
-    );
+    // We have contact AND duration - check if we have a preferred time
+    if (preferredTimeIso) {
+      const timezone = 'America/Santo_Domingo';
+      const preferredStart = new Date(preferredTimeIso);
+      const preferredEnd = new Date(preferredStart.getTime() + durationMinutes * 60 * 1000);
+
+      // Check if this time slot is free using the calendar API
+      const busy = await this.calendarApi.getBusyIntervals(task.userId, {
+        calendarId: 'primary',
+        timeMinIso: preferredStart.toISOString(),
+        timeMaxIso: preferredEnd.toISOString(),
+        timeZone: timezone,
+      });
+
+      const isAvailable = !busy.some((b) => {
+        const busyStart = new Date(b.startIso).getTime();
+        const busyEnd = new Date(b.endIso).getTime();
+        const slotStart = preferredStart.getTime();
+        const slotEnd = preferredEnd.getTime();
+        return busyStart < slotEnd && busyEnd > slotStart;
+      });
+
+      if (isAvailable) {
+        // Time is free - propose this specific time
+        const proposed = [
+          {
+            label: 'A',
+            startIso: preferredStart.toISOString(),
+            endIso: preferredEnd.toISOString(),
+          },
+        ];
+
+        const dateStr = preferredStart.toLocaleDateString('en-US', {
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+          timeZone: timezone,
+        });
+        const startTime = preferredStart.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+        const endTime = preferredEnd.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+
+        await this.tasks.mergeMemory(taskId, {
+          meeting: {
+            phase: 'need_user_approval',
+            contact,
+            durationMinutes,
+            proposed,
+            previouslyProposed: [],
+            timezone,
+          },
+        });
+
+        await this.tasks.appendMessage({
+          taskId,
+          userId: task.userId,
+          role: 'assistant',
+          content: `Great! ${dateStr}, ${startTime} – ${endTime} is available for a ${durationMinutes}-minute meeting with ${contact.name}.\n\nShould I send this time to ${contact.email}? (Reply "yes" to approve, or let me know if you'd like different times)`,
+        });
+
+        await this.tasks.setWaiting(taskId, {
+          kind: 'user_message',
+          prompt: 'Approve this time?',
+          sinceIso: new Date().toISOString(),
+        });
+        await this.tasks.setStatus(taskId, 'waiting', null);
+        return 'handled';
+      }
+
+      // Time is NOT free - tell user and find alternatives
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Unfortunately, ${preferredTime || 'that time'} isn't available. Let me find some alternative times...`,
+      });
+    }
+
+    // No preferred time OR preferred time wasn't available - find slots
+    return await this.findSlotsAndAskApproval(taskId, task, contact, durationMinutes);
   }
 
   private async handleDurationResponse(
@@ -493,10 +943,16 @@ export class AgentRunnerService {
     const mem = task.memory ?? {};
     const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
     const contact = isRecord(meeting['contact']) ? meeting['contact'] : {};
-    const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
     const contactName = typeof contact['name'] === 'string' ? contact['name'] : '';
+    const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
+    const hubspotContactId =
+      typeof contact['hubspotContactId'] === 'string' ? contact['hubspotContactId'] : '';
+    const storedPreferredTime =
+      typeof meeting['preferredTime'] === 'string' ? meeting['preferredTime'] : null;
+    const storedPreferredTimeIso =
+      typeof meeting['preferredTimeIso'] === 'string' ? meeting['preferredTimeIso'] : null;
 
-    // Check for cancellation or contact change first
+    // Check for flow control
     const flowControlResult = await this.handleFlowControl(
       taskId,
       task,
@@ -508,129 +964,32 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    // Use NLP to parse the response
-    const agentAskedFor = contactEmail ? 'duration' : 'email';
+    // Parse duration from user response using LLM
     const parsed = await this.nlp.parseUserResponse({
       userMessage: userResponse,
-      agentAskedFor,
+      agentAskedFor: 'duration',
     });
 
-    // Check for cancellation in the parsed response
+    // Check for cancellation
     if (parsed.type === 'cancellation') {
       await this.tasks.appendMessage({
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `No problem, I've cancelled the scheduling request. Let me know if you need anything else.`,
+        content: `No problem, I've cancelled the scheduling request.`,
       });
-
-      await this.tasks.mergeMemory(taskId, { meeting: null });
       await this.tasks.setStatus(taskId, 'completed', null);
       return 'handled';
     }
 
-    // Check for contact change
-    if (parsed.type === 'change_contact' && parsed.newContactName) {
+    const durationMinutes = parsed.durationMinutes ?? null;
+
+    if (!durationMinutes) {
       await this.tasks.appendMessage({
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `Got it, let me find ${parsed.newContactName} instead.`,
-      });
-
-      await this.tasks.mergeMemory(taskId, { meeting: null });
-
-      const updatedTask: AgentTaskRow = {
-        ...task,
-        goal: `Schedule a meeting with ${parsed.newContactName}`,
-        memory: {},
-      };
-
-      return await this.startSchedulingFlow(taskId, updatedTask);
-    }
-
-    // Check if user provided an email (in case we were waiting for that)
-    if (parsed.type === 'email' && parsed.email) {
-      const updatedContact = {
-        ...contact,
-        email: parsed.email,
-      };
-
-      await this.tasks.mergeMemory(taskId, {
-        meeting: {
-          ...meeting,
-          contact: updatedContact,
-        },
-      });
-
-      await this.tasks.appendMessage({
-        taskId,
-        userId: task.userId,
-        role: 'assistant',
-        content: `Got it. How long should the meeting be? (e.g., "30 minutes", "1 hour")`,
-      });
-
-      await this.tasks.setWaiting(taskId, {
-        kind: 'user_message',
-        prompt: 'How long should the meeting be? Please specify the duration.',
-        sinceIso: new Date().toISOString(),
-      });
-      await this.tasks.setStatus(taskId, 'waiting', null);
-      return 'handled';
-    }
-
-    // Check for duration
-    if (parsed.type === 'duration' && parsed.durationMinutes) {
-      if (!contactEmail) {
-        await this.tasks.appendMessage({
-          taskId,
-          userId: task.userId,
-          role: 'assistant',
-          content: `I still need the email address for this contact. Could you provide it?`,
-        });
-
-        await this.tasks.setWaiting(taskId, {
-          kind: 'user_message',
-          prompt: 'Please provide the email address.',
-          sinceIso: new Date().toISOString(),
-        });
-        await this.tasks.setStatus(taskId, 'waiting', null);
-        return 'handled';
-      }
-
-      return await this.findSlotsAndAskApproval(
-        taskId,
-        task,
-        {
-          name: contactName,
-          email: contactEmail,
-          hubspotContactId:
-            typeof contact['hubspotContactId'] === 'string' ? contact['hubspotContactId'] : '',
-        },
-        parsed.durationMinutes,
-      );
-    }
-
-    // Couldn't understand the response - ask again with context
-    if (!contactEmail) {
-      await this.tasks.appendMessage({
-        taskId,
-        userId: task.userId,
-        role: 'assistant',
-        content: `I didn't quite catch that. Could you please provide the email address for the contact? (Or say "cancel" if you'd like to stop)`,
-      });
-
-      await this.tasks.setWaiting(taskId, {
-        kind: 'user_message',
-        prompt: 'Please provide the email address.',
-        sinceIso: new Date().toISOString(),
-      });
-    } else {
-      await this.tasks.appendMessage({
-        taskId,
-        userId: task.userId,
-        role: 'assistant',
-        content: `I didn't quite catch that. Could you please specify how long the meeting should be? (e.g., "30 minutes", "1 hour", or "half an hour"). Say "cancel" if you'd like to stop.`,
+        content: `I didn't catch the duration. How long should the meeting be? (e.g., "30 minutes", "1 hour")`,
       });
 
       await this.tasks.setWaiting(taskId, {
@@ -638,10 +997,101 @@ export class AgentRunnerService {
         prompt: 'Please specify the meeting duration.',
         sinceIso: new Date().toISOString(),
       });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
     }
 
-    await this.tasks.setStatus(taskId, 'waiting', null);
-    return 'handled';
+    const contactObj = {
+      name: contactName,
+      email: contactEmail,
+      hubspotContactId,
+    };
+
+    // If we have a preferred time, check availability
+    if (storedPreferredTimeIso) {
+      const timezone = 'America/Santo_Domingo';
+      const preferredStart = new Date(storedPreferredTimeIso);
+      const preferredEnd = new Date(preferredStart.getTime() + durationMinutes * 60 * 1000);
+
+      const busy = await this.calendarApi.getBusyIntervals(task.userId, {
+        calendarId: 'primary',
+        timeMinIso: preferredStart.toISOString(),
+        timeMaxIso: preferredEnd.toISOString(),
+        timeZone: timezone,
+      });
+
+      const isAvailable = !busy.some((b) => {
+        const busyStart = new Date(b.startIso).getTime();
+        const busyEnd = new Date(b.endIso).getTime();
+        const slotStart = preferredStart.getTime();
+        const slotEnd = preferredEnd.getTime();
+        return busyStart < slotEnd && busyEnd > slotStart;
+      });
+
+      if (isAvailable) {
+        const proposed = [
+          {
+            label: 'A',
+            startIso: preferredStart.toISOString(),
+            endIso: preferredEnd.toISOString(),
+          },
+        ];
+
+        const dateStr = preferredStart.toLocaleDateString('en-US', {
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+          timeZone: timezone,
+        });
+        const startTime = preferredStart.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+        const endTime = preferredEnd.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+
+        await this.tasks.mergeMemory(taskId, {
+          meeting: {
+            phase: 'need_user_approval',
+            contact: contactObj,
+            durationMinutes,
+            proposed,
+            previouslyProposed: [],
+            timezone,
+          },
+        });
+
+        await this.tasks.appendMessage({
+          taskId,
+          userId: task.userId,
+          role: 'assistant',
+          content: `Great! ${dateStr}, ${startTime} – ${endTime} is available for a ${durationMinutes}-minute meeting with ${contactName}.\n\nShould I send this time to ${contactEmail}? (Reply "yes" to approve, or let me know if you'd like different times)`,
+        });
+
+        await this.tasks.setWaiting(taskId, {
+          kind: 'user_message',
+          prompt: 'Approve this time?',
+          sinceIso: new Date().toISOString(),
+        });
+        await this.tasks.setStatus(taskId, 'waiting', null);
+        return 'handled';
+      }
+
+      // Time is NOT free
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Unfortunately, ${storedPreferredTime || 'that time'} isn't available. Let me find some alternative times...`,
+      });
+    }
+
+    // No preferred time or it wasn't available - find slots
+    return await this.findSlotsAndAskApproval(taskId, task, contactObj, durationMinutes);
   }
 
   private async findSlotsAndAskApproval(
@@ -911,23 +1361,43 @@ export class AgentRunnerService {
         return 'handled';
       }
 
-      const body = buildSchedulingOptionsEmail({
-        intro:
-          `Hi ${contactName},\n\n` +
-          `I'd like to schedule a ${durationMinutes}-minute meeting. Please reply with the letter of your preferred time, or "D" if none of these work:\n`,
-        options: proposed.map((p) => ({
-          label: p.label,
-          startIso: p.startIso,
-          endIso: p.endIso,
-          timeZone,
-        })),
-        includeNoneOption: true,
-      });
+      // Determine if single option mode (user specified exact time)
+      const isSingleOption = proposed.length === 1;
+
+      const body = isSingleOption
+        ? buildSchedulingOptionsEmail({
+            intro:
+              `Hi ${contactName},\n\n` +
+              `I'd like to schedule a ${durationMinutes}-minute meeting with you.`,
+            options: proposed.map((p) => ({
+              label: p.label,
+              startIso: p.startIso,
+              endIso: p.endIso,
+              timeZone,
+            })),
+            singleOptionMode: true,
+          })
+        : buildSchedulingOptionsEmail({
+            intro:
+              `Hi ${contactName},\n\n` +
+              `I'd like to schedule a ${durationMinutes}-minute meeting. Please reply with the letter of your preferred time, or "${String.fromCharCode('A'.charCodeAt(0) + proposed.length)}" if none of these work:\n`,
+            options: proposed.map((p) => ({
+              label: p.label,
+              startIso: p.startIso,
+              endIso: p.endIso,
+              timeZone,
+            })),
+            includeNoneOption: true,
+          });
+
+      const subject = isSingleOption
+        ? `Meeting Request — please confirm`
+        : `Scheduling Request — please choose an option`;
 
       // Send email FIRST
       const sendRes = await this.gmailApi.sendEmail(task.userId, {
         to: contactEmail,
-        subject: `Scheduling Request — please choose an option`,
+        subject,
         bodyText: body,
       });
 
@@ -967,6 +1437,7 @@ export class AgentRunnerService {
           gmailThreadId: gmailThreadId || null,
           proposed,
           previouslyProposed: updatedPreviouslyProposed,
+          isSingleOption,
         },
       });
 
@@ -983,7 +1454,9 @@ export class AgentRunnerService {
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `I've sent the scheduling options to ${contactEmail}. I'll notify you here when they respond.`,
+        content: isSingleOption
+          ? `I've sent the meeting request to ${contactEmail}. I'll notify you here when they respond.`
+          : `I've sent the scheduling options to ${contactEmail}. I'll notify you here when they respond.`,
       });
 
       return 'handled';
@@ -1084,15 +1557,117 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    const label = extractLabelChoice(parsed.bodyText);
+    const choice = extractLabelChoice(parsed.bodyText);
+    const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
+    const contactName = typeof contact['name'] === 'string' ? contact['name'] : contactEmail;
+    const threadId = parsed.threadId;
 
-    // Check if contact selected "D" (none of these work)
-    if (label === 'D') {
+    // Handle YES response (for single-option mode)
+    if (choice === 'YES' && proposed.length >= 1) {
+      const chosen = proposed[0];
+
+      // Check if slot is still available
+      const busy = await this.calendarApi.getBusyIntervals(task.userId, {
+        calendarId: 'primary',
+        timeMinIso: chosen.startIso,
+        timeMaxIso: chosen.endIso,
+        timeZone,
+      });
+
+      const isBusyNow = busy.some((b) => {
+        const busyStart = new Date(b.startIso).getTime();
+        const busyEnd = new Date(b.endIso).getTime();
+        const chosenStart = new Date(chosen.startIso).getTime();
+        const chosenEnd = new Date(chosen.endIso).getTime();
+        return busyStart < chosenEnd && busyEnd > chosenStart;
+      });
+
+      if (isBusyNow) {
+        return await this.sendNewTimesAfterConflict(taskId, task, parsed, 'conflict');
+      }
+
+      // Create the calendar event
+      const summary = `Meeting with ${contactName}`;
+
+      const created = await this.calendarApi.createEvent(task.userId, {
+        calendarId: 'primary',
+        summary,
+        startIso: chosen.startIso,
+        endIso: chosen.endIso,
+        timeZone,
+        attendees: [{ email: contactEmail }],
+      });
+
+      // Add HubSpot note
+      const hubspotContactId =
+        typeof contact['hubspotContactId'] === 'string' ? contact['hubspotContactId'] : '';
+      if (hubspotContactId) {
+        const noteBody =
+          `Scheduled meeting.\n\n` +
+          `Client: ${contactEmail}\n` +
+          `Start: ${formatDateTimeForHumans(chosen.startIso, timeZone)}\n` +
+          `End: ${formatDateTimeForHumans(chosen.endIso, timeZone)}\n` +
+          `Duration: ${durationMinutes} minutes\n` +
+          `Calendar event: ${created.id}\n`;
+
+        await this.hubspotApi.createNoteOnContact(task.userId, {
+          contactId: hubspotContactId,
+          body: noteBody,
+          timestampIso: new Date().toISOString(),
+        });
+      }
+
+      // Send confirmation email
+      const confirmBody =
+        `Confirmed — you're booked!\n\n` +
+        `Start: ${formatDateTimeForHumans(chosen.startIso, timeZone)}\n` +
+        `End: ${formatDateTimeForHumans(chosen.endIso, timeZone)}\n` +
+        `Duration: ${durationMinutes} minutes\n\n` +
+        `I've added it to my calendar and you should receive an invite shortly.`;
+
+      await this.gmailApi.sendEmail(task.userId, {
+        to: contactEmail,
+        subject: parsed.subject ? `Re: ${parsed.subject}` : 'Re: Meeting Request',
+        bodyText: confirmBody,
+        threadId,
+      });
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          ...meeting,
+          phase: 'scheduled',
+          chosen: { label: chosen.label, startIso: chosen.startIso, endIso: chosen.endIso },
+          calendarEventId: created.id,
+        },
+      });
+
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content:
+          `Meeting scheduled with ${contactName}!\n\n` +
+          `📅 ${formatDateTimeForHumans(chosen.startIso, timeZone)} – ${formatTimeForHumans(chosen.endIso, timeZone)}\n` +
+          `⏱️ ${durationMinutes} minutes\n\n` +
+          `I've created the calendar event and sent a confirmation email.`,
+      });
+
+      await this.tasks.setStatus(taskId, 'completed', null);
+      return 'handled';
+    }
+
+    // Handle NO response (for single-option mode) - same as "none of these work"
+    if (choice === 'NO') {
       return await this.handleNoneOfTheseWork(taskId, task, parsed);
     }
 
-    if (!label) {
-      // Couldn't parse a label - wait for another reply or ask the user
+    // Handle D (none of these work) for multi-option mode
+    if (choice === 'D') {
+      return await this.handleNoneOfTheseWork(taskId, task, parsed);
+    }
+
+    if (!choice) {
+      // Couldn't parse a choice - wait for another reply or ask the user
       await this.tasks.appendMessage({
         taskId,
         userId: task.userId,
@@ -1109,10 +1684,24 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    // Find the chosen slot
-    const chosen = proposed.find((p) => p.label.toUpperCase() === label.toUpperCase());
+    // Find the chosen slot (A, B, or C)
+    const chosen = proposed.find((p) => p.label.toUpperCase() === choice.toUpperCase());
 
     if (!chosen) {
+      // Invalid choice - ask user what to do
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I received a reply from the contact but they selected "${choice}" which doesn't match any of the options. Here's what they said:\n\n"${parsed.bodyText.slice(0, 500)}"\n\nWould you like me to follow up with them?`,
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'How would you like to proceed?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
       return 'handled';
     }
 
@@ -1132,16 +1721,12 @@ export class AgentRunnerService {
       return busyStart < chosenEnd && busyEnd > chosenStart;
     });
 
-    const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
-    const threadId = parsed.threadId;
-
     if (isBusyNow) {
       // Slot became unavailable - send new options
       return await this.sendNewTimesAfterConflict(taskId, task, parsed, 'conflict');
     }
 
     // Create the calendar event
-    const contactName = typeof contact['name'] === 'string' ? contact['name'] : contactEmail;
     const summary = `Meeting with ${contactName}`;
 
     const created = await this.calendarApi.createEvent(task.userId, {
@@ -1160,7 +1745,7 @@ export class AgentRunnerService {
       const noteBody =
         `Scheduled meeting.\n\n` +
         `Client: ${contactEmail}\n` +
-        `Chosen option: ${label}\n` +
+        `Chosen option: ${choice}\n` +
         `Start: ${formatDateTimeForHumans(chosen.startIso, timeZone)}\n` +
         `End: ${formatDateTimeForHumans(chosen.endIso, timeZone)}\n` +
         `Duration: ${durationMinutes} minutes\n` +
@@ -1175,7 +1760,7 @@ export class AgentRunnerService {
 
     // Send confirmation email
     const confirmBody =
-      `Confirmed — you're booked for option ${label}.\n\n` +
+      `Confirmed — you're booked for option ${choice}.\n\n` +
       `Start: ${formatDateTimeForHumans(chosen.startIso, timeZone)}\n` +
       `End: ${formatDateTimeForHumans(chosen.endIso, timeZone)}\n` +
       `Duration: ${durationMinutes} minutes\n\n` +
@@ -1192,7 +1777,7 @@ export class AgentRunnerService {
       meeting: {
         ...meeting,
         phase: 'scheduled',
-        chosen: { label, startIso: chosen.startIso, endIso: chosen.endIso },
+        chosen: { label: choice, startIso: chosen.startIso, endIso: chosen.endIso },
         calendarEventId: created.id,
       },
     });
@@ -1966,6 +2551,12 @@ export class AgentRunnerService {
     const candidateOptionsRaw = Array.isArray(meeting['candidateOptions'])
       ? meeting['candidateOptions']
       : [];
+    const durationMinutes =
+      typeof meeting['durationMinutes'] === 'number' ? meeting['durationMinutes'] : null;
+    const preferredTime =
+      typeof meeting['preferredTime'] === 'string' ? meeting['preferredTime'] : null;
+    const preferredTimeIso =
+      typeof meeting['preferredTimeIso'] === 'string' ? meeting['preferredTimeIso'] : null;
 
     // Parse candidate options safely
     const candidateOptions = candidateOptionsRaw
@@ -2046,12 +2637,15 @@ export class AgentRunnerService {
 
       await this.tasks.mergeMemory(taskId, {
         meeting: {
-          phase: 'need_duration',
+          phase: 'need_email',
           contact: {
             name: displayName,
             email: null,
             hubspotContactId,
           },
+          durationMinutes,
+          preferredTime,
+          preferredTimeIso,
         },
       });
 
@@ -2064,15 +2658,109 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    // We have the contact - now ask for duration
+    const contact = {
+      name: displayName,
+      email,
+      hubspotContactId: hubspotContactId ?? '',
+    };
+
+    // If we already have duration AND preferred time, check availability
+    if (durationMinutes && preferredTimeIso) {
+      const timezone = 'America/Santo_Domingo';
+      const preferredStart = new Date(preferredTimeIso);
+      const preferredEnd = new Date(preferredStart.getTime() + durationMinutes * 60 * 1000);
+
+      const busy = await this.calendarApi.getBusyIntervals(task.userId, {
+        calendarId: 'primary',
+        timeMinIso: preferredStart.toISOString(),
+        timeMaxIso: preferredEnd.toISOString(),
+        timeZone: timezone,
+      });
+
+      const isAvailable = !busy.some((b) => {
+        const busyStart = new Date(b.startIso).getTime();
+        const busyEnd = new Date(b.endIso).getTime();
+        const slotStart = preferredStart.getTime();
+        const slotEnd = preferredEnd.getTime();
+        return busyStart < slotEnd && busyEnd > slotStart;
+      });
+
+      if (isAvailable) {
+        const proposed = [
+          {
+            label: 'A',
+            startIso: preferredStart.toISOString(),
+            endIso: preferredEnd.toISOString(),
+          },
+        ];
+
+        const dateStr = preferredStart.toLocaleDateString('en-US', {
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+          timeZone: timezone,
+        });
+        const startTime = preferredStart.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+        const endTime = preferredEnd.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZone: timezone,
+        });
+
+        await this.tasks.mergeMemory(taskId, {
+          meeting: {
+            phase: 'need_user_approval',
+            contact,
+            durationMinutes,
+            proposed,
+            previouslyProposed: [],
+            timezone,
+          },
+        });
+
+        await this.tasks.appendMessage({
+          taskId,
+          userId: task.userId,
+          role: 'assistant',
+          content: `Great! ${dateStr}, ${startTime} – ${endTime} is available for a ${durationMinutes}-minute meeting with ${contact.name}.\n\nShould I send this time to ${contact.email}? (Reply "yes" to approve, or let me know if you'd like different times)`,
+        });
+
+        await this.tasks.setWaiting(taskId, {
+          kind: 'user_message',
+          prompt: 'Approve this time?',
+          sinceIso: new Date().toISOString(),
+        });
+        await this.tasks.setStatus(taskId, 'waiting', null);
+        return 'handled';
+      }
+
+      // Time is NOT free
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Unfortunately, ${preferredTime || 'that time'} isn't available. Let me find some alternative times...`,
+      });
+
+      return await this.findSlotsAndAskApproval(taskId, task, contact, durationMinutes);
+    }
+
+    // If we have duration but no preferred time, find slots directly
+    if (durationMinutes) {
+      return await this.findSlotsAndAskApproval(taskId, task, contact, durationMinutes);
+    }
+
+    // No duration yet - ask for it
     await this.tasks.mergeMemory(taskId, {
       meeting: {
         phase: 'need_duration',
-        contact: {
-          name: displayName,
-          email,
-          hubspotContactId,
-        },
+        contact,
+        preferredTime,
+        preferredTimeIso,
       },
     });
 
@@ -2164,7 +2852,52 @@ function extractLabelChoice(body: string): string | null {
   const head = s.slice(0, 300);
   const headUpper = head.toUpperCase();
 
-  // FIRST: Check for explicit letter choices A, B, C at the very start
+  // FIRST: Check for Yes/No responses (for single-option mode)
+  const yesPatterns = [
+    /^YES\b/i,
+    /^YEP\b/i,
+    /^YEAH\b/i,
+    /^YUP\b/i,
+    /^SURE\b/i,
+    /^OK\b/i,
+    /^OKAY\b/i,
+    /^SOUNDS?\s+GOOD\b/i,
+    /^THAT\s+WORKS?\b/i,
+    /^WORKS?\s+FOR\s+ME\b/i,
+    /^PERFECT\b/i,
+    /^GREAT\b/i,
+    /^CONFIRMED?\b/i,
+    /^I'?M?\s+(?:GOOD|IN|AVAILABLE|FREE)\b/i,
+    /^(?:THAT'?S?\s+)?(?:GOOD|FINE|GREAT|PERFECT)\b/i,
+    /^SEE\s+YOU\s+THEN\b/i,
+  ];
+
+  for (const pattern of yesPatterns) {
+    if (pattern.test(head)) {
+      return 'YES';
+    }
+  }
+
+  const noPatterns = [
+    /^NO\b/i,
+    /^NOPE\b/i,
+    /^NAH\b/i,
+    /^SORRY\b/i,
+    /^(?:I\s+)?CAN'?T\b/i,
+    /^(?:THAT\s+)?(?:DOESN'?T|DOES\s+NOT|WON'?T|WILL\s+NOT)\s+WORK\b/i,
+    /^(?:I'?M?\s+)?NOT\s+(?:AVAILABLE|FREE)\b/i,
+    /^(?:I\s+)?(?:HAVE|GOT)\s+(?:A\s+)?(?:CONFLICT|SOMETHING)\b/i,
+    /^UNFORTUNATELY\b/i,
+    /^(?:NEED|WANT)\s+(?:A\s+)?DIFFERENT\s+TIME\b/i,
+  ];
+
+  for (const pattern of noPatterns) {
+    if (pattern.test(head)) {
+      return 'NO';
+    }
+  }
+
+  // SECOND: Check for explicit letter choices A, B, C at the very start
   // This is the most common case: contact just replies "C" or "C." or "Option C"
 
   // Check if response starts with a single letter (most common case)
@@ -2185,7 +2918,7 @@ function extractLabelChoice(body: string): string | null {
     return parenAtStart[1].toUpperCase();
   }
 
-  // SECOND: Check for choice phrases that indicate A, B, or C
+  // THIRD: Check for choice phrases that indicate A, B, or C
   const choicePatterns = [
     /\bOPTION\s+([A-C])\b/i,
     /\bCHOOSE\s+([A-C])\b/i,
@@ -2207,14 +2940,14 @@ function extractLabelChoice(body: string): string | null {
     }
   }
 
-  // THIRD: Check for standalone A, B, or C with clear word boundaries
+  // FOURTH: Check for standalone A, B, or C with clear word boundaries
   // Be careful not to match letters that are part of words
   const standaloneABC = headUpper.match(/(?:^|[\s.,:;!?()])([A-C])(?:[\s.,:;!?()]|$)/);
   if (standaloneABC) {
     return standaloneABC[1];
   }
 
-  // FOURTH: Now check for explicit "D" or "none of these" ONLY if no A/B/C was found
+  // FIFTH: Now check for explicit "D" or "none of these" ONLY if no A/B/C was found
 
   // Check if starts with D
   const startsWithD = head.match(/^([Dd])\b/);
@@ -2258,8 +2991,30 @@ function buildSchedulingOptionsEmail(input: {
   intro: string;
   options: Array<{ label: string; startIso: string; endIso: string; timeZone: string }>;
   includeNoneOption?: boolean;
+  singleOptionMode?: boolean;
 }): string {
   const lines: string[] = [];
+
+  // Single option mode: Yes/No format
+  if (input.singleOptionMode && input.options.length === 1) {
+    const opt = input.options[0];
+    const start = formatDateTimeForHumans(opt.startIso, opt.timeZone);
+    const end = formatTimeForHumans(opt.endIso, opt.timeZone);
+
+    lines.push(input.intro);
+    lines.push('');
+    lines.push(`Proposed time: ${start} – ${end}`);
+    lines.push('');
+    lines.push('Please reply:');
+    lines.push('  Yes - if this time works for you');
+    lines.push('  No - if you need a different time');
+    lines.push('');
+    lines.push('Just reply with "Yes" or "No".');
+
+    return lines.join('\n');
+  }
+
+  // Multiple options mode: A/B/C/D format
   lines.push(input.intro);
   lines.push('');
 
@@ -2270,7 +3025,8 @@ function buildSchedulingOptionsEmail(input: {
   }
 
   if (input.includeNoneOption) {
-    lines.push(`D) None of these times work for me`);
+    const nextLabel = String.fromCharCode('A'.charCodeAt(0) + input.options.length);
+    lines.push(`${nextLabel}) None of these times work for me`);
   }
 
   lines.push('');

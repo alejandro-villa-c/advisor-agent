@@ -45,12 +45,6 @@ type BackfillState = {
   lastRunAt: string | null;
 };
 
-type PgBossSend = (
-  name: string,
-  data?: unknown,
-  options?: Record<string, unknown>,
-) => Promise<unknown>;
-
 @Injectable()
 export class GmailSyncWorker implements OnModuleInit {
   private readonly logger = new Logger(GmailSyncWorker.name);
@@ -403,10 +397,10 @@ export class GmailSyncWorker implements OnModuleInit {
     let didEnqueueNextBackfill = false;
 
     if (mode === 'backfill' && lastNextPageToken) {
-      const send = getPgBossSend(this.pgBossService.client as unknown);
       const tokenKeyPart = hashSingletonKeyPart(lastNextPageToken);
 
-      await send(
+      // Use bound method call instead of extracted function to preserve `this` context
+      await this.pgBossService.client.send(
         GMAIL_SYNC_MESSAGES_JOB,
         {
           userId,
@@ -761,13 +755,6 @@ class QuotaLimiter {
       this.lastRefillMs = nowMs;
     }
   }
-}
-
-function getPgBossSend(client: unknown): PgBossSend {
-  if (!isRecord(client)) throw new Error('PgBoss client is not an object');
-  const send = client['send'];
-  if (typeof send !== 'function') throw new Error('PgBoss client.send is not a function');
-  return send as PgBossSend;
 }
 
 function hashSingletonKeyPart(value: string): string {

@@ -6,6 +6,7 @@ export type SchedulingIntent = {
   contactName: string | null;
   durationMinutes: number | null;
   preferredTimeframe: string | null;
+  preferredTimeIso: string | null;
   confidence: number;
 };
 
@@ -59,8 +60,15 @@ export class AgentNlpService {
       return this.parseSchedulingGoalHeuristic(goal);
     }
 
+    const now = new Date();
+    const today = now.toISOString().split('T')[0];
+    const dayOfWeek = now.toLocaleDateString('en-US', { weekday: 'long' });
+    const currentHour = now.getHours();
+
     const systemPrompt = `You are a natural language parser for a scheduling assistant.
 Analyze the user's request and extract scheduling information.
+
+Current date/time: ${dayOfWeek}, ${today}, approximately ${currentHour}:00.
 
 Return ONLY valid JSON matching this schema:
 {
@@ -68,18 +76,33 @@ Return ONLY valid JSON matching this schema:
   "contactName": string | null,
   "durationMinutes": number | null,
   "preferredTimeframe": string | null,
+  "preferredTimeIso": string | null,
   "confidence": number (0-1)
 }
 
-Examples:
-- "Schedule a meeting with Sara Smith" -> {"isSchedulingRequest": true, "contactName": "Sara Smith", "durationMinutes": null, "preferredTimeframe": null, "confidence": 0.95}
-- "Book a 30 minute call with John next week" -> {"isSchedulingRequest": true, "contactName": "John", "durationMinutes": 30, "preferredTimeframe": "next week", "confidence": 0.95}
-- "Set up an hour-long meeting with Dr. Jane Doe tomorrow afternoon" -> {"isSchedulingRequest": true, "contactName": "Dr. Jane Doe", "durationMinutes": 60, "preferredTimeframe": "tomorrow afternoon", "confidence": 0.95}
-- "Can you arrange a call with the marketing team?" -> {"isSchedulingRequest": true, "contactName": "the marketing team", "durationMinutes": null, "preferredTimeframe": null, "confidence": 0.85}
-- "What's the weather today?" -> {"isSchedulingRequest": false, "contactName": null, "durationMinutes": null, "preferredTimeframe": null, "confidence": 0.95}
-- "Send an email to Bob" -> {"isSchedulingRequest": false, "contactName": null, "durationMinutes": null, "preferredTimeframe": null, "confidence": 0.9}
+For preferredTimeIso:
+- Convert relative times to ISO 8601 format based on today's date
+- "tomorrow at 3pm" -> calculate the actual date and return the ISO string
+- "next Monday at 10am" -> calculate and return the ISO string
+- "at 3pm" or "3 PM" (no date specified) -> assume TODAY if the time hasn't passed yet, otherwise assume TOMORROW. Return the full ISO string.
+- "this afternoon" -> assume today around 14:00-15:00
+- "this morning" -> assume today around 9:00-10:00
+- "in the morning" -> assume today/tomorrow around 9:00
+- "in the afternoon" -> assume today/tomorrow around 14:00
+- Only return null if NO time preference is mentioned at all
 
-Be flexible with how people phrase requests. "Set up time with", "arrange a call with", "find time to meet with", "schedule a chat with" are all scheduling requests.`;
+Examples:
+- "Schedule a meeting with Sara Smith" -> {"isSchedulingRequest": true, "contactName": "Sara Smith", "durationMinutes": null, "preferredTimeframe": null, "preferredTimeIso": null, "confidence": 0.95}
+- "Schedule a meeting at 3pm" -> {"isSchedulingRequest": true, "contactName": null, "durationMinutes": null, "preferredTimeframe": "at 3pm", "preferredTimeIso": "${today}T15:00:00", "confidence": 0.95}
+- "Book a 30 minute call with John tomorrow at 2pm" -> {"isSchedulingRequest": true, "contactName": "John", "durationMinutes": 30, "preferredTimeframe": "tomorrow at 2pm", "preferredTimeIso": "YYYY-MM-DDT14:00:00", "confidence": 0.95}
+- "Set up an hour-long meeting with Dr. Jane Doe next Tuesday at 10am" -> {"isSchedulingRequest": true, "contactName": "Dr. Jane Doe", "durationMinutes": 60, "preferredTimeframe": "next Tuesday at 10am", "preferredTimeIso": "YYYY-MM-DDT10:00:00", "confidence": 0.95}
+- "Can you arrange a call with Bob sometime next week?" -> {"isSchedulingRequest": true, "contactName": "Bob", "durationMinutes": null, "preferredTimeframe": "next week", "preferredTimeIso": null, "confidence": 0.85}
+- "What's the weather today?" -> {"isSchedulingRequest": false, "contactName": null, "durationMinutes": null, "preferredTimeframe": null, "preferredTimeIso": null, "confidence": 0.95}
+- "Meeting with John at 9am" -> {"isSchedulingRequest": true, "contactName": "John", "durationMinutes": null, "preferredTimeframe": "at 9am", "preferredTimeIso": "${today}T09:00:00", "confidence": 0.95}
+
+Be flexible with how people phrase requests. "Set up time with", "arrange a call with", "find time to meet with", "schedule a chat with" are all scheduling requests.
+
+IMPORTANT: When a specific time is mentioned (like "3pm", "10am", "at 2"), ALWAYS return a preferredTimeIso. Use today's date if the time hasn't passed, tomorrow if it has.`;
 
     try {
       const raw = await this.llm.complete({
@@ -106,6 +129,10 @@ Be flexible with how people phrase requests. "Set up time with", "arrange a call
         preferredTimeframe:
           typeof parsed.preferredTimeframe === 'string'
             ? parsed.preferredTimeframe.trim() || null
+            : null,
+        preferredTimeIso:
+          typeof parsed.preferredTimeIso === 'string'
+            ? parsed.preferredTimeIso.trim() || null
             : null,
         confidence: typeof parsed.confidence === 'number' ? clamp01(parsed.confidence) : 0.5,
       };
@@ -332,6 +359,7 @@ Examples when asked for email:
         contactName: null,
         durationMinutes: null,
         preferredTimeframe: null,
+        preferredTimeIso: null,
         confidence: 0.7,
       };
     }
@@ -344,6 +372,7 @@ Examples when asked for email:
       contactName,
       durationMinutes,
       preferredTimeframe: null,
+      preferredTimeIso: null,
       confidence: 0.6,
     };
   }
