@@ -9,7 +9,6 @@
   const sendBtn = document.querySelector('.send-btn');
 
   const historyTab = document.querySelector('.tab:not(.tab--active)');
-  const newThreadBtn = document.querySelector('[data-new-thread]');
 
   if (!contentInner || !textarea) return;
 
@@ -27,6 +26,7 @@
   async function fetchJson(url, options) {
     const res = await fetch(url, {
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
       ...options,
     });
 
@@ -163,13 +163,6 @@
   if (historyTab) {
     historyTab.addEventListener('click', () => {
       window.location.href = '/threads';
-    });
-  }
-
-  if (newThreadBtn) {
-    newThreadBtn.addEventListener('click', () => {
-      // Assumes your server renders a fresh thread when you hit /chat
-      window.location.href = '/chat';
     });
   }
 

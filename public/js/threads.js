@@ -2,6 +2,8 @@
   if (window.__threadsUiInitialized) return;
   window.__threadsUiInitialized = true;
 
+  let isCreatingThread = false;
+
   function escapeHtml(s) {
     return String(s)
       .replaceAll('&', '&amp;')
@@ -20,6 +22,7 @@
   async function fetchJson(url, options) {
     const res = await fetch(url, {
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
       ...options,
     });
     if (!res.ok) {
@@ -136,25 +139,47 @@
       .join('');
   }
 
+  function setNewThreadButtonsBusy(busy) {
+    const buttons = document.querySelectorAll('[data-new-thread]');
+    for (const el of buttons) {
+      if (!(el instanceof HTMLElement)) continue;
+      el.dataset.busy = busy ? '1' : '0';
+
+      // Disable only if it's a real form control
+      if (el instanceof HTMLButtonElement) {
+        el.disabled = busy;
+      }
+    }
+  }
+
   function wireNewThreadButtons() {
     const buttons = document.querySelectorAll('[data-new-thread]');
     for (const btn of buttons) {
       btn.addEventListener('click', async (e) => {
         e.preventDefault();
+        e.stopPropagation();
 
-        if (btn.dataset.busy === '1') return;
-        btn.dataset.busy = '1';
+        if (isCreatingThread) return;
+
+        isCreatingThread = true;
+        setNewThreadButtonsBusy(true);
 
         try {
           const created = await fetchJson('/api/threads', {
             method: 'POST',
             body: JSON.stringify({}),
           });
-          window.location.href = `/chat?thread=${encodeURIComponent(created.threadId)}`;
+
+          const threadId = Number(created?.threadId);
+          if (!Number.isFinite(threadId) || threadId <= 0) {
+            throw new Error('Failed to create thread (invalid response).');
+          }
+
+          window.location.href = `/chat?thread=${encodeURIComponent(String(threadId))}`;
         } catch (err) {
           alert(err?.message || String(err));
-        } finally {
-          btn.dataset.busy = '0';
+          isCreatingThread = false;
+          setNewThreadButtonsBusy(false);
         }
       });
     }
