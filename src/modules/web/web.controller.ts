@@ -11,7 +11,7 @@ import {
   HUBSPOT_SYNC_NOTES_JOB,
   GMAIL_SYNC_MESSAGES_JOB,
   CALENDAR_SYNC_EVENTS_JOB,
-  RAG_EMBED_DOCUMENTS_JOB,
+  RAG_REBUILD_EMBED_JOB,
 } from '../../jobs/job.constants';
 
 type SyncStateView = {
@@ -279,7 +279,7 @@ export class WebController {
     const userId = this.requireAuth(req, res);
     if (!userId) return;
 
-    await this.pgBoss.client.send(RAG_EMBED_DOCUMENTS_JOB, { userId });
+    await this.pgBoss.client.send(RAG_REBUILD_EMBED_JOB, { userId });
 
     req.session.flash = { type: 'success', message: 'Queued RAG rebuild + embed.' };
     res.redirect('/settings');

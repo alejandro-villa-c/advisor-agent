@@ -117,8 +117,12 @@ export class RagService {
 
     for (const d of docs) {
       const docText = (d.text ?? '').trim();
+
+      // If a doc becomes empty, delete its chunks (scoped by userId for safety).
       if (!docText) {
-        await this.dbService.db.delete(documentChunks).where(eq(documentChunks.documentId, d.id));
+        await this.dbService.db
+          .delete(documentChunks)
+          .where(and(eq(documentChunks.userId, userId), eq(documentChunks.documentId, d.id)));
         continue;
       }
 
@@ -140,31 +144,46 @@ export class RagService {
 
       const chunks = this.chunkText(docText, { chunkSize, overlap });
 
-      await this.dbService.db.delete(documentChunks).where(eq(documentChunks.documentId, d.id));
-      if (chunks.length === 0) continue;
+      // Key change: make delete+insert atomic so failures cannot leave the doc chunkless.
+      // Also tolerate concurrency by using ON CONFLICT DO NOTHING.
+      await this.dbService.db.transaction(async (tx) => {
+        await tx
+          .delete(documentChunks)
+          .where(and(eq(documentChunks.userId, userId), eq(documentChunks.documentId, d.id)));
 
-      const rows = chunks.map((c, idx) => ({
-        userId,
-        documentId: d.id,
-        chunkIndex: idx,
-        text: c.text,
-        embedding: null,
-        embeddingModel: null,
-        meta: {
-          documentTitle: d.title ?? null,
-          source: d.source,
-          sourceId: d.sourceId,
-          start: c.meta.start,
-          end: c.meta.end,
-          documentUpdatedAt: d.updatedAt?.toISOString?.() ?? null,
-          documentTextHash: docHash,
-          chunkSize,
-          overlap,
-        },
-      }));
+        if (chunks.length === 0) return;
 
-      await this.dbService.db.insert(documentChunks).values(rows);
-      chunksInserted += rows.length;
+        const rows = chunks.map((c, idx) => ({
+          userId,
+          documentId: d.id,
+          chunkIndex: idx,
+          text: c.text,
+          embedding: null,
+          embeddingModel: null,
+          meta: {
+            documentTitle: d.title ?? null,
+            source: d.source,
+            sourceId: d.sourceId,
+            start: c.meta.start,
+            end: c.meta.end,
+            documentUpdatedAt: d.updatedAt?.toISOString?.() ?? null,
+            documentTextHash: docHash,
+            chunkSize,
+            overlap,
+          },
+        }));
+
+        await tx
+          .insert(documentChunks)
+          .values(rows)
+          .onConflictDoNothing({
+            target: [documentChunks.documentId, documentChunks.chunkIndex],
+          });
+
+        // NOTE: we count intended inserts (good enough for logging/metrics);
+        // if a concurrent insert won the race, onConflictDoNothing may insert fewer.
+        chunksInserted += rows.length;
+      });
     }
 
     return { documentsProcessed: docs.length, chunksInserted };

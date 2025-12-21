@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { PgBossService } from '../jobs/pgboss.service';
 import { DbService } from '../db/db.service';
-import { documents, hubspotNotes, integrationStates } from '../db/schema';
+import { documentChunks, documents, hubspotNotes, integrationStates } from '../db/schema';
 import { HubspotApiService } from '../modules/integrations/hubspot/hubspot-api.service';
 import { HUBSPOT_SYNC_NOTES_JOB, RAG_EMBED_DOCUMENTS_JOB } from '../jobs/job.constants';
 
@@ -88,6 +88,27 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
       }
     }
 
+    // 1) Normal behavior: embed docs that changed this run
+    await this.enqueueEmbedForChangedDocs({
+      userId,
+      source: 'hubspot_note',
+      changedSourceIds,
+    });
+
+    // 2) NEW: “repair mode” — if any hubspot_note docs exist without chunks, force-queue embedding
+    // This solves the "notes exist, but have 0 chunks forever" deadlock.
+    const missingChunkDocIds = await this.findHubspotNoteDocumentIdsMissingChunks({ userId });
+
+    if (missingChunkDocIds.length > 0) {
+      await this.enqueueEmbedForDocumentIds({ userId, documentIds: missingChunkDocIds });
+
+      this.logger.warn(
+        `[${HUBSPOT_SYNC_NOTES_JOB}] repair: queued embed for hubspot_note docs missing chunks count=${missingChunkDocIds.length}`,
+      );
+    }
+
+    const uniqueChangedSourceIds = Array.from(new Set(changedSourceIds)).filter(Boolean);
+
     await this.dbService.db
       .insert(integrationStates)
       .values({
@@ -97,7 +118,8 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
           lastSyncedAt: new Date().toISOString(),
           totalImported: total,
           page,
-          changedDocuments: Array.from(new Set(changedSourceIds)).length,
+          changedDocuments: uniqueChangedSourceIds.length,
+          missingChunkDocumentsQueued: missingChunkDocIds.length,
         },
       })
       .onConflictDoUpdate({
@@ -108,14 +130,8 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
         },
       });
 
-    await this.enqueueEmbedForChangedDocs({
-      userId,
-      source: 'hubspot_note',
-      changedSourceIds,
-    });
-
     this.logger.log(
-      `[${HUBSPOT_SYNC_NOTES_JOB}] done job=${String(job.id)} totalNotes=${total} changedDocs=${Array.from(new Set(changedSourceIds)).length}`,
+      `[${HUBSPOT_SYNC_NOTES_JOB}] done job=${String(job.id)} totalNotes=${total} changedDocs=${uniqueChangedSourceIds.length} missingChunkDocsQueued=${missingChunkDocIds.length}`,
     );
   }
 
@@ -293,10 +309,54 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
 
     if (documentIds.length === 0) return;
 
-    await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
-      userId: input.userId,
-      documentIds,
-    });
+    await this.enqueueEmbedForDocumentIds({ userId: input.userId, documentIds });
+  }
+
+  private async enqueueEmbedForDocumentIds(input: {
+    userId: number;
+    documentIds: number[];
+  }): Promise<void> {
+    const unique = Array.from(new Set(input.documentIds))
+      .map((x) => Number(x))
+      .filter((x) => Number.isFinite(x) && x > 0);
+
+    if (unique.length === 0) return;
+
+    // pg-boss payload size safety
+    for (const chunk of chunkArray(unique, 1000)) {
+      await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
+        userId: input.userId,
+        documentIds: chunk,
+      });
+    }
+  }
+
+  private async findHubspotNoteDocumentIdsMissingChunks(input: {
+    userId: number;
+  }): Promise<number[]> {
+    // We consider a document "chunked" if it has chunkIndex=0.
+    // If chunkIndex=0 is missing, the doc has no chunks (or chunking failed).
+    const rows = await this.dbService.db
+      .select({ id: documents.id })
+      .from(documents)
+      .leftJoin(
+        documentChunks,
+        and(
+          eq(documentChunks.userId, input.userId),
+          eq(documentChunks.documentId, documents.id),
+          eq(documentChunks.chunkIndex, 0),
+        ),
+      )
+      .where(
+        and(
+          eq(documents.userId, input.userId),
+          eq(documents.source, 'hubspot_note'),
+          sql`${documentChunks.id} IS NULL`,
+        ),
+      )
+      .limit(5000);
+
+    return rows.map((r) => r.id);
   }
 }
 
