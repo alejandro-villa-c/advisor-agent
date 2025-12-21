@@ -43,6 +43,13 @@
       "when": 1766205813678,
       "tag": "0005_update_integration_kinds",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1766297028775,
+      "tag": "0006_add_agent_tables",
+      "breakpoints": true
     }
   ]
 }
