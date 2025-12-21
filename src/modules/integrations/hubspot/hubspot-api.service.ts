@@ -11,7 +11,7 @@ export type HubspotContactSummary = {
 export type HubspotNoteSummary = {
   id: string;
   body: string | undefined;
-  timestamp: string | undefined; // hs_timestamp can be ISO or unix-ms
+  timestamp: string | undefined;
 };
 
 export type HubspotNoteWithContactSummary = {
@@ -21,15 +21,37 @@ export type HubspotNoteWithContactSummary = {
   timestamp: string | undefined;
 };
 
-/**
- * Minimal, strict-ish HubSpot API wrapper.
- * All methods require userId so we can fetch a valid access token (refreshing if needed).
- */
 @Injectable()
 export class HubspotApiService {
   private readonly baseUrl = 'https://api.hubapi.com';
 
   constructor(private readonly hubspotTokenService: HubspotTokenService) {}
+
+  async getContact(userId: number, contactId: string): Promise<HubspotContactSummary> {
+    const data = await this.hubspotRequest(
+      userId,
+      'GET',
+      `/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname`,
+    );
+
+    const id = readString(data, 'id');
+    if (!id) throw new Error('HubSpot: getContact returned no id');
+
+    const props = readRecord(data, 'properties');
+    const email = (props ? readString(props, 'email') : null) ?? undefined;
+    const firstName = (props ? readString(props, 'firstname') : null) ?? undefined;
+    const lastName = (props ? readString(props, 'lastname') : null) ?? undefined;
+
+    return { id, email, firstName, lastName };
+  }
+
+  async deleteContact(userId: number, contactId: string): Promise<void> {
+    await this.hubspotRequest(userId, 'DELETE', `/crm/v3/objects/contacts/${contactId}`);
+  }
+
+  async deleteNote(userId: number, noteId: string): Promise<void> {
+    await this.hubspotRequest(userId, 'DELETE', `/crm/v3/objects/notes/${noteId}`);
+  }
 
   async searchContacts(
     userId: number,
@@ -147,7 +169,7 @@ export class HubspotApiService {
           types: [
             {
               associationCategory: 'HUBSPOT_DEFINED',
-              associationTypeId: 202, // note_to_contact
+              associationTypeId: 202,
             },
           ],
         },
@@ -183,7 +205,6 @@ export class HubspotApiService {
       archived: 'false',
     });
 
-    // HubSpot expects properties as repeated query params; easiest is append.
     qs.append('properties', 'email');
     qs.append('properties', 'firstname');
     qs.append('properties', 'lastname');
@@ -219,10 +240,6 @@ export class HubspotApiService {
     return { results, nextAfter };
   }
 
-  /**
-   * Paginated note listing used for ingestion.
-   * Pulls notes and tries to grab an associated contact id (if present).
-   */
   async listNotesPage(
     userId: number,
     input: { limit?: number; after?: string | null },
@@ -280,13 +297,6 @@ export class HubspotApiService {
     return { results, nextAfter };
   }
 
-  /**
-   * Notes are separate CRM objects.
-   * This fetches notes (with associated contact IDs) and filters to one contact.
-   *
-   * NOTE: This is meant for tools/smoke tests. For large portals, you’ll want a proper
-   * import pipeline or association-based batch reads for performance.
-   */
   async listNotesForContact(
     userId: number,
     input: { contactId: string; limit?: number },
@@ -369,7 +379,6 @@ export class HubspotApiService {
       if (!nextAfter) break;
       after = nextAfter;
 
-      // safety cap (avoid insane scans if a portal has tons of notes)
       if (page >= 10) break;
     }
 
@@ -378,9 +387,6 @@ export class HubspotApiService {
     return out.slice(0, desiredLimit).map((x) => x.note);
   }
 
-  // -----------------------
-  // Low-level request helper
-  // -----------------------
   private async hubspotRequest(
     userId: number,
     method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE',
@@ -410,9 +416,6 @@ export class HubspotApiService {
   }
 }
 
-// -----------------------
-// Tiny “safe” helpers (avoid any / unsafe member access)
-// -----------------------
 function safeJson(text: string): unknown {
   if (!text) return {};
   try {
@@ -463,11 +466,9 @@ function clampInt(n: number, min: number, max: number): number {
 function toSortableTimestamp(ts: string | undefined): number {
   if (!ts) return 0;
 
-  // unix-ms as string
   const asNum = Number(ts);
   if (Number.isFinite(asNum)) return asNum;
 
-  // ISO
   const asDate = Date.parse(ts);
   return Number.isFinite(asDate) ? asDate : 0;
 }

@@ -186,7 +186,7 @@ export class SyncTickWorker implements OnModuleInit {
             enqueued += 1;
           }
 
-          if (shouldRun(lastSyncedAtByKey.get(`${userId}:hubspot_contacts`), 360)) {
+          if (shouldRun(lastSyncedAtByKey.get(`${userId}:hubspot_contacts`), 15)) {
             await this.enqueueJob(
               HUBSPOT_SYNC_CONTACTS_JOB,
               { userId },

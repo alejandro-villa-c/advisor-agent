@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Post,
@@ -10,6 +11,21 @@ import {
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { HubspotApiService } from './hubspot-api.service';
+
+interface ContactListQuery {
+  limit?: string;
+  after?: string;
+}
+
+interface CreateContactBody {
+  email: string;
+  firstName?: string;
+  lastName?: string;
+}
+
+interface CreateNoteBody {
+  text: string;
+}
 
 @Controller('/api/hubspot')
 export class HubspotToolsController {
@@ -22,6 +38,32 @@ export class HubspotToolsController {
 
     const results = await this.hubspotApi.searchContacts(userId, q ?? '');
     return { results };
+  }
+
+  @Get('/contacts')
+  async listContacts(@Req() req: Request, @Query() query: ContactListQuery): Promise<unknown> {
+    const userId = req.session.userId;
+    if (!userId) throw new UnauthorizedException();
+
+    const limit = query.limit ? parseLimit(query.limit) : 50;
+    const after = query.after || null;
+
+    const response = await this.hubspotApi.listContactsPage(userId, { limit, after });
+
+    return {
+      contacts: response.results,
+      nextAfter: response.nextAfter,
+      hasMore: !!response.nextAfter,
+    };
+  }
+
+  @Get('/contacts/:contactId')
+  async getContact(@Req() req: Request, @Param('contactId') contactId: string): Promise<unknown> {
+    const userId = req.session.userId;
+    if (!userId) throw new UnauthorizedException();
+
+    const contact = await this.hubspotApi.getContact(userId, contactId);
+    return { contact };
   }
 
   @Get('/contacts/:contactId/notes')
@@ -44,10 +86,7 @@ export class HubspotToolsController {
   }
 
   @Post('/contacts')
-  async createContact(
-    @Req() req: Request,
-    @Body() body: { email?: string; firstName?: string; lastName?: string },
-  ): Promise<unknown> {
+  async createContact(@Req() req: Request, @Body() body: CreateContactBody): Promise<unknown> {
     const userId = req.session.userId;
     if (!userId) throw new UnauthorizedException();
     if (!body.email) throw new Error('email is required');
@@ -61,11 +100,23 @@ export class HubspotToolsController {
     return { created };
   }
 
+  @Delete('/contacts/:contactId')
+  async deleteContact(
+    @Req() req: Request,
+    @Param('contactId') contactId: string,
+  ): Promise<unknown> {
+    const userId = req.session.userId;
+    if (!userId) throw new UnauthorizedException();
+
+    await this.hubspotApi.deleteContact(userId, contactId);
+    return { success: true, contactId };
+  }
+
   @Post('/contacts/:contactId/notes')
   async createNote(
     @Req() req: Request,
     @Param('contactId') contactId: string,
-    @Body() body: { text?: string },
+    @Body() body: CreateNoteBody,
   ): Promise<unknown> {
     const userId = req.session.userId;
     if (!userId) throw new UnauthorizedException();
@@ -79,17 +130,13 @@ export class HubspotToolsController {
     return { created };
   }
 
-  @Post('/import/contacts')
-  enqueueImport(@Req() req: Request): unknown {
+  @Delete('/notes/:noteId')
+  async deleteNote(@Req() req: Request, @Param('noteId') noteId: string): Promise<unknown> {
     const userId = req.session.userId;
     if (!userId) throw new UnauthorizedException();
 
-    // Worker step below will register this job name.
-    // If you don’t have enqueue wired yet, this endpoint can come later.
-    return {
-      ok: true,
-      note: 'Use /api/jobs/hubspot/import-contacts once worker is wired (next step).',
-    };
+    await this.hubspotApi.deleteNote(userId, noteId);
+    return { success: true, noteId };
   }
 }
 
@@ -99,6 +146,6 @@ function parseLimit(raw?: string): number {
   if (!Number.isFinite(n)) return 10;
   const x = Math.trunc(n);
   if (x < 1) return 1;
-  if (x > 50) return 50;
+  if (x > 100) return 100;
   return x;
 }

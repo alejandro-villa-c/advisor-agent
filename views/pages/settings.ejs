@@ -1,212 +1,511 @@
 <%
-  // Format ISO timestamps coming from integrationStates.state.lastSyncedAt
-  // Displayed in Dominican Republic time.
   const TIME_ZONE = 'America/Santo_Domingo';
 
   function formatSyncDate(value) {
     if (!value || typeof value !== 'string') return '—';
-
     const ms = Date.parse(value);
-    if (!Number.isFinite(ms)) return value; // fallback if not parseable
-
+    if (!Number.isFinite(ms)) return value;
     const d = new Date(ms);
-
     return new Intl.DateTimeFormat('en-US', {
       timeZone: TIME_ZONE,
       dateStyle: 'medium',
       timeStyle: 'short',
-      // hour12: false, // uncomment if you prefer 24h
     }).format(d);
   }
 %>
 
-<div class="app-shell">
-  <%- include('../partials/sidebar', { active: 'settings' }) %>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Settings</title>
+  <link rel="stylesheet" href="/styles.css">
+  <style>
+    /* HubSpot Management Styles */
+    .contact-card {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
 
-  <main class="main-area" aria-label="Settings">
-    <div class="center-page">
-      <div class="center-card">
-        <!-- Mobile-only nav tabs (mirrors Chat page tabs) -->
-        <div class="page-tabs" aria-label="Page navigation">
-          <div class="tabs">
-            <div class="tabs__left">
-              <a class="tab tab--active" href="/settings" aria-current="page">Settings</a>
-              <a class="tab" href="/threads">History</a>
+    .contact-card__header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .contact-card__info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .contact-card__name {
+      font-weight: 700;
+      font-size: 16px;
+      margin-bottom: 4px;
+    }
+
+    .contact-card__email {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .contact-card__actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .note-card {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 10px;
+    }
+
+    .note-card__header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .note-card__timestamp {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .note-card__body {
+      font-size: 14px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+
+    .modal {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.5);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .modal__content {
+      background: #fff;
+      border-radius: 18px;
+      max-width: 600px;
+      width: 100%;
+      max-height: 80vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .modal__header {
+      padding: 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .modal__title {
+      font-size: 20px;
+      font-weight: 700;
+      margin: 0;
+    }
+
+    .modal__body {
+      padding: 20px;
+      overflow: auto;
+      flex: 1;
+    }
+
+    .modal__footer {
+      padding: 20px;
+      border-top: 1px solid var(--border);
+    }
+
+    .modal-close {
+      appearance: none;
+      border: none;
+      background: transparent;
+      font-size: 24px;
+      cursor: pointer;
+      color: var(--muted);
+      padding: 0;
+      width: 32px;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .modal-close:hover {
+      color: var(--text);
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    .form-label {
+      display: block;
+      font-weight: 600;
+      font-size: 14px;
+      margin-bottom: 6px;
+    }
+
+    .form-input {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 15px;
+      font-family: inherit;
+    }
+
+    .form-input:focus {
+      outline: none;
+      border-color: var(--text);
+    }
+
+    .form-textarea {
+      min-height: 100px;
+      resize: vertical;
+    }
+
+    .btn--small {
+      padding: 8px 12px;
+      font-size: 13px;
+    }
+
+    .btn--danger:hover {
+      background: #dc2626;
+      border-color: #dc2626;
+      color: #fff;
+    }
+
+    .notification {
+      padding: 12px 16px;
+      border-radius: 8px;
+      background: #fff;
+      border: 1px solid var(--border);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      animation: slideIn 0.3s ease;
+    }
+
+    .notification--success {
+      border-color: rgba(0, 200, 120, 0.35);
+      background: rgba(0, 200, 120, 0.05);
+    }
+
+    .notification--error {
+      border-color: rgba(255, 90, 90, 0.35);
+      background: rgba(255, 90, 90, 0.05);
+    }
+
+    @keyframes slideIn {
+      from {
+        transform: translateX(100%);
+        opacity: 0;
+      }
+      to {
+        transform: translateX(0);
+        opacity: 1;
+      }
+    }
+
+    @keyframes slideOut {
+      from {
+        transform: translateX(0);
+        opacity: 1;
+      }
+      to {
+        transform: translateX(100%);
+        opacity: 0;
+      }
+    }
+
+    #load-more-contacts {
+      display: block;
+      margin: 16px auto 0;
+    }
+
+    @media (max-width: 768px) {
+      .contact-card__header {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .contact-card__actions {
+        width: 100%;
+      }
+
+      .btn--small {
+        flex: 1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <%- include('../partials/sidebar', { active: 'settings' }) %>
+
+    <main class="main-area" aria-label="Settings">
+      <div class="center-page">
+        <div class="center-card">
+          <div class="page-tabs" aria-label="Page navigation">
+            <div class="tabs">
+              <div class="tabs__left">
+                <a class="tab tab--active" href="/settings" aria-current="page">Settings</a>
+                <a class="tab" href="/threads">History</a>
+              </div>
             </div>
           </div>
-        </div>
 
-        <div class="page-badge page-badge--desktop">Settings</div>
-        <h1 class="page-title">Connections</h1>
-        <p class="page-subtitle">
-          Connect your accounts so the agent can retrieve context and take actions.
-        </p>
+          <div class="page-badge page-badge--desktop">Settings</div>
+          <h1 class="page-title">Connections</h1>
+          <p class="page-subtitle">
+            Connect your accounts so the agent can retrieve context and take actions.
+          </p>
 
-        <% if (flash) { %>
-          <div class="notice <%= flash.type === 'success' ? 'notice--success' : 'notice--error' %>">
-            <%= flash.message %>
-          </div>
-        <% } %>
-
-        <div class="page-status">
-          <div class="status-chip">
-            <span class="status-chip__label">Google</span>
-            <span class="status-chip__value"><%= connections.google ? 'Connected' : 'Not connected' %></span>
-          </div>
-
-          <div class="status-chip">
-            <span class="status-chip__label">HubSpot</span>
-            <span class="status-chip__value"><%= connections.hubspot ? 'Connected' : 'Not connected' %></span>
-          </div>
-        </div>
-
-        <div class="page-actions" style="margin-top: 18px; display:flex; gap:10px; flex-wrap:wrap;">
-          <% if (!connections.google) { %>
-            <a class="btn btn--primary" href="/auth/google">Connect Google</a>
+          <% if (flash) { %>
+            <div class="notice <%= flash.type === 'success' ? 'notice--success' : 'notice--error' %>">
+              <%= flash.message %>
+            </div>
           <% } %>
 
-          <% if (!connections.hubspot) { %>
-            <a class="btn btn--primary" href="/auth/hubspot">Connect HubSpot</a>
-          <% } else { %>
-            <form method="post" action="/settings/hubspot/test">
-              <button class="btn btn--ghost" type="submit">Test HubSpot</button>
-            </form>
+          <div class="page-status">
+            <div class="status-chip">
+              <span class="status-chip__label">Google</span>
+              <span class="status-chip__value"><%= connections.google ? 'Connected' : 'Not connected' %></span>
+            </div>
 
-            <form method="post" action="/settings/hubspot/disconnect" onsubmit="return confirm('Disconnect HubSpot?');">
-              <button class="btn btn--ghost" type="submit">Disconnect HubSpot</button>
-            </form>
+            <div class="status-chip">
+              <span class="status-chip__label">HubSpot</span>
+              <span class="status-chip__value"><%= connections.hubspot ? 'Connected' : 'Not connected' %></span>
+            </div>
+          </div>
+
+          <div class="page-actions" style="margin-top: 18px; display:flex; gap:10px; flex-wrap:wrap;">
+            <% if (!connections.google) { %>
+              <a class="btn btn--primary" href="/auth/google">Connect Google</a>
+            <% } %>
+
+            <% if (!connections.hubspot) { %>
+              <a class="btn btn--primary" href="/auth/hubspot">Connect HubSpot</a>
+            <% } else { %>
+              <form method="post" action="/settings/hubspot/test">
+                <button class="btn btn--ghost" type="submit">Test HubSpot</button>
+              </form>
+
+              <form method="post" action="/settings/hubspot/disconnect" onsubmit="return confirm('Disconnect HubSpot?');">
+                <button class="btn btn--ghost" type="submit">Disconnect HubSpot</button>
+              </form>
+            <% } %>
+          </div>
+
+          <% if (hubspotDebug) { %>
+            <div class="card" style="margin-top:16px;">
+              <div class="card__title" style="margin-bottom:6px;">HubSpot Debug</div>
+              <div style="font-size: 14px; opacity: .9;">
+                <div><strong>Hub:</strong> <%= hubspotDebug.hubDomain %></div>
+                <div><strong>User:</strong> <%= hubspotDebug.hubUserEmail %></div>
+                <div><strong>Expires in:</strong> <%= hubspotDebug.expiresIn %> seconds</div>
+                <div style="margin-top:6px;"><strong>Scopes:</strong> <%= hubspotDebug.scopes.join(', ') %></div>
+              </div>
+            </div>
           <% } %>
-        </div>
 
-        <% if (hubspotDebug) { %>
+          <!-- HubSpot Contact Management Section -->
+          <% if (connections.hubspot) { %>
+            <div class="card" style="margin-top:16px;">
+              <div class="card__title" style="margin-bottom:6px;">Manage HubSpot Contacts</div>
+              <div style="font-size: 14px; opacity: .9; margin-bottom: 16px;">
+                Create, view, and manage contacts and their notes directly from here.
+              </div>
+
+              <form id="create-contact-form" style="margin-bottom: 20px;">
+                <div style="display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
+                  <div class="form-group" style="margin-bottom: 0;">
+                    <input type="email" name="email" class="form-input" placeholder="Email *" required>
+                  </div>
+                  <div class="form-group" style="margin-bottom: 0;">
+                    <input type="text" name="firstName" class="form-input" placeholder="First Name">
+                  </div>
+                  <div class="form-group" style="margin-bottom: 0;">
+                    <input type="text" name="lastName" class="form-input" placeholder="Last Name">
+                  </div>
+                  <div>
+                    <button type="submit" class="btn btn--primary" style="width: 100%; height: 100%;">
+                      Create Contact
+                    </button>
+                  </div>
+                </div>
+              </form>
+
+              <div id="contacts-list"></div>
+
+              <button id="load-more-contacts" class="btn btn--ghost" style="display: none;">
+                Load More Contacts
+              </button>
+            </div>
+          <% } %>
+
           <div class="card" style="margin-top:16px;">
-            <div class="card__title" style="margin-bottom:6px;">HubSpot Debug</div>
+            <div class="card__title" style="margin-bottom:6px;">Sync status</div>
             <div style="font-size: 14px; opacity: .9;">
-              <div><strong>Hub:</strong> <%= hubspotDebug.hubDomain %></div>
-              <div><strong>User:</strong> <%= hubspotDebug.hubUserEmail %></div>
-              <div><strong>Expires in:</strong> <%= hubspotDebug.expiresIn %> seconds</div>
-              <div style="margin-top:6px;"><strong>Scopes:</strong> <%= hubspotDebug.scopes.join(', ') %></div>
-            </div>
-          </div>
-        <% } %>
-
-        <div class="card" style="margin-top:16px;">
-          <div class="card__title" style="margin-bottom:6px;">Sync status</div>
-          <div style="font-size: 14px; opacity: .9;">
-            Recent sync activity for connected integrations.
-          </div>
-
-          <div style="margin-top:10px; font-size: 14px;">
-            <div style="display:flex; gap:12px; flex-wrap:wrap;">
-              <div class="status-chip">
-                <span class="status-chip__label">Gmail last sync</span>
-                <span class="status-chip__value">
-                  <%= formatSyncDate(syncState && syncState.gmail && syncState.gmail.lastSyncedAt) %>
-                </span>
-              </div>
-
-              <div class="status-chip">
-                <span class="status-chip__label">Calendar last sync</span>
-                <span class="status-chip__value">
-                  <%= formatSyncDate(syncState && syncState.calendar && syncState.calendar.lastSyncedAt) %>
-                </span>
-              </div>
-
-              <div class="status-chip">
-                <span class="status-chip__label">HubSpot contacts last sync</span>
-                <span class="status-chip__value">
-                  <%= formatSyncDate(syncState && syncState.hubspotContacts && syncState.hubspotContacts.lastSyncedAt) %>
-                </span>
-              </div>
-
-              <div class="status-chip">
-                <span class="status-chip__label">HubSpot notes last sync</span>
-                <span class="status-chip__value">
-                  <%= formatSyncDate(syncState && syncState.hubspotNotes && syncState.hubspotNotes.lastSyncedAt) %>
-                </span>
-              </div>
-
-              <div class="status-chip">
-                <span class="status-chip__label">Gmail ingested</span>
-                <span class="status-chip__value"><%= counts ? counts.gmailMessages : 0 %> emails</span>
-              </div>
-
-              <div class="status-chip">
-                <span class="status-chip__label">Calendar ingested</span>
-                <span class="status-chip__value"><%= counts ? counts.calendarEvents : 0 %> events</span>
-              </div>
-
-              <div class="status-chip">
-                <span class="status-chip__label">HubSpot contacts ingested</span>
-                <span class="status-chip__value"><%= counts ? counts.hubspotContacts : 0 %> contacts</span>
-              </div>
-
-              <div class="status-chip">
-                <span class="status-chip__label">HubSpot notes ingested</span>
-                <span class="status-chip__value"><%= counts ? counts.hubspotNotes : 0 %> notes</span>
-              </div>
-
-              <div class="status-chip">
-                <span class="status-chip__label">RAG documents</span>
-                <span class="status-chip__value"><%= counts ? counts.documents : 0 %></span>
-              </div>
-
-              <div class="status-chip">
-                <span class="status-chip__label">RAG chunks</span>
-                <span class="status-chip__value"><%= counts ? counts.documentChunks : 0 %></span>
-              </div>
+              Recent sync activity for connected integrations.
             </div>
 
-            <div style="margin-top:10px; opacity:.85;">
-              Manual sync is optional. In production, sync jobs typically run automatically on a schedule.
+            <div style="margin-top:10px; font-size: 14px;">
+              <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                <div class="status-chip">
+                  <span class="status-chip__label">Gmail last sync</span>
+                  <span class="status-chip__value">
+                    <%= formatSyncDate(syncState && syncState.gmail && syncState.gmail.lastSyncedAt) %>
+                  </span>
+                </div>
+
+                <div class="status-chip">
+                  <span class="status-chip__label">Calendar last sync</span>
+                  <span class="status-chip__value">
+                    <%= formatSyncDate(syncState && syncState.calendar && syncState.calendar.lastSyncedAt) %>
+                  </span>
+                </div>
+
+                <div class="status-chip">
+                  <span class="status-chip__label">HubSpot contacts last sync</span>
+                  <span class="status-chip__value">
+                    <%= formatSyncDate(syncState && syncState.hubspotContacts && syncState.hubspotContacts.lastSyncedAt) %>
+                  </span>
+                </div>
+
+                <div class="status-chip">
+                  <span class="status-chip__label">HubSpot notes last sync</span>
+                  <span class="status-chip__value">
+                    <%= formatSyncDate(syncState && syncState.hubspotNotes && syncState.hubspotNotes.lastSyncedAt) %>
+                  </span>
+                </div>
+
+                <div class="status-chip">
+                  <span class="status-chip__label">Gmail ingested</span>
+                  <span class="status-chip__value"><%= counts ? counts.gmailMessages : 0 %> emails</span>
+                </div>
+
+                <div class="status-chip">
+                  <span class="status-chip__label">Calendar ingested</span>
+                  <span class="status-chip__value"><%= counts ? counts.calendarEvents : 0 %> events</span>
+                </div>
+
+                <div class="status-chip">
+                  <span class="status-chip__label">HubSpot contacts ingested</span>
+                  <span class="status-chip__value"><%= counts ? counts.hubspotContacts : 0 %> contacts</span>
+                </div>
+
+                <div class="status-chip">
+                  <span class="status-chip__label">HubSpot notes ingested</span>
+                  <span class="status-chip__value"><%= counts ? counts.hubspotNotes : 0 %> notes</span>
+                </div>
+
+                <div class="status-chip">
+                  <span class="status-chip__label">RAG documents</span>
+                  <span class="status-chip__value"><%= counts ? counts.documents : 0 %></span>
+                </div>
+
+                <div class="status-chip">
+                  <span class="status-chip__label">RAG chunks</span>
+                  <span class="status-chip__value"><%= counts ? counts.documentChunks : 0 %></span>
+                </div>
+              </div>
+
+              <div style="margin-top:10px; opacity:.85;">
+                Manual sync is optional. In production, sync jobs typically run automatically on a schedule.
+              </div>
             </div>
           </div>
-        </div>
 
-        <div class="card" style="margin-top:16px;">
-          <div class="card__title" style="margin-bottom:6px;">Manual sync (optional)</div>
-          <div style="font-size: 14px; opacity: .9;">
-            Use these to pull data into the database. Defaults are conservative to avoid huge imports.
-            After sync, new/changed documents are automatically queued for RAG embedding.
+          <div class="card" style="margin-top:16px;">
+            <div class="card__title" style="margin-bottom:6px;">Manual sync (optional)</div>
+            <div style="font-size: 14px; opacity: .9;">
+              Use these to pull data into the database. Defaults are conservative to avoid huge imports.
+              After sync, new/changed documents are automatically queued for RAG embedding.
+            </div>
+
+            <div class="page-actions" style="margin-top: 12px; display:flex; gap:10px; flex-wrap:wrap;">
+              <% if (connections.hubspot) { %>
+                <form method="post" action="/settings/sync/hubspot/contacts">
+                  <button class="btn btn--ghost" type="submit">Sync HubSpot contacts</button>
+                </form>
+
+                <form method="post" action="/settings/sync/hubspot/notes">
+                  <button class="btn btn--ghost" type="submit">Sync HubSpot notes</button>
+                </form>
+              <% } %>
+
+              <% if (connections.google) { %>
+                <form method="post" action="/settings/sync/gmail" onsubmit="return confirm('Queue Gmail backfill? This will ingest thousands of emails.');">
+                  <button class="btn btn--ghost" type="submit">Sync Gmail (Backfill)</button>
+                </form>
+
+                <form method="post" action="/settings/sync/calendar">
+                  <button class="btn btn--ghost" type="submit">Sync Calendar</button>
+                </form>
+              <% } %>
+            </div>
           </div>
 
-          <div class="page-actions" style="margin-top: 12px; display:flex; gap:10px; flex-wrap:wrap;">
-            <% if (connections.hubspot) { %>
-              <form method="post" action="/settings/sync/hubspot/contacts">
-                <button class="btn btn--ghost" type="submit">Sync HubSpot contacts</button>
+          <div class="card" style="margin-top:16px;">
+            <div class="card__title" style="margin-bottom:6px;">RAG indexing</div>
+            <div style="font-size: 14px; opacity: .9;">
+              Usually you don't need this manually (sync queues embedding automatically).
+              This button is a maintenance tool to rebuild chunks and embed any missing chunks.
+            </div>
+
+            <div class="page-actions" style="margin-top: 12px; display:flex; gap:10px; flex-wrap:wrap;">
+              <form method="post" action="/settings/rag/rebuild-and-embed" onsubmit="return confirm('Queue RAG rebuild + embed?');">
+                <button class="btn btn--primary" type="submit">Rebuild + Embed</button>
               </form>
-
-              <form method="post" action="/settings/sync/hubspot/notes">
-                <button class="btn btn--ghost" type="submit">Sync HubSpot notes</button>
-              </form>
-            <% } %>
-
-            <% if (connections.google) { %>
-              <form method="post" action="/settings/sync/gmail" onsubmit="return confirm('Queue Gmail backfill? This will ingest thousands of emails.');">
-                <button class="btn btn--ghost" type="submit">Sync Gmail (Backfill)</button>
-              </form>
-
-              <form method="post" action="/settings/sync/calendar">
-                <button class="btn btn--ghost" type="submit">Sync Calendar</button>
-              </form>
-            <% } %>
-          </div>
-        </div>
-
-        <div class="card" style="margin-top:16px;">
-          <div class="card__title" style="margin-bottom:6px;">RAG indexing</div>
-          <div style="font-size: 14px; opacity: .9;">
-            Usually you don’t need this manually (sync queues embedding automatically).
-            This button is a maintenance tool to rebuild chunks and embed any missing chunks.
-          </div>
-
-          <div class="page-actions" style="margin-top: 12px; display:flex; gap:10px; flex-wrap:wrap;">
-            <form method="post" action="/settings/rag/rebuild-and-embed" onsubmit="return confirm('Queue RAG rebuild + embed?');">
-              <button class="btn btn--primary" type="submit">Rebuild + Embed</button>
-            </form>
+            </div>
           </div>
         </div>
       </div>
+    </main>
+  </div>
+
+  <!-- Notes Modal -->
+  <div id="notes-modal" class="modal">
+    <div class="modal__content">
+      <div class="modal__header">
+        <h2 class="modal__title">Contact Notes</h2>
+        <button class="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal__body">
+        <div id="notes-list"></div>
+      </div>
+      <div class="modal__footer">
+        <form id="create-note-form">
+          <div class="form-group">
+            <label class="form-label">Add New Note</label>
+            <textarea name="noteText" class="form-input form-textarea" placeholder="Enter note text..." required></textarea>
+          </div>
+          <button type="submit" class="btn btn--primary">Add Note</button>
+        </form>
+      </div>
     </div>
-  </main>
-</div>
+  </div>
+
+  <script src="/js/hubspot-manager.js"></script>
+</body>
+</html>
