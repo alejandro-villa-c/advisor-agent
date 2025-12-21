@@ -26,7 +26,17 @@
   <main class="main-area" aria-label="Settings">
     <div class="center-page">
       <div class="center-card">
-        <div class="page-badge">Settings</div>
+        <!-- Mobile-only nav tabs (mirrors Chat page tabs) -->
+        <div class="page-tabs" aria-label="Page navigation">
+          <div class="tabs">
+            <div class="tabs__left">
+              <a class="tab tab--active" href="/settings" aria-current="page">Settings</a>
+              <a class="tab" href="/threads">History</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="page-badge page-badge--desktop">Settings</div>
         <h1 class="page-title">Connections</h1>
         <p class="page-subtitle">
           Connect your accounts so the agent can retrieve context and take actions.

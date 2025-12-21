@@ -45,6 +45,12 @@ type BackfillState = {
   lastRunAt: string | null;
 };
 
+type PgBossSend = (
+  name: string,
+  data?: unknown,
+  options?: Record<string, unknown>,
+) => Promise<unknown>;
+
 @Injectable()
 export class GmailSyncWorker implements OnModuleInit {
   private readonly logger = new Logger(GmailSyncWorker.name);
@@ -126,6 +132,10 @@ export class GmailSyncWorker implements OnModuleInit {
       `[${GMAIL_SYNC_MESSAGES_JOB}] using query="${query}" pageToken=${startPageToken ? 'YES' : 'NO'}`,
     );
 
+    // Safety-first speed: stay under a budget and backoff on 429/403-quota errors.
+    // If you want faster, raise these carefully (unitsPerMinute first, then burst, then concurrency).
+    const quota = new QuotaLimiter({ unitsPerMinute: 10_000, burstUnits: 2_000 });
+
     let pageToken: string | null = startPageToken;
     let pages = 0;
 
@@ -135,11 +145,15 @@ export class GmailSyncWorker implements OnModuleInit {
     while (pages < maxPages && messageIds.length < maxMessages) {
       pages += 1;
 
-      const page = await this.gmailApi.listMessagesPage(userId, {
-        q: query,
-        maxResults: Math.min(500, maxMessages - messageIds.length),
-        pageToken,
-      });
+      await quota.takeUnits(5);
+
+      const page = await withRetry(this.logger, 'listMessagesPage', async () =>
+        this.gmailApi.listMessagesPage(userId, {
+          q: query,
+          maxResults: Math.min(500, maxMessages - messageIds.length),
+          pageToken,
+        }),
+      );
 
       if (page.ids.length === 0) break;
 
@@ -166,10 +180,16 @@ export class GmailSyncWorker implements OnModuleInit {
 
     const touchedThreadIds = new Set<string>();
 
-    // Parallelize Gmail message fetch for speed (major win)
-    const concurrency = mode === 'backfill' ? 12 : 8;
+    // Parallelize Gmail message fetch for speed (budgeted by quota limiter)
+    const concurrency = mode === 'backfill' ? 20 : 10;
+
     const messages = await mapWithConcurrency(uniqueIds, concurrency, async (id) => {
-      const msg = await this.gmailApi.getMessage(userId, id);
+      await quota.takeUnits(5);
+
+      const msg = await withRetry(this.logger, 'getMessage', async () =>
+        this.gmailApi.getMessage(userId, id),
+      );
+
       if (msg.threadId) touchedThreadIds.add(msg.threadId);
       return msg;
     });
@@ -378,8 +398,35 @@ export class GmailSyncWorker implements OnModuleInit {
       });
     }
 
+    // Key speed fix: if backfill has more pages, enqueue the next page immediately.
+    // This removes the "wait for tick + singleton window" delay between pages.
+    let didEnqueueNextBackfill = false;
+
+    if (mode === 'backfill' && lastNextPageToken) {
+      const send = getPgBossSend(this.pgBossService.client as unknown);
+      const tokenKeyPart = hashSingletonKeyPart(lastNextPageToken);
+
+      await send(
+        GMAIL_SYNC_MESSAGES_JOB,
+        {
+          userId,
+          mode: 'backfill',
+          maxPages,
+          maxMessages,
+          pageToken: lastNextPageToken,
+        },
+        {
+          // Dedupe per (user, token-hash) to avoid enqueue storms if something retries.
+          singletonKey: `gmail_backfill_page:${userId}:${tokenKeyPart}`,
+          singletonSeconds: 3600,
+        },
+      );
+
+      didEnqueueNextBackfill = true;
+    }
+
     this.logger.log(
-      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} mode=${mode} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} touchedThreads=${threads.length} backfillDone=${backfillState?.done ?? 'n/a'}`,
+      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} mode=${mode} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} touchedThreads=${threads.length} backfillDone=${backfillState?.done ?? 'n/a'} enqueuedNextBackfill=${didEnqueueNextBackfill}`,
     );
   }
 
@@ -621,4 +668,118 @@ async function mapWithConcurrency<T, R>(
 
   await Promise.all(workers);
   return out;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null;
+}
+
+function isRateLimitLikeError(err: unknown): boolean {
+  if (!isRecord(err)) return false;
+
+  const status = typeof err['status'] === 'number' ? err['status'] : undefined;
+  const code = typeof err['code'] === 'number' ? err['code'] : undefined;
+  const httpStatus = status ?? code;
+
+  if (httpStatus === 429) return true;
+
+  if (httpStatus === 403) {
+    const message = typeof err['message'] === 'string' ? err['message'] : '';
+    if (/rate limit|userRateLimitExceeded|quota|resource has been exhausted/i.test(message)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function withRetry<T>(logger: Logger, label: string, fn: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+
+  while (true) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      attempt += 1;
+
+      // Only retry the stuff that is usually transient (rate/quota).
+      if (!isRateLimitLikeError(err) || attempt >= 8) throw err;
+
+      // 250ms, 500ms, 1s, 2s, 4s... capped + jitter
+      const base = Math.min(10_000, 250 * 2 ** (attempt - 1));
+      const jitter = Math.floor(Math.random() * 250);
+      const waitMs = base + jitter;
+
+      logger.warn(
+        `[gmail] rate-limited during ${label}, retrying in ${waitMs}ms (attempt ${attempt})`,
+      );
+
+      await sleep(waitMs);
+    }
+  }
+}
+
+class QuotaLimiter {
+  private availableUnits: number;
+  private lastRefillMs: number;
+
+  constructor(private readonly config: { unitsPerMinute: number; burstUnits: number }) {
+    this.availableUnits = Math.max(1, Math.floor(config.burstUnits));
+    this.lastRefillMs = Date.now();
+  }
+
+  async takeUnits(costUnits: number): Promise<void> {
+    const cost = Math.max(1, Math.floor(costUnits));
+
+    while (true) {
+      this.refill();
+
+      if (this.availableUnits >= cost) {
+        this.availableUnits -= cost;
+        return;
+      }
+
+      await sleep(50);
+    }
+  }
+
+  private refill(): void {
+    const nowMs = Date.now();
+    const elapsedMs = nowMs - this.lastRefillMs;
+    if (elapsedMs <= 0) return;
+
+    const unitsPerMs = this.config.unitsPerMinute / 60_000;
+    const add = elapsedMs * unitsPerMs;
+
+    if (add >= 1) {
+      const burst = Math.max(1, Math.floor(this.config.burstUnits));
+      this.availableUnits = Math.min(burst, this.availableUnits + Math.floor(add));
+      this.lastRefillMs = nowMs;
+    }
+  }
+}
+
+function getPgBossSend(client: unknown): PgBossSend {
+  if (!isRecord(client)) throw new Error('PgBoss client is not an object');
+  const send = client['send'];
+  if (typeof send !== 'function') throw new Error('PgBoss client.send is not a function');
+  return send as PgBossSend;
+}
+
+function hashSingletonKeyPart(value: string): string {
+  // Simple 32-bit hash -> base36 string (short, pg-boss singletonKey-friendly)
+  let hash = 2166136261;
+
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  // Force unsigned 32-bit
+  const unsigned = hash >>> 0;
+  return unsigned.toString(36);
 }

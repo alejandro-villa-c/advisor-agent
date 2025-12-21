@@ -282,6 +282,12 @@ body {
   color: var(--muted);
   font-size: 16px;
   cursor: pointer;
+
+  /* Allow <a> tabs as well as <button> */
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .tab--active {
@@ -413,6 +419,12 @@ body {
   background: #fff;
   border-radius: 18px;
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.06);
+}
+
+/* Settings: mobile-only tabs row */
+.page-tabs {
+  display: none; /* desktop: sidebar exists */
+  margin-bottom: 14px;
 }
 
 .page-badge {
@@ -789,6 +801,15 @@ body {
     max-width: 520px;
     margin-left: auto;
     margin-right: auto;
+  }
+
+  /* Settings mobile nav */
+  .page-tabs {
+    display: flex;
+  }
+
+  .page-badge--desktop {
+    display: none;
   }
 }
 
