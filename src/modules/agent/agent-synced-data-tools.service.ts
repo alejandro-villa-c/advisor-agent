@@ -17,6 +17,7 @@ export class AgentSyncedDataToolsService {
     const q = (input.query ?? '').trim();
     if (!q) return [];
 
+    // Simplify query matching
     const like = `%${escapeLike(q)}%`;
 
     const rows = await this.dbService.db
@@ -31,9 +32,8 @@ export class AgentSyncedDataToolsService {
         and(
           eq(hubspotContacts.userId, input.userId),
           sql`(
-            ${hubspotContacts.email} ILIKE ${like}
-            OR ${hubspotContacts.firstName} ILIKE ${like}
-            OR ${hubspotContacts.lastName} ILIKE ${like}
+            ${hubspotContacts.email} ILIKE ${like} OR
+            concat_ws(' ', ${hubspotContacts.firstName}, ${hubspotContacts.lastName}) ILIKE ${like}
           )`,
         ),
       )
@@ -121,7 +121,6 @@ export class AgentSyncedDataToolsService {
     const workEndHour = clampInt(input.workDayEndHour, 1, 24);
     const tzOffsetMin = clampInt(input.timezoneOffsetMinutes, -14 * 60, 14 * 60);
 
-    // Load busy intervals from local calendar mirror
     const rows = await this.dbService.db
       .select({
         startAt: calendarEvents.startAt,
@@ -148,7 +147,6 @@ export class AgentSyncedDataToolsService {
 
     const slots: Array<{ startIso: string; endIso: string }> = [];
 
-    // iterate day-by-day in "local" time (via fixed offset)
     const dayMs = 86_400_000;
     let cursorDayLocal = floorToLocalDay(startMs, tzOffsetMin);
 
@@ -160,7 +158,7 @@ export class AgentSyncedDataToolsService {
       const windowEnd = Math.min(workEndUtc, endMs);
 
       if (windowEnd > windowStart) {
-        const stepMs = 30 * 60_000; // 30-min stepping (simple + stable)
+        const stepMs = 30 * 60_000;
 
         for (let t = windowStart; t + durationMs <= windowEnd; t += stepMs) {
           const candidate = { start: t, end: t + durationMs };
@@ -191,7 +189,6 @@ function clampInt(n: number, min: number, max: number): number {
 }
 
 function escapeLike(s: string): string {
-  // basic escaping for LIKE patterns
   return s.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
 }
 
@@ -223,7 +220,6 @@ function overlapsAny(
   x: { start: number; end: number },
   intervals: Array<{ start: number; end: number }>,
 ): boolean {
-  // intervals sorted/merged
   for (const b of intervals) {
     if (b.end <= x.start) continue;
     if (b.start >= x.end) return false;

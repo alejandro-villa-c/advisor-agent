@@ -49,7 +49,7 @@ export class CalendarApiService {
   constructor(private readonly googleTokenService: GoogleTokenService) {}
 
   /**
-   * New: paginated listing.
+   * paginated listing.
    */
   async listEventsPage(
     userId: number,

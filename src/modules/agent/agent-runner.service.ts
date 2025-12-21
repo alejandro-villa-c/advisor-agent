@@ -52,6 +52,11 @@ export class AgentRunnerService {
       await this.tasks.setWaiting(taskId, null);
       await this.tasks.setStatus(taskId, 'running', null);
 
+      // deterministically kick off scheduling if possible
+      const didStart = await this.tryAutoStartScheduling(taskId, task);
+      if (didStart === 'waiting') return;
+
+      // Existing auto-resolve when we already have meeting state + incoming reply
       const didAuto = await this.tryAutoResolveScheduling(taskId, task);
       if (didAuto === 'completed') return;
       if (didAuto === 'waiting') return;
@@ -170,7 +175,6 @@ export class AgentRunnerService {
 
       await this.tasks.setStatus(taskId, 'failed', 'Max turns reached without completion.');
     } finally {
-      // Always try to mirror any newly-added agent messages into the chat thread.
       await this.enqueueReact(taskId);
     }
   }
@@ -192,7 +196,126 @@ export class AgentRunnerService {
     }
   }
 
-  // ---------------- scheduling auto-resolve ----------------
+  private async tryAutoStartScheduling(
+    taskId: number,
+    task: AgentTaskRow,
+  ): Promise<'waiting' | 'nope'> {
+    const mem = task.memory ?? {};
+    const meeting = isRecord(mem['meeting']) ? mem['meeting'] : null;
+    if (meeting) return 'nope';
+
+    if (!isLikelyScheduleMeetingGoal(task.goal)) return 'nope';
+
+    const contactName = extractContactNameFromGoal(task.goal);
+    if (!contactName) return 'nope';
+
+    const matches = await this.syncedDataTools.findHubspotContactsLocal({
+      userId: task.userId,
+      query: contactName,
+      limit: 10,
+    });
+
+    const best = pickBestContact(matches, contactName);
+    if (!best) return 'nope';
+
+    if (!best.email) {
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: `I found the contact "${best.displayName}", but it has no email in HubSpot. Please provide the email address.`,
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I found "${best.displayName}" but it has no email. Please provide the email address.`,
+      });
+
+      return 'waiting';
+    }
+
+    const timeZone = 'America/Santo_Domingo';
+    const durationMinutes = 30;
+
+    const now = Date.now();
+    const startIso = new Date(now + 60 * 60_000).toISOString();
+    const endIso = new Date(now + 14 * 24 * 60 * 60_000).toISOString();
+
+    const slots = await this.syncedDataTools.suggestCalendarTimesLocal({
+      userId: task.userId,
+      startIso,
+      endIso,
+      durationMinutes,
+      workDayStartHour: 9,
+      workDayEndHour: 17,
+      timezoneOffsetMinutes: -240,
+      maxSuggestions: 6,
+    });
+
+    const proposed = slots.slice(0, 3).map((s, idx) => ({
+      label: String.fromCharCode('A'.charCodeAt(0) + idx),
+      startIso: s.startIso,
+      endIso: s.endIso,
+    }));
+
+    if (proposed.length === 0) return 'nope';
+
+    const body = buildSchedulingOptionsEmail({
+      intro:
+        `Hi ${best.displayName},\n\n` +
+        `I'd like to schedule a quick 30-minute meeting. Please reply with the option label only (A, B, or C):`,
+      options: proposed.map((p) => ({
+        label: p.label,
+        startIso: p.startIso,
+        endIso: p.endIso,
+        timeZone,
+      })),
+    });
+
+    const sendRes = await this.gmailApi.sendEmail(task.userId, {
+      to: best.email,
+      subject: `Scheduling — please choose A, B, or C`,
+      bodyText: body,
+    });
+
+    const gmailThreadId = extractThreadIdFromSendResult(sendRes);
+    const sinceIso = new Date().toISOString();
+
+    await this.tasks.mergeMemory(taskId, {
+      meeting: {
+        timezone: timeZone,
+        durationMinutes,
+        contact: {
+          name: best.displayName,
+          email: best.email,
+          hubspotContactId: best.hubspotContactId,
+        },
+        gmailThreadId: gmailThreadId || null,
+        proposed,
+      },
+    });
+
+    await this.tasks.setWaiting(taskId, {
+      kind: 'gmail_reply',
+      threadId: gmailThreadId || '',
+      fromEmail: best.email,
+      sinceIso,
+    });
+    await this.tasks.setStatus(taskId, 'waiting', null);
+
+    await this.tasks.appendMessage({
+      taskId,
+      userId: task.userId,
+      role: 'assistant',
+      content: `I emailed ${best.email} with options A/B/C and I'm waiting for their selection.`,
+    });
+
+    return 'waiting';
+  }
+
+  // ---------------- existing scheduling auto-resolve (unchanged) ----------------
   private async tryAutoResolveScheduling(
     taskId: number,
     task: AgentTaskRow,
@@ -307,21 +430,13 @@ export class AgentRunnerService {
         threadId,
       });
 
-      // Use Gmail's internal timeline as baseline (not server clock)
-      const baseline = await getGmailThreadBaselineInternalDateMs(
-        this.gmailApi,
-        task.userId,
-        threadId,
-      );
-
+      const sinceIso = new Date().toISOString();
       await this.tasks.setWaiting(taskId, {
         kind: 'gmail_reply',
         threadId,
         fromEmail: contactEmail,
-        sinceIso: new Date().toISOString(), // keep for debugging
-        sinceInternalDateMs: baseline.sinceInternalDateMs,
+        sinceIso,
       });
-
       await this.tasks.setStatus(taskId, 'waiting', null);
 
       await this.tasks.appendMessage({
@@ -493,19 +608,12 @@ export class AgentRunnerService {
             return { kind: 'error', error: err };
           }
 
-          // baseline using Gmail internalDateMs
-          const baseline = await getGmailThreadBaselineInternalDateMs(
-            this.gmailApi,
-            userId,
-            gmailThreadId,
-          );
-
+          const sinceIso = new Date().toISOString();
           const waiting: Record<string, unknown> = {
             kind: 'gmail_reply',
             threadId: gmailThreadId,
             fromEmail: fromEmail || null,
-            sinceIso: new Date().toISOString(), // keep for debug/visibility
-            sinceInternalDateMs: baseline.sinceInternalDateMs,
+            sinceIso,
           };
 
           await this.tasks.setWaiting(taskId, waiting);
@@ -515,8 +623,7 @@ export class AgentRunnerService {
             kind: 'gmail_reply',
             gmailThreadId,
             fromEmail: fromEmail || null,
-            sinceIso: waiting.sinceIso,
-            sinceInternalDateMs: baseline.sinceInternalDateMs,
+            sinceIso,
           };
 
           await this.tasks.logToolCall({
@@ -874,25 +981,83 @@ export class AgentRunnerService {
   }
 }
 
-async function getGmailThreadBaselineInternalDateMs(
-  gmailApi: GmailApiService,
-  userId: number,
-  threadId: string,
-): Promise<{ sinceInternalDateMs: number }> {
-  try {
-    const msgs = await gmailApi.getThreadMessages(userId, threadId);
-    let max = 0;
+function isLikelyScheduleMeetingGoal(goal: string): boolean {
+  const g = String(goal ?? '').toLowerCase();
+  return g.includes('schedule') && g.includes('meeting');
+}
 
-    for (const m of msgs) {
-      const v = typeof m.internalDateMs === 'number' ? m.internalDateMs : NaN;
-      if (Number.isFinite(v) && v > max) max = v;
-    }
+function extractContactNameFromGoal(goal: string): string | null {
+  const g = String(goal ?? '').trim();
+  if (!g) return null;
 
-    return { sinceInternalDateMs: max };
-  } catch {
-    // If Gmail read fails, keep baseline at 0 (still better than mixing server clock with Gmail clock).
-    return { sinceInternalDateMs: 0 };
+  const m =
+    g.match(/schedule\s+(?:a\s+)?meeting\s+with\s+(.+)$/i) ??
+    g.match(/schedule\s+meeting\s+with\s+(.+)$/i) ??
+    g.match(/set\s+up\s+(?:a\s+)?meeting\s+with\s+(.+)$/i);
+
+  const name = (m?.[1] ?? '').trim();
+  if (!name) return null;
+
+  return name.replace(/[.?!]+$/g, '').trim();
+}
+
+function pickBestContact(
+  matches: Array<{
+    id: string;
+    email: string | null;
+    firstName: string | null;
+    lastName: string | null;
+  }>,
+  query: string,
+): { hubspotContactId: string; email: string | null; displayName: string } | null {
+  if (!Array.isArray(matches) || matches.length === 0) return null;
+
+  const qn = normalizeName(query);
+
+  const scored = matches.map((m) => {
+    const full = `${m.firstName ?? ''} ${m.lastName ?? ''}`.trim();
+    const fn = normalizeName(full);
+    const exact = fn && qn && fn === qn ? 100 : 0;
+    const contains = fn && qn && fn.includes(qn) ? 50 : 0;
+    const hasEmail = m.email ? 10 : 0;
+    const score = exact + contains + hasEmail;
+    return { m, full, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const best = scored[0];
+  const displayName = best.full || query;
+
+  return {
+    hubspotContactId: String(best.m.id),
+    email: best.m.email ?? null,
+    displayName,
+  };
+}
+
+function normalizeName(s: string): string {
+  return String(s ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[^a-z0-9 ]/g, '');
+}
+
+function extractThreadIdFromSendResult(sendRes: unknown): string {
+  if (!sendRes || typeof sendRes !== 'object') return '';
+  const r = sendRes as Record<string, unknown>;
+  const t1 = typeof r.threadId === 'string' ? r.threadId : '';
+  if (t1) return t1;
+  const t2 = typeof r.gmailThreadId === 'string' ? r.gmailThreadId : '';
+  if (t2) return t2;
+  const inner = r.result;
+  if (inner && typeof inner === 'object') {
+    const rr = inner as Record<string, unknown>;
+    const t3 = typeof rr.threadId === 'string' ? rr.threadId : '';
+    if (t3) return t3;
   }
+  return '';
 }
 
 function parseIncomingEmailBlock(content: string): {

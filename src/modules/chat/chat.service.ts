@@ -116,7 +116,8 @@ export class ChatService {
       }
     }
 
-    // 1) If there is a waiting task asking the advisor for info, treat this message as the reply.
+    // 1) If there is a waiting task asking the advisor for info, treat this message as the reply,
+    // BUT ONLY if the message looks like it answers the prompt.
     const resumed = await this.tryResumeWaitingUserMessageTask({
       userId,
       threadId,
@@ -244,10 +245,14 @@ export class ChatService {
   }): Promise<{ taskId: number } | null> {
     const waiting = await this.agentTasks.listWaitingTasksForUser(input.userId, 50);
 
+    // Only resume if:
+    // - waiting.kind === 'user_message'
+    // - and the new text looks like it answers the prompt (heuristic)
     const match = waiting.find((t) => {
       if (!isRecord(t.waiting)) return false;
       const kind = typeof t.waiting.kind === 'string' ? t.waiting.kind : '';
-      return kind === 'user_message';
+      if (kind !== 'user_message') return false;
+      return shouldResumeUserMessageWaiting(t.waiting, input.advisorReplyText);
     });
 
     if (!match) return null;
@@ -255,6 +260,19 @@ export class ChatService {
     // Claim waiting->queued so we don’t double enqueue.
     const claimed = await this.agentTasks.claimWaitingTask(match.id);
     if (!claimed) return null;
+
+    // IMPORTANT: retarget chat bridge to THIS thread so future agent updates mirror here
+    const full = await this.agentTasks.getTask(match.id);
+    const mem = full?.memory ?? {};
+
+    const existingBridge = isRecord(mem['chatBridge']) ? mem['chatBridge'] : {};
+    const newBridge: Record<string, unknown> = {
+      ...existingBridge,
+      threadId: input.threadId,
+      didPushTerminalStatus: false,
+    };
+
+    await this.agentTasks.mergeMemory(match.id, { chatBridge: newBridge });
 
     // Append the advisor reply into the agent task conversation.
     await this.agentTasks.appendMessage({
@@ -766,4 +784,41 @@ function safeJson(text: string): unknown {
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
+}
+
+function shouldResumeUserMessageWaiting(
+  waiting: Record<string, unknown>,
+  replyText: string,
+): boolean {
+  const prompt = typeof waiting.prompt === 'string' ? waiting.prompt : '';
+
+  // If the agent is explicitly asking for an email, only resume when the advisor message contains one.
+  const wantsEmail =
+    /email\b/i.test(prompt) || /email address/i.test(prompt) || /e-mail/i.test(prompt);
+
+  if (wantsEmail) {
+    return containsEmail(replyText);
+  }
+
+  // If the agent is asking for a label choice (A/B/C), only resume if the reply contains one.
+  const wantsLabel =
+    /\breply\b/i.test(prompt) && /\b(A|B|C)\b/i.test(prompt) && /label/i.test(prompt);
+
+  if (wantsLabel) {
+    return containsLabelChoice(replyText);
+  }
+
+  // Default: resume
+  return true;
+}
+
+function containsEmail(text: string): boolean {
+  return /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(String(text ?? ''));
+}
+
+function containsLabelChoice(text: string): boolean {
+  const s = String(text ?? '')
+    .trim()
+    .slice(0, 200);
+  return /\b([A-F])\b/i.test(s) || /\boption\s*([A-F])\b/i.test(s);
 }
