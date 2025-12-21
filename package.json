@@ -13,7 +13,7 @@
     "start:dev": "nest start --watch",
     "start:worker:dev": "ts-node-dev --respawn --files -r tsconfig-paths/register src/worker.ts",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main",
+    "start:prod": "node dist/src/main.js",
     "start:worker:prod": "node dist/src/worker.js",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\"",
     "lint:fix": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",

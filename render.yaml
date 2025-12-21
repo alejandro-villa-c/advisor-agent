@@ -1,0 +1,14 @@
+services:
+  # Web Service
+  - type: web
+    name: advisor-agent
+    runtime: node
+    buildCommand: npm install --include=dev && npx @nestjs/cli build
+    startCommand: node dist/src/main.js
+
+  # Background Worker
+  - type: worker
+    name: advisor-agent-worker
+    runtime: node
+    buildCommand: npm install --include=dev && npx @nestjs/cli build
+    startCommand: node dist/src/worker.js
