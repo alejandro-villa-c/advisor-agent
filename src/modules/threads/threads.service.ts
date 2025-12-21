@@ -3,15 +3,11 @@ import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { DbService } from '../../db/db.service';
 import { messages, threads } from '../../db/schema';
 
-export type JsonPrimitive = string | number | boolean | null;
-export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
-
 export type ThreadMessageDto = {
   id: number;
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   createdAt: string;
-  meta: JsonValue | null;
 };
 
 export type ThreadListDto = {
@@ -85,13 +81,13 @@ export class ThreadsService {
   async listMessages(userId: number, threadId: number): Promise<ThreadMessageDto[]> {
     await this.assertThreadOwned(userId, threadId);
 
+    // IMPORTANT: We intentionally do NOT select/return `meta` to avoid leaking debug data to the client.
     const rows = await this.db.db
       .select({
         id: messages.id,
         role: messages.role,
         content: messages.content,
         createdAt: messages.createdAt,
-        meta: messages.meta,
       })
       .from(messages)
       .where(and(eq(messages.threadId, threadId), eq(messages.userId, userId)))
@@ -102,8 +98,6 @@ export class ThreadsService {
       role: r.role,
       content: r.content,
       createdAt: r.createdAt.toISOString(),
-      // Drizzle may type this as unknown depending on your schema; keep it safe.
-      meta: (r.meta ?? null) as JsonValue | null,
     }));
   }
 }

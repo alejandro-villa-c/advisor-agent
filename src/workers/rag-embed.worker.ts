@@ -54,7 +54,11 @@ export class RagEmbedWorker implements OnModuleInit {
       `[${RAG_EMBED_DOCUMENTS_JOB}] rebuilt documents=${rebuilt.documentsProcessed} chunks=${rebuilt.chunksInserted}`,
     );
 
-    const embedded = await this.rag.embedMissingChunksForUser({ userId, batchSize: 64 });
+    const embedded = await this.rag.embedMissingChunksForUser({
+      userId,
+      batchSize: 64,
+      documentIds,
+    });
     this.logger.log(
       `[${RAG_EMBED_DOCUMENTS_JOB}] embedded chunks=${embedded.chunksEmbedded} model=${embedded.modelUsed ?? 'NONE'}`,
     );

@@ -9,6 +9,7 @@
   const sendBtn = document.querySelector('.send-btn');
 
   const historyTab = document.querySelector('.tab:not(.tab--active)');
+  const newThreadBtn = document.querySelector('[data-new-thread]');
 
   if (!contentInner || !textarea) return;
 
@@ -21,13 +22,6 @@
       .replaceAll('>', '&gt;')
       .replaceAll('"', '&quot;')
       .replaceAll("'", '&#039;');
-  }
-
-  function truncate(s, max) {
-    const t = String(s ?? '').trim();
-    if (!t) return '';
-    if (t.length <= max) return t;
-    return `${t.slice(0, Math.max(0, max - 1))}…`;
   }
 
   async function fetchJson(url, options) {
@@ -55,70 +49,48 @@
     sendBtn.disabled = isSending || !hasText;
   }
 
-  function normalizeCitations(meta) {
-    const citations = meta && Array.isArray(meta.citations) ? meta.citations : [];
-    return citations
-      .map((c) => ({
-        title: c && c.title == null ? null : String(c && c.title != null ? c.title : ''),
-        chunkText: String(c && c.chunkText != null ? c.chunkText : ''),
-      }))
-      .filter((c) => c.source || c.title || c.sourceId || c.chunkText);
-  }
-
-  function renderSources(citations) {
-    if (!citations.length) return '';
-
-    const items = citations.map((c) => {
-      const headerParts = [];
-      if (c.title) headerParts.push(c.title);
-
-      const header = headerParts.join(' — ') || 'Source';
-      const snippet = truncate(c.chunkText, 220);
-
-      return `
-        <li class="sources__item">
-          <div class="sources__header" title="${escapeHtml(header)}">${escapeHtml(truncate(header, 80))}}</div>
-          ${snippet ? `<div class="sources__snippet" title="${escapeHtml(c.chunkText)}">${escapeHtml(snippet)}</div>` : ''}
-        </li>
-      `;
-    });
-
-    return `
-      <details class="sources">
-        <summary class="sources__summary">Sources (${citations.length})</summary>
-        <ol class="sources__list">
-          ${items.join('')}
-        </ol>
-      </details>
-    `;
-  }
-
-  function renderMessage(role, text, meta) {
+  function createMessageElement(role, text, opts) {
     const wrap = document.createElement('div');
     wrap.className = role === 'user' ? 'msg msg--user' : 'msg msg--assistant';
 
-    const sourcesHtml = role === 'assistant' ? renderSources(normalizeCitations(meta)) : '';
+    if (opts && opts.isThinking) {
+      wrap.classList.add('msg--thinking');
+    }
 
     wrap.innerHTML = `
       <div class="msg__text">
         <div class="msg__content">${escapeHtml(text)}</div>
-        ${sourcesHtml}
       </div>
     `;
 
-    contentInner.appendChild(wrap);
+    return wrap;
+  }
+
+  function renderMessage(role, text, opts) {
+    const el = createMessageElement(role, text, opts);
+    contentInner.appendChild(el);
+    return el;
+  }
+
+  function updateAssistantMessage(el, text) {
+    if (!el) return;
+    el.classList.remove('msg--thinking');
+
+    el.innerHTML = `
+      <div class="msg__text">
+        <div class="msg__content">${escapeHtml(text)}</div>
+      </div>
+    `;
   }
 
   async function loadMessages() {
     contentInner.innerHTML = '';
 
-    const data = await fetchJson(`/api/threads/${threadId}/messages`, {
-      method: 'GET',
-    });
+    const data = await fetchJson(`/api/threads/${threadId}/messages`, { method: 'GET' });
 
     const msgs = Array.isArray(data && data.messages) ? data.messages : [];
     for (const m of msgs) {
-      renderMessage(m.role, m.content, m.meta);
+      renderMessage(m.role, m.content);
     }
 
     scrollToBottom();
@@ -130,10 +102,15 @@
     isSending = true;
     updateSendState();
 
-    renderMessage('user', text, null);
+    renderMessage('user', text);
 
     textarea.value = '';
     textarea.focus();
+    scrollToBottom();
+
+    // Thinking placeholder
+    const thinkingEl = renderMessage('assistant', 'Thinking', { isThinking: true });
+    thinkingEl.querySelector('.msg__content').classList.add('thinking-dots');
     scrollToBottom();
 
     try {
@@ -147,9 +124,13 @@
         (data && typeof data.assistant === 'string' && data.assistant) ||
         '';
 
-      const citations = Array.isArray(data && data.citations) ? data.citations : [];
-      renderMessage('assistant', assistantText, { citations });
-
+      updateAssistantMessage(thinkingEl, assistantText);
+      scrollToBottom();
+    } catch (err) {
+      updateAssistantMessage(
+        thinkingEl,
+        `Error: ${err && err.message ? err.message : String(err)}`,
+      );
       scrollToBottom();
     } finally {
       isSending = false;
@@ -166,9 +147,7 @@
       const text = textarea.value.trim();
       if (!text) return;
 
-      sendMessage(text).catch((err) => {
-        renderMessage('assistant', `Error: ${err && err.message ? err.message : String(err)}`, null);
-      });
+      sendMessage(text);
     }
   });
 
@@ -177,9 +156,7 @@
       const text = textarea.value.trim();
       if (!text) return;
 
-      sendMessage(text).catch((err) => {
-        renderMessage('assistant', `Error: ${err && err.message ? err.message : String(err)}`, null);
-      });
+      sendMessage(text);
     });
   }
 
@@ -189,11 +166,21 @@
     });
   }
 
+  if (newThreadBtn) {
+    newThreadBtn.addEventListener('click', () => {
+      // Assumes your server renders a fresh thread when you hit /chat
+      window.location.href = '/chat';
+    });
+  }
+
   updateSendState();
 
   if (threadId > 0) {
     loadMessages().catch((err) => {
-      renderMessage('assistant', `Error loading messages: ${err && err.message ? err.message : String(err)}`, null);
+      renderMessage(
+        'assistant',
+        `Error loading messages: ${err && err.message ? err.message : String(err)}`,
+      );
     });
   }
 })();

@@ -10,7 +10,7 @@ export class ChatController {
   async message(
     @Req() req: Request,
     @Body() body: { threadId?: number; content?: string },
-  ): Promise<{ threadId: number; assistant: { content: string }; citations: any[] }> {
+  ): Promise<{ threadId: number; assistant: { content: string } }> {
     const userId = req.session.userId;
     if (!userId) throw new UnauthorizedException();
 
@@ -23,7 +23,6 @@ export class ChatController {
     return {
       threadId: result.threadId,
       assistant: { content: result.assistant },
-      citations: Array.isArray(result.citations) ? result.citations : [],
     };
   }
 }

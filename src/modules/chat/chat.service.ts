@@ -1,9 +1,33 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray } from 'drizzle-orm';
 import { DbService } from '../../db/db.service';
 import { agentInstructions, messages, threads } from '../../db/schema';
-import { RagService } from '../rag/rag.service';
-import { OpenAiChatService } from './openai-chat.service';
+import { RagService, type RagSearchRow } from '../rag/rag.service';
+import { OpenAiChatService, type OpenAiChatMessage } from './openai-chat.service';
+
+type ChatCitation = {
+  chunkId: number;
+  documentId: number;
+  title: string | null;
+  source: string;
+  sourceId: string;
+  excerpt: string;
+};
+
+// Stored in DB only (minimal, no excerpt bloat)
+// Now includes similarity + distance for debugging + ranking.
+type ChatDebugCitation = {
+  chunkId: number;
+  documentId: number;
+  similarity: number | null; // higher = better match (when available)
+  distance: number | null; // lower = better match (when available)
+};
+
+type RetrievalPlan = {
+  query: string;
+  mode: 'standard' | 'bulk';
+  expandedQueries: string[];
+};
 
 @Injectable()
 export class ChatService {
@@ -17,7 +41,7 @@ export class ChatService {
     userId: number;
     threadId?: number;
     text: string;
-  }): Promise<{ threadId: number; assistant: string; citations: any[] }> {
+  }): Promise<{ threadId: number; assistant: string }> {
     const userId = input.userId;
     const text = (input.text ?? '').trim();
     if (!text) throw new Error('Message text is empty.');
@@ -46,7 +70,7 @@ export class ChatService {
       isNewThread = true;
     }
 
-    // Store user message (return id so we can safely detect "first user message" when needed)
+    // Store user message
     const insertedUser = await this.dbService.db
       .insert(messages)
       .values({
@@ -65,7 +89,6 @@ export class ChatService {
       if (isNewThread) {
         await this.setThreadTitleFromPrompt({ userId, threadId, prompt: text });
       } else if (typeof userMessageId === 'number') {
-        // Only set it if this message is actually the first user message in that thread
         const firstUser = await this.dbService.db
           .select({ id: messages.id })
           .from(messages)
@@ -93,23 +116,71 @@ export class ChatService {
 
     const instructions = instrRows.map((r) => r.instruction).filter(Boolean);
 
-    // RAG context
-    const results = await this.rag.search({ userId, query: text, k: 10 });
+    // Multi-turn: include last N messages from the thread (user + assistant)
+    const history = await this.loadThreadHistoryForLlm({
+      userId,
+      threadId,
+      maxMessages: readHistoryMaxMessages(),
+      maxCharsPerMessage: readHistoryMaxCharsPerMessage(),
+    });
 
-    const citations = results.map((r) => ({
-      chunkId: r.chunkId,
-      documentId: r.documentId,
-      title: r.title,
-      source: r.source,
-      sourceId: r.sourceId,
-      distance: r.distance,
-      chunkText: r.chunkText,
-    }));
+    // Build a better RAG query from recent USER turns (so follow-ups work)
+    const ragQuery = await this.buildRagQueryFromRecentUserTurns({
+      userId,
+      threadId,
+      fallback: text,
+      maxUserTurns: readRagQueryUserTurns(),
+      maxChars: readRagQueryMaxChars(),
+    });
 
-    const system = buildSystemPrompt({ instructions, citations });
+    // General-purpose retrieval plan (LLM chooses standard vs bulk)
+    const plan = await this.planRetrieval({
+      userText: text,
+      ragQuery,
+      history,
+    });
+
+    const retrievalTake = plan.mode === 'bulk' ? readRagBulkTake() : readRagStandardTake();
+
+    // Hybrid retrieval
+    const base = await this.rag.searchHybrid({
+      userId,
+      query: plan.query,
+      take: retrievalTake,
+      semanticCandidates: readRagSemanticCandidates(),
+      lexicalCandidates: readRagLexicalCandidates(),
+    });
+
+    // Optional query expansion (still general-purpose)
+    const expanded = await this.runExpandedQueries({
+      userId,
+      expandedQueries: plan.expandedQueries,
+      takeEach: Math.max(25, Math.floor(retrievalTake / 3)),
+    });
+
+    // Merge duplicates but prefer "better-scored" row for a given chunk
+    const merged = mergeUniqueByChunkIdPreferBest([...base, ...expanded]);
+
+    // Rank by closest match -> lowest match for BOTH:
+    // - prompt citations
+    // - DB debug citations
+    const ranked = rankRowsBestToWorst(merged);
+
+    // Rich citations only for building the system prompt context (not stored to DB)
+    const systemCitations = toCitations(
+      ranked.slice(0, readSystemCitationsMax()),
+      readSystemExcerptMaxChars(),
+    );
+
+    // Minimal debug citations stored to DB (no excerpts to avoid bloat)
+    const debugCitations = toDebugCitations(ranked.slice(0, readDebugCitationsMax()));
+
+    const system = buildSystemPrompt({ instructions, citations: systemCitations });
+
+    const llmMessages: OpenAiChatMessage[] = [{ role: 'system', content: system }, ...history];
 
     const assistant = this.llm.isConfigured()
-      ? await this.llm.complete({ system, user: text })
+      ? await this.llm.complete({ messages: llmMessages, temperature: 0.2 })
       : 'LLM is not configured (OPENAI_API_KEY missing).';
 
     await this.dbService.db.insert(messages).values({
@@ -117,10 +188,178 @@ export class ChatService {
       threadId,
       role: 'assistant',
       content: assistant,
-      meta: { citations },
+      meta: { citations: debugCitations },
     });
 
-    return { threadId, assistant, citations };
+    return { threadId, assistant };
+  }
+
+  private async runExpandedQueries(input: {
+    userId: number;
+    expandedQueries: string[];
+    takeEach: number;
+  }): Promise<RagSearchRow[]> {
+    const qs = Array.isArray(input.expandedQueries) ? input.expandedQueries : [];
+    const cleaned = qs
+      .map((q) => String(q ?? '').trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    if (cleaned.length === 0) return [];
+
+    const out: RagSearchRow[] = [];
+
+    for (const q of cleaned) {
+      const rows = await this.rag.searchHybrid({
+        userId: input.userId,
+        query: q,
+        take: clampInt(input.takeEach, 10, 2000),
+        semanticCandidates: readRagSemanticCandidates(),
+        lexicalCandidates: readRagLexicalCandidates(),
+      });
+      out.push(...rows);
+    }
+
+    return out;
+  }
+
+  private async planRetrieval(input: {
+    userText: string;
+    ragQuery: string;
+    history: OpenAiChatMessage[];
+  }): Promise<RetrievalPlan> {
+    if (!this.llm.isConfigured() || readDisablePlanner()) {
+      return { query: input.ragQuery, mode: 'standard', expandedQueries: [] };
+    }
+
+    const sys =
+      `You plan retrieval queries for a RAG-powered assistant.\n` +
+      `Return ONLY valid JSON.\n\n` +
+      `Schema:\n` +
+      `{\n` +
+      `  "query": string,\n` +
+      `  "mode": "standard"|"bulk",\n` +
+      `  "expandedQueries": string[]\n` +
+      `}\n\n` +
+      `Guidelines:\n` +
+      `- Use BULK when the user asks for totals, summaries over many items, a full list, or the request likely spans many documents.\n` +
+      `- Do NOT mention any specific company or keywords unless they come from the user conversation.\n`;
+
+    const convo = input.history
+      .filter((m) => m.role === 'user')
+      .map((m) => `- ${m.content}`)
+      .slice(-6)
+      .join('\n');
+
+    const user =
+      `Recent user messages:\n${convo || '(none)'}\n\n` +
+      `Latest user message:\n${input.userText}\n\n` +
+      `Fallback combined query:\n${input.ragQuery}\n`;
+
+    const raw = await this.llm.complete({
+      messages: [
+        { role: 'system', content: sys },
+        { role: 'user', content: user },
+      ],
+      temperature: 0.0,
+    });
+
+    const parsed = safeJson(raw);
+    if (!isRecord(parsed)) return { query: input.ragQuery, mode: 'standard', expandedQueries: [] };
+
+    const query = typeof parsed.query === 'string' ? parsed.query.trim() : '';
+    const mode = parsed.mode === 'bulk' ? 'bulk' : 'standard';
+    const expandedQueries = Array.isArray(parsed.expandedQueries)
+      ? parsed.expandedQueries
+          .map((x) => String(x ?? '').trim())
+          .filter(Boolean)
+          .slice(0, 4)
+      : [];
+
+    return {
+      query: query || input.ragQuery,
+      mode,
+      expandedQueries,
+    };
+  }
+
+  private async buildRagQueryFromRecentUserTurns(input: {
+    userId: number;
+    threadId: number;
+    fallback: string;
+    maxUserTurns: number;
+    maxChars: number;
+  }): Promise<string> {
+    const maxTurns = clampInt(input.maxUserTurns, 1, 12);
+    const maxChars = clampInt(input.maxChars, 200, 20_000);
+
+    const rows = await this.dbService.db
+      .select({
+        content: messages.content,
+        createdAt: messages.createdAt,
+        id: messages.id,
+      })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.userId, input.userId),
+          eq(messages.threadId, input.threadId),
+          eq(messages.role, 'user'),
+        ),
+      )
+      .orderBy(desc(messages.createdAt), desc(messages.id))
+      .limit(maxTurns);
+
+    const chronological = rows.slice().reverse();
+    const combined = chronological
+      .map((r) => String(r.content ?? '').trim())
+      .filter(Boolean)
+      .join('\n');
+
+    const q = capText(combined || input.fallback, maxChars).trim();
+    return q || input.fallback;
+  }
+
+  private async loadThreadHistoryForLlm(input: {
+    userId: number;
+    threadId: number;
+    maxMessages: number;
+    maxCharsPerMessage: number;
+  }): Promise<OpenAiChatMessage[]> {
+    const maxMessages = clampInt(input.maxMessages, 2, 60);
+    const maxChars = clampInt(input.maxCharsPerMessage, 200, 20_000);
+
+    const rows = await this.dbService.db
+      .select({
+        role: messages.role,
+        content: messages.content,
+        createdAt: messages.createdAt,
+        id: messages.id,
+      })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.userId, input.userId),
+          eq(messages.threadId, input.threadId),
+          inArray(messages.role, ['user', 'assistant']),
+        ),
+      )
+      .orderBy(desc(messages.createdAt), desc(messages.id))
+      .limit(maxMessages);
+
+    const chronological = rows.slice().reverse();
+
+    const out: OpenAiChatMessage[] = [];
+    for (const r of chronological) {
+      const role = r.role === 'user' ? 'user' : r.role === 'assistant' ? 'assistant' : null;
+      if (!role) continue;
+
+      const content = capText(String(r.content ?? ''), maxChars).trim();
+      if (!content) continue;
+
+      out.push({ role, content });
+    }
+
+    return out;
   }
 
   private async createThread(userId: number): Promise<number> {
@@ -139,7 +378,6 @@ export class ChatService {
   }): Promise<void> {
     const title = deriveThreadTitleFromPrompt(input.prompt);
 
-    // Update only if still "New thread" (prevents overwriting a user-provided/custom title)
     await this.dbService.db
       .update(threads)
       .set({ title, updatedAt: new Date() })
@@ -166,19 +404,10 @@ function deriveThreadTitleFromPrompt(prompt: string): string {
   const collapsed = firstNonEmptyLine.replace(/\s+/g, ' ').trim();
   if (!collapsed) return 'New thread';
 
-  // Keep it reasonably bounded for storage; UI truncation + hover handles display.
   return collapsed.length > 200 ? collapsed.slice(0, 200) : collapsed;
 }
 
-function buildSystemPrompt(input: {
-  instructions: string[];
-  citations: Array<{
-    title: string | null;
-    source: string;
-    sourceId: string;
-    chunkText: string;
-  }>;
-}): string {
+function buildSystemPrompt(input: { instructions: string[]; citations: ChatCitation[] }): string {
   const instructionsBlock = input.instructions.length
     ? `Ongoing instructions (memory):\n- ${input.instructions.join('\n- ')}\n\n`
     : '';
@@ -187,17 +416,256 @@ function buildSystemPrompt(input: {
     ? `Context (RAG excerpts):\n${input.citations
         .map((c, i) => {
           const label = `[${i + 1}] ${c.source} ${c.title ?? ''} (${c.sourceId})`.trim();
-          return `${label}\n${c.chunkText}`;
+          return `${label}\n${c.excerpt}`;
         })
         .join('\n\n')}\n\n`
     : 'Context (RAG excerpts):\n(no relevant excerpts found)\n\n';
 
   return (
     `You are an AI assistant for financial advisors.\n` +
-    `Use the provided context to answer accurately. If the context is insufficient, say so and ask a concise follow-up.\n` +
-    `When answering, be helpful and practical.\n\n` +
+    `Use the provided context to answer accurately.\n` +
+    `If the context is insufficient, say so and ask a concise follow-up question.\n` +
+    `Be helpful and practical.\n\n` +
     instructionsBlock +
     contextBlock +
-    `Return a clear answer.`
+    `Return a clear answer.\n`
   );
+}
+
+function toCitations(rows: RagSearchRow[], excerptMaxChars: number): ChatCitation[] {
+  const max = clampInt(excerptMaxChars, 120, 5000);
+
+  return rows.map((r) => ({
+    chunkId: r.chunkId,
+    documentId: r.documentId,
+    title: r.title ?? null,
+    source: r.source,
+    sourceId: r.sourceId,
+    excerpt: excerptText(r.chunkText, max),
+  }));
+}
+
+function toDebugCitations(rows: RagSearchRow[]): ChatDebugCitation[] {
+  return rows.map((r) => {
+    const distance = extractDistance(r);
+    const similarity = extractSimilarity(r, distance);
+
+    return {
+      chunkId: r.chunkId,
+      documentId: r.documentId,
+      similarity,
+      distance,
+    };
+  });
+}
+
+/**
+ * Rank rows best -> worst.
+ * Prefers semantic distance when present (lower distance = better),
+ * otherwise falls back to similarity-like scores when present (higher = better).
+ */
+function rankRowsBestToWorst(rows: RagSearchRow[]): RagSearchRow[] {
+  return rows.slice().sort((a, b) => compareRowsBestFirst(a, b));
+}
+
+/**
+ * Merge by chunkId but keep the "better" row when duplicates exist
+ * (important because expansions can find the same chunk via different retrieval paths).
+ */
+function mergeUniqueByChunkIdPreferBest(rows: RagSearchRow[]): RagSearchRow[] {
+  const m = new Map<number, RagSearchRow>();
+
+  for (const r of rows) {
+    const existing = m.get(r.chunkId);
+    if (!existing) {
+      m.set(r.chunkId, r);
+      continue;
+    }
+
+    // Replace if the new row is "better"
+    if (compareRowsBestFirst(r, existing) < 0) {
+      m.set(r.chunkId, r);
+    }
+  }
+
+  return Array.from(m.values());
+}
+
+function compareRowsBestFirst(a: RagSearchRow, b: RagSearchRow): number {
+  const ad = extractDistance(a);
+  const bd = extractDistance(b);
+
+  const aHasD = typeof ad === 'number';
+  const bHasD = typeof bd === 'number';
+
+  // Prefer semantic-scored rows (distance-based) over non-semantic rows
+  if (aHasD && !bHasD) return -1;
+  if (!aHasD && bHasD) return 1;
+
+  // Both semantic: lower distance is better
+  if (aHasD && bHasD) {
+    if (ad !== bd) return ad - bd;
+    // stable tie-breakers
+    return a.chunkId - b.chunkId;
+  }
+
+  const as = extractSimilarity(a, null);
+  const bs = extractSimilarity(b, null);
+
+  const aHasS = typeof as === 'number';
+  const bHasS = typeof bs === 'number';
+
+  // Prefer similarity-scored rows over unknown
+  if (aHasS && !bHasS) return -1;
+  if (!aHasS && bHasS) return 1;
+
+  // Both have similarity: higher is better
+  if (aHasS && bHasS) {
+    if (as !== bs) return bs - as;
+    return a.chunkId - b.chunkId;
+  }
+
+  // Fallback stable ordering
+  return a.chunkId - b.chunkId;
+}
+
+/**
+ * Extract a vector distance if present on RagSearchRow.
+ * We intentionally access as "any" because RagSearchRow shape can vary.
+ */
+function extractDistance(row: RagSearchRow): number | null {
+  const r = row as unknown as Record<string, unknown>;
+
+  const candidates = [r.distance, r.semanticDistance, r.vectorDistance, r.embeddingDistance];
+
+  for (const v of candidates) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+
+  return null;
+}
+
+/**
+ * Extract a similarity-like score if present.
+ * If we have distance, we also compute cosine-sim style value: similarity = 1 - distance
+ * (still useful for debugging even if the underlying metric differs).
+ */
+function extractSimilarity(row: RagSearchRow, distance: number | null): number | null {
+  const r = row as unknown as Record<string, unknown>;
+
+  const candidates = [
+    r.similarity,
+    r.score,
+    r.semanticSimilarity,
+    r.relevance,
+    r.hybridScore,
+    r.lexicalScore,
+    r.bm25Score,
+    r.rankScore,
+  ];
+
+  for (const v of candidates) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+
+  if (typeof distance === 'number' && Number.isFinite(distance)) {
+    return 1 - distance;
+  }
+
+  return null;
+}
+
+function excerptText(text: string, maxChars: number): string {
+  const max = clampInt(maxChars, 80, 5000);
+  const t = String(text ?? '').trim();
+  if (!t) return '';
+  if (t.length <= max) return t;
+  return t.slice(0, max).trim();
+}
+
+function readHistoryMaxMessages(): number {
+  const raw = Number(process.env.CHAT_HISTORY_MAX_MESSAGES ?? '16');
+  return Number.isFinite(raw) ? raw : 16;
+}
+
+function readHistoryMaxCharsPerMessage(): number {
+  const raw = Number(process.env.CHAT_HISTORY_MAX_CHARS ?? '2000');
+  return Number.isFinite(raw) ? raw : 2000;
+}
+
+function readSystemExcerptMaxChars(): number {
+  const raw = Number(process.env.RAG_SYSTEM_EXCERPT_MAX_CHARS ?? '650');
+  return Number.isFinite(raw) ? raw : 650;
+}
+
+function readSystemCitationsMax(): number {
+  const raw = Number(process.env.RAG_SYSTEM_CITATIONS_MAX ?? '40');
+  return Number.isFinite(raw) ? clampInt(raw, 1, 400) : 40;
+}
+
+// Debug citations stored on messages.meta (minimal only)
+function readDebugCitationsMax(): number {
+  const raw = Number(process.env.RAG_DEBUG_CITATIONS_MAX ?? '300');
+  return Number.isFinite(raw) ? clampInt(raw, 0, 5000) : 300;
+}
+
+function readRagStandardTake(): number {
+  const raw = Number(process.env.RAG_STANDARD_TAKE ?? '200');
+  return Number.isFinite(raw) ? clampInt(raw, 10, 5000) : 200;
+}
+
+function readRagBulkTake(): number {
+  const raw = Number(process.env.RAG_BULK_TAKE ?? '1200');
+  return Number.isFinite(raw) ? clampInt(raw, 50, 5000) : 1200;
+}
+
+function readRagSemanticCandidates(): number {
+  const raw = Number(process.env.RAG_SEMANTIC_CANDIDATES ?? '800');
+  return Number.isFinite(raw) ? clampInt(raw, 50, 5000) : 800;
+}
+
+function readRagLexicalCandidates(): number {
+  const raw = Number(process.env.RAG_LEXICAL_CANDIDATES ?? '800');
+  return Number.isFinite(raw) ? clampInt(raw, 50, 5000) : 800;
+}
+
+function readRagQueryUserTurns(): number {
+  const raw = Number(process.env.RAG_QUERY_USER_TURNS ?? '5');
+  return Number.isFinite(raw) ? clampInt(raw, 1, 12) : 5;
+}
+
+function readRagQueryMaxChars(): number {
+  const raw = Number(process.env.RAG_QUERY_MAX_CHARS ?? '4000');
+  return Number.isFinite(raw) ? clampInt(raw, 200, 20_000) : 4000;
+}
+
+function readDisablePlanner(): boolean {
+  return String(process.env.RAG_DISABLE_PLANNER ?? '').trim() === '1';
+}
+
+function clampInt(n: number, min: number, max: number): number {
+  if (!Number.isFinite(n)) return min;
+  const x = Math.trunc(n);
+  if (x < min) return min;
+  if (x > max) return max;
+  return x;
+}
+
+function capText(s: string, maxLen: number): string {
+  const t = (s ?? '').trim();
+  if (!t) return '';
+  return t.length > maxLen ? t.slice(0, maxLen) : t;
+}
+
+function safeJson(text: string): unknown {
+  if (!text) return {};
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return {};
+  }
+}
+
+function isRecord(x: unknown): x is Record<string, unknown> {
+  return typeof x === 'object' && x !== null && !Array.isArray(x);
 }

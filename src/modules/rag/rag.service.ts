@@ -7,6 +7,22 @@ import { OpenAiEmbeddingsService } from './openai-embeddings.service';
 
 type Chunk = { text: string; meta: { start: number; end: number } };
 
+export type RagSearchRow = {
+  chunkId: number;
+  documentId: number;
+  title: string | null;
+  source: string;
+  sourceId: string;
+  chunkText: string;
+  distance: number | null;
+};
+
+type RankedRow = RagSearchRow & {
+  rrfScore: number;
+  titleTermHits: number;
+  bodyTermHits: number;
+};
+
 @Injectable()
 export class RagService {
   constructor(
@@ -14,9 +30,6 @@ export class RagService {
     private readonly embeddings: OpenAiEmbeddingsService,
   ) {}
 
-  /**
-   * Basic overlapping char chunker.
-   */
   chunkText(
     input: string,
     opts?: { chunkSize?: number; overlap?: number; maxChunks?: number },
@@ -34,41 +47,25 @@ export class RagService {
     while (start < text.length && out.length < maxChunks) {
       let end = Math.min(start + chunkSize, text.length);
 
-      // Try to avoid splitting in the middle of a word if we can.
       if (end < text.length) {
         const windowStart = Math.max(start, end - 200);
         const slice = text.slice(windowStart, end);
         const lastSpace = Math.max(slice.lastIndexOf('\n'), slice.lastIndexOf(' '));
-        if (lastSpace > 40) {
-          end = windowStart + lastSpace;
-        }
+        if (lastSpace > 40) end = windowStart + lastSpace;
       }
 
-      if (end <= start) {
-        // Safety to avoid infinite loop
-        end = Math.min(start + chunkSize, text.length);
-      }
+      if (end <= start) end = Math.min(start + chunkSize, text.length);
 
       const chunk = text.slice(start, end).trim();
-      if (chunk) {
-        out.push({ text: chunk, meta: { start, end } });
-      }
+      if (chunk) out.push({ text: chunk, meta: { start, end } });
 
       if (end >= text.length) break;
-
       start = Math.max(0, end - overlap);
     }
 
     return out;
   }
 
-  /**
-   * Rebuilds chunks for all documents for a user (or a subset).
-   * Deletes existing chunks for each document and recreates them.
-   *
-   * IMPORTANT: Now idempotent — if the document text hash + chunk params match, we skip rebuild
-   * to avoid re-embedding unchanged docs (saves budget).
-   */
   async rebuildChunksForUser(input: {
     userId: number;
     documentIds?: number[];
@@ -110,21 +107,17 @@ export class RagService {
           ),
         );
 
-      for (const row of firstChunks) {
-        firstChunkMetaByDocId.set(row.documentId, row.meta);
-      }
+      for (const row of firstChunks) firstChunkMetaByDocId.set(row.documentId, row.meta);
     }
 
     let chunksInserted = 0;
 
-    // Keep the chunking params stable (so our "up-to-date" check is meaningful).
     const chunkSize = 900;
     const overlap = 120;
 
     for (const d of docs) {
       const docText = (d.text ?? '').trim();
       if (!docText) {
-        // still wipe existing chunks if doc became empty
         await this.dbService.db.delete(documentChunks).where(eq(documentChunks.documentId, d.id));
         continue;
       }
@@ -136,7 +129,6 @@ export class RagService {
       const existingChunkSize = readMetaNumber(existingMeta, 'chunkSize');
       const existingOverlap = readMetaNumber(existingMeta, 'overlap');
 
-      // If unchanged + same chunk settings, skip rebuild entirely.
       if (
         existingHash &&
         existingHash === docHash &&
@@ -148,9 +140,7 @@ export class RagService {
 
       const chunks = this.chunkText(docText, { chunkSize, overlap });
 
-      // Wipe existing chunks
       await this.dbService.db.delete(documentChunks).where(eq(documentChunks.documentId, d.id));
-
       if (chunks.length === 0) continue;
 
       const rows = chunks.map((c, idx) => ({
@@ -180,10 +170,6 @@ export class RagService {
     return { documentsProcessed: docs.length, chunksInserted };
   }
 
-  /**
-   * Embeds chunks missing embeddings for a user.
-   * If documentIds is provided, only embeds chunks belonging to those documents (prevents huge surprise bills).
-   */
   async embedMissingChunksForUser(input: {
     userId: number;
     batchSize?: number;
@@ -199,10 +185,7 @@ export class RagService {
       return { chunksEmbedded: 0, modelUsed: this.embeddings.isConfigured() ? 'unknown' : null };
     }
 
-    if (!this.embeddings.isConfigured()) {
-      // Still “functional”: you can chunk + keyword search, but semantic search won’t work.
-      return { chunksEmbedded: 0, modelUsed: null };
-    }
+    if (!this.embeddings.isConfigured()) return { chunksEmbedded: 0, modelUsed: null };
 
     let chunksEmbedded = 0;
     let modelUsed: string | null = null;
@@ -212,10 +195,7 @@ export class RagService {
         eq(documentChunks.userId, userId),
         sql`${documentChunks.embedding} IS NULL`,
       ];
-
-      if (documentIds) {
-        conditions.push(inArray(documentChunks.documentId, documentIds));
-      }
+      if (documentIds) conditions.push(inArray(documentChunks.documentId, documentIds));
 
       const batch = await this.dbService.db
         .select({
@@ -234,42 +214,110 @@ export class RagService {
       for (let i = 0; i < batch.length; i += 1) {
         await this.dbService.db
           .update(documentChunks)
-          .set({
-            embedding: vectors[i],
-            embeddingModel: model,
-          })
+          .set({ embedding: vectors[i], embeddingModel: model })
           .where(eq(documentChunks.id, batch[i].id));
       }
 
       chunksEmbedded += batch.length;
-
-      // dev safety cap
       if (chunksEmbedded >= 5000) break;
     }
 
     return { chunksEmbedded, modelUsed };
   }
 
-  /**
-   * Semantic search (falls back to keyword search if embeddings not configured).
-   */
-  async search(input: { userId: number; query: string; k?: number }): Promise<
-    Array<{
-      chunkId: number;
-      documentId: number;
-      title: string | null;
-      source: string;
-      sourceId: string;
-      chunkText: string;
-      distance: number | null;
-    }>
-  > {
+  async searchHybrid(input: {
+    userId: number;
+    query: string;
+    take?: number;
+    semanticCandidates?: number;
+    lexicalCandidates?: number;
+  }): Promise<RagSearchRow[]> {
+    const userId = input.userId;
+    const q = (input.query ?? '').trim();
+    if (!q) return [];
+
+    const take = clampInt(input.take ?? 25, 1, 5000);
+    const semanticCandidates = clampInt(input.semanticCandidates ?? 300, 1, 5000);
+    const lexicalCandidates = clampInt(input.lexicalCandidates ?? 300, 1, 5000);
+
+    const terms = extractQueryTerms(q, 12);
+
+    const semantic = await this.semanticCandidates(userId, q, semanticCandidates);
+    const fts = await this.fullTextCandidates(userId, q, lexicalCandidates);
+    const ilike =
+      fts.length === 0 && terms.length > 0 ? await this.ilikeCandidates(userId, terms, 200) : [];
+
+    const semanticRank = buildRankMap(semantic);
+    const ftsRank = buildRankMap(fts);
+    const ilikeRank = buildRankMap(ilike);
+
+    const combined = new Map<number, RagSearchRow>();
+    for (const r of semantic) combined.set(r.chunkId, r);
+    for (const r of fts) if (!combined.has(r.chunkId)) combined.set(r.chunkId, r);
+    for (const r of ilike) if (!combined.has(r.chunkId)) combined.set(r.chunkId, r);
+
+    const rrfK = 60;
+    const scored: RankedRow[] = [];
+
+    for (const r of combined.values()) {
+      const sRank = semanticRank.get(r.chunkId);
+      const fRank = ftsRank.get(r.chunkId);
+      const iRank = ilikeRank.get(r.chunkId);
+
+      let rrfScore = 0;
+      if (typeof sRank === 'number') rrfScore += 1 / (rrfK + sRank);
+      if (typeof fRank === 'number') rrfScore += 1 / (rrfK + fRank);
+      if (typeof iRank === 'number') rrfScore += 1 / (rrfK + iRank);
+
+      const title = (r.title ?? '').toLowerCase();
+      const body = (r.chunkText ?? '').toLowerCase();
+
+      let titleTermHits = 0;
+      let bodyTermHits = 0;
+
+      for (const t of terms) {
+        if (title.includes(t)) titleTermHits += 1;
+        if (body.includes(t)) bodyTermHits += 1;
+      }
+
+      scored.push({ ...r, rrfScore, titleTermHits, bodyTermHits });
+    }
+
+    scored.sort((a, b) => {
+      if (b.rrfScore !== a.rrfScore) return b.rrfScore - a.rrfScore;
+      if (b.titleTermHits !== a.titleTermHits) return b.titleTermHits - a.titleTermHits;
+      if (b.bodyTermHits !== a.bodyTermHits) return b.bodyTermHits - a.bodyTermHits;
+
+      const ad = a.distance;
+      const bd = b.distance;
+
+      const aHas = typeof ad === 'number' && Number.isFinite(ad);
+      const bHas = typeof bd === 'number' && Number.isFinite(bd);
+
+      if (aHas && bHas) return ad - bd;
+      if (aHas && !bHas) return -1;
+      if (!aHas && bHas) return 1;
+
+      return a.chunkId - b.chunkId;
+    });
+
+    return scored.slice(0, take).map((r) => ({
+      chunkId: r.chunkId,
+      documentId: r.documentId,
+      title: r.title,
+      source: r.source,
+      sourceId: r.sourceId,
+      chunkText: r.chunkText,
+      distance: r.distance,
+    }));
+  }
+
+  async search(input: { userId: number; query: string; k?: number }): Promise<RagSearchRow[]> {
     const userId = input.userId;
     const q = (input.query ?? '').trim();
     const k = clampInt(input.k ?? 10, 1, 25);
     if (!q) return [];
 
-    // Fallback: keyword search
     if (!this.embeddings.isConfigured()) {
       const rows = await this.dbService.db
         .select({
@@ -295,8 +343,6 @@ export class RagService {
 
     const { vector } = await this.embeddings.embedOne(q);
     const vectorLiteral = `[${vector.join(',')}]`;
-
-    // cosine distance: embedding <=> query_vector
     const distanceExpr = sql<number>`${documentChunks.embedding} <=> ${vectorLiteral}::vector`;
 
     const rows = await this.dbService.db
@@ -317,6 +363,120 @@ export class RagService {
 
     return rows;
   }
+
+  private async semanticCandidates(
+    userId: number,
+    query: string,
+    k: number,
+  ): Promise<RagSearchRow[]> {
+    if (!this.embeddings.isConfigured()) return [];
+
+    const { vector } = await this.embeddings.embedOne(query);
+    const vectorLiteral = `[${vector.join(',')}]`;
+    const distanceExpr = sql<number>`${documentChunks.embedding} <=> ${vectorLiteral}::vector`;
+
+    const rows = await this.dbService.db
+      .select({
+        chunkId: documentChunks.id,
+        documentId: documents.id,
+        title: documents.title,
+        source: documents.source,
+        sourceId: documents.sourceId,
+        chunkText: documentChunks.text,
+        distance: distanceExpr,
+      })
+      .from(documentChunks)
+      .innerJoin(documents, eq(documentChunks.documentId, documents.id))
+      .where(and(eq(documentChunks.userId, userId), isNotNull(documentChunks.embedding)))
+      .orderBy(distanceExpr)
+      .limit(k);
+
+    return rows;
+  }
+
+  private async fullTextCandidates(
+    userId: number,
+    query: string,
+    k: number,
+  ): Promise<RagSearchRow[]> {
+    const q = (query ?? '').trim();
+    if (!q) return [];
+
+    const vectorExpr = sql`to_tsvector('simple', coalesce(${documents.title}, '') || ' ' || ${documentChunks.text})`;
+    const queryExpr = sql`plainto_tsquery('simple', ${q})`;
+    const rankExpr = sql<number>`ts_rank_cd(${vectorExpr}, ${queryExpr})`;
+
+    const rows = await this.dbService.db
+      .select({
+        chunkId: documentChunks.id,
+        documentId: documents.id,
+        title: documents.title,
+        source: documents.source,
+        sourceId: documents.sourceId,
+        chunkText: documentChunks.text,
+        rank: rankExpr,
+      })
+      .from(documentChunks)
+      .innerJoin(documents, eq(documentChunks.documentId, documents.id))
+      .where(and(eq(documentChunks.userId, userId), sql`${vectorExpr} @@ ${queryExpr}`))
+      .orderBy(sql`${rankExpr} DESC`)
+      .limit(k);
+
+    return rows.map((r) => ({
+      chunkId: r.chunkId,
+      documentId: r.documentId,
+      title: r.title,
+      source: r.source,
+      sourceId: r.sourceId,
+      chunkText: r.chunkText,
+      distance: null,
+    }));
+  }
+
+  private async ilikeCandidates(
+    userId: number,
+    terms: string[],
+    k: number,
+  ): Promise<RagSearchRow[]> {
+    if (terms.length === 0) return [];
+
+    const likeClauses = terms.map((t) => {
+      const pat = `%${t}%`;
+      return sql`(${documentChunks.text} ILIKE ${pat} OR ${documents.title} ILIKE ${pat})`;
+    });
+
+    const whereLike = sql`(${sql.join(likeClauses, sql` OR `)})`;
+
+    const rows = await this.dbService.db
+      .select({
+        chunkId: documentChunks.id,
+        documentId: documents.id,
+        title: documents.title,
+        source: documents.source,
+        sourceId: documents.sourceId,
+        chunkText: documentChunks.text,
+      })
+      .from(documentChunks)
+      .innerJoin(documents, eq(documentChunks.documentId, documents.id))
+      .where(and(eq(documentChunks.userId, userId), whereLike))
+      .limit(k);
+
+    return rows.map((r) => ({
+      chunkId: r.chunkId,
+      documentId: r.documentId,
+      title: r.title,
+      source: r.source,
+      sourceId: r.sourceId,
+      chunkText: r.chunkText,
+      distance: null,
+    }));
+  }
+}
+
+function buildRankMap(rows: RagSearchRow[]): Map<number, number> {
+  const m = new Map<number, number>();
+  for (let i = 0; i < rows.length; i += 1) m.set(rows[i].chunkId, i + 1);
+  return m;
 }
 
 function clampInt(n: number, min: number, max: number): number {
@@ -345,4 +505,78 @@ function readMetaNumber(meta: unknown, key: string): number | null {
   if (!isRecord(meta)) return null;
   const v = meta[key];
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+function extractQueryTerms(input: string, maxTerms: number): string[] {
+  const raw = (input ?? '').toLowerCase();
+  const cleaned = raw.replace(/[^a-z0-9]+/g, ' ');
+
+  const parts = cleaned
+    .split(' ')
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const stop = new Set([
+    'the',
+    'a',
+    'an',
+    'and',
+    'or',
+    'to',
+    'of',
+    'in',
+    'for',
+    'on',
+    'at',
+    'is',
+    'are',
+    'was',
+    'were',
+    'be',
+    'been',
+    'being',
+    'with',
+    'it',
+    'this',
+    'that',
+    'i',
+    'me',
+    'my',
+    'you',
+    'your',
+    'we',
+    'our',
+    'they',
+    'their',
+    'them',
+    'he',
+    'she',
+    'his',
+    'her',
+    'as',
+    'by',
+    'from',
+    'do',
+    'does',
+    'did',
+    'will',
+    'would',
+    'could',
+    'should',
+    'can',
+  ]);
+
+  const unique: string[] = [];
+  const seen = new Set<string>();
+
+  for (const p of parts) {
+    if (unique.length >= maxTerms) break;
+    if (p.length < 3) continue;
+    if (stop.has(p)) continue;
+    if (seen.has(p)) continue;
+    seen.add(p);
+    unique.push(p);
+  }
+
+  return unique;
 }

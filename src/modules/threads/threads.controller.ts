@@ -10,7 +10,6 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import type { Request } from 'express';
-import type { JsonValue } from './threads.service';
 import { ThreadsService } from './threads.service';
 
 @Controller('/api/threads')
@@ -64,7 +63,6 @@ export class ThreadsController {
       role: string;
       content: string;
       createdAt: string;
-      meta: JsonValue | null;
     }[];
   }> {
     const userId = req.session.userId;

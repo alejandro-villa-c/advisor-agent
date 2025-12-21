@@ -5,14 +5,17 @@
     <div class="panel" data-thread-id="<%= threadId %>">
       <header class="panel__header">
         <h1 class="panel__title">Ask Anything</h1>
-        <!-- Mobile close -->
         <a class="icon-btn" href="/threads" aria-label="Close">✕</a>
       </header>
 
       <div class="panel__tabs">
         <div class="tabs">
-          <button class="tab tab--active" type="button">Chat</button>
-          <button class="tab" type="button">History</button>
+          <div class="tabs__left">
+            <button class="tab tab--active" type="button">Chat</button>
+            <button class="tab" type="button">History</button>
+          </div>
+
+          <button class="btn btn--primary" type="button" data-new-thread>+ New thread</button>
         </div>
       </div>
 

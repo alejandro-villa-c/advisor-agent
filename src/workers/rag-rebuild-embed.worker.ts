@@ -6,6 +6,7 @@ import { RAG_REBUILD_EMBED_JOB } from '../jobs/job.constants';
 export type RagRebuildEmbedJobData = {
   userId: number;
   embedBatchSize?: number; // default 64
+  documentIds?: number[];
 };
 
 type PgBossJob<T> = {
@@ -69,6 +70,7 @@ export class RagRebuildEmbedWorker implements OnModuleInit {
     const embedded = await this.rag.embedMissingChunksForUser({
       userId,
       batchSize: embedBatchSize,
+      documentIds: job.data.documentIds,
     });
 
     this.logger.log(
