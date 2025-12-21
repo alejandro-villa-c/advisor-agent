@@ -37,7 +37,7 @@ body {
   grid-template-columns: 300px 1fr;
 }
 
-/* Sidebar */
+/* Sidebar - fixed height with scrollable history */
 .sidebar {
   background: var(--sidebar);
   border-right: 1px solid var(--border);
@@ -46,9 +46,12 @@ body {
   flex-direction: column;
   gap: 14px;
   min-width: 0;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar__brand {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -73,6 +76,7 @@ body {
 }
 
 .sidebar__section-title {
+  flex-shrink: 0;
   margin-top: 6px;
   color: var(--muted);
   font-size: 12px;
@@ -80,18 +84,27 @@ body {
   text-transform: uppercase;
 }
 
+/* Primary nav - doesn't scroll */
 .sidebar__threads {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  overflow: auto;
   padding-right: 4px;
+  flex-shrink: 0;
+}
+
+/* History threads - scrollable */
+.sidebar__threads[data-threads-history] {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  flex-shrink: 1;
 }
 
 .thread-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
 }
 
@@ -141,6 +154,7 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Delete button - sidebar */
 .thread-delete {
   appearance: none;
   border: 1px solid var(--border);
@@ -152,15 +166,28 @@ body {
   color: var(--muted);
   display: grid;
   place-items: center;
-  flex: 0 0 auto;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
 }
 
 .thread-delete:hover {
-  background: rgba(0, 0, 0, 0.03);
-  color: var(--text);
+  background: #fee2e2;
+  border-color: #fecaca;
+  color: #dc2626;
 }
 
+.thread-delete:active {
+  background: #fecaca;
+}
+
+.thread-delete svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Sidebar footer - pinned to bottom */
 .sidebar__footer {
+  flex-shrink: 0;
   margin-top: auto;
   border-top: 1px solid var(--border);
   padding-top: 14px;
@@ -282,8 +309,6 @@ body {
   color: var(--muted);
   font-size: 16px;
   cursor: pointer;
-
-  /* Allow <a> tabs as well as <button> */
   text-decoration: none;
   display: inline-flex;
   align-items: center;
@@ -331,6 +356,8 @@ body {
   font-size: 18px;
   letter-spacing: -0.02em;
   line-height: 1.35;
+  display: flex;
+  flex-direction: column;
 }
 
 .msg--user .msg__text {
@@ -340,6 +367,21 @@ body {
 .msg__content {
   white-space: pre-wrap;
   overflow: auto;
+}
+
+/* Message timestamps */
+.msg__timestamp {
+  font-size: 11px;
+  color: var(--muted2);
+  margin-top: 8px;
+}
+
+.msg--user .msg__timestamp {
+  text-align: right;
+}
+
+.msg--assistant .msg__timestamp {
+  text-align: left;
 }
 
 /* Composer pinned at bottom */
@@ -374,7 +416,7 @@ body {
   outline: none;
   font-size: 18px;
   font-family: inherit;
-  padding: 6px 54px 8px 6px; /* room for send button */
+  padding: 6px 54px 8px 6px;
 }
 
 .send-btn {
@@ -423,7 +465,7 @@ body {
 
 /* Settings: mobile-only tabs row */
 .page-tabs {
-  display: none; /* desktop: sidebar exists */
+  display: none;
   margin-bottom: 14px;
 }
 
@@ -560,17 +602,19 @@ body {
   display: none;
 }
 
+/* Mobile threads page - fixed layout with scrollable history */
 .threads-page {
   height: 100%;
   min-height: 0;
-  overflow: auto;
   padding: 22px;
   display: flex;
   flex-direction: column;
   gap: 18px;
+  overflow: hidden;
 }
 
 .threads-page__header {
+  flex-shrink: 0;
   max-width: var(--content-max);
   margin: 0 auto;
   width: 100%;
@@ -609,6 +653,7 @@ body {
 }
 
 .threads-section-title {
+  flex-shrink: 0;
   max-width: var(--content-max);
   margin: 0 auto;
   width: 100%;
@@ -618,12 +663,22 @@ body {
   text-transform: uppercase;
 }
 
+/* Primary list (Settings link) - doesn't scroll */
 .threads-page__list {
+  flex-shrink: 0;
   max-width: var(--content-max);
   margin: 0 auto;
   width: 100%;
   display: grid;
   gap: 12px;
+}
+
+/* History list - scrollable */
+.threads-page__list[data-threads-list] {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  flex-shrink: 1;
 }
 
 .thread-card-row {
@@ -670,25 +725,39 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Delete button - mobile threads */
 .thread-card-delete {
   appearance: none;
   border: 1px solid var(--border);
   background: #fff;
-  width: 46px;
+  width: 52px;
   border-radius: 14px;
   cursor: pointer;
   color: var(--muted);
   display: grid;
   place-items: center;
-  flex: 0 0 auto;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
 }
 
 .thread-card-delete:hover {
-  background: rgba(0, 0, 0, 0.03);
-  color: var(--text);
+  background: #fee2e2;
+  border-color: #fecaca;
+  color: #dc2626;
 }
 
+.thread-card-delete:active {
+  background: #fecaca;
+}
+
+.thread-card-delete svg {
+  width: 20px;
+  height: 20px;
+}
+
+/* Mobile threads footer - pinned to bottom */
 .threads-page__footer {
+  flex-shrink: 0;
   margin-top: auto;
   max-width: var(--content-max);
   margin-left: auto;
@@ -788,10 +857,12 @@ body {
 
   .threads-mobile {
     display: block;
+    height: 100%;
   }
 
   .threads-page {
     padding: 18px 22px;
+    height: 100%;
   }
 
   .threads-page__header,
@@ -883,6 +954,7 @@ body {
   line-height: 1.4;
 }
 
+/* Thinking animation */
 .msg--thinking .msg__content {
   opacity: 0.75;
   font-style: italic;

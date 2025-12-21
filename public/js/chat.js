@@ -25,6 +25,41 @@
       .replaceAll("'", '&#039;');
   }
 
+  function formatTimestamp(dateString) {
+    const date = new Date(dateString);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / (1000 * 60));
+    const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+    const timeStr = date.toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
+
+    if (diffMins < 1) {
+      return 'Just now';
+    } else if (diffMins < 60) {
+      return `${diffMins}m ago`;
+    } else if (diffHours < 24 && date.getDate() === now.getDate()) {
+      return `Today at ${timeStr}`;
+    } else if (diffDays === 1 || (diffHours < 48 && date.getDate() === now.getDate() - 1)) {
+      return `Yesterday at ${timeStr}`;
+    } else if (diffDays < 7) {
+      const dayName = date.toLocaleDateString('en-US', { weekday: 'long' });
+      return `${dayName} at ${timeStr}`;
+    } else {
+      const dateStr = date.toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: date.getFullYear() !== now.getFullYear() ? 'numeric' : undefined,
+      });
+      return `${dateStr} at ${timeStr}`;
+    }
+  }
+
   async function fetchJson(url, options) {
     const res = await fetch(url, {
       headers: { 'Content-Type': 'application/json' },
@@ -59,9 +94,12 @@
       wrap.classList.add('msg--thinking');
     }
 
+    const timestamp = opts && opts.createdAt ? formatTimestamp(opts.createdAt) : formatTimestamp(new Date().toISOString());
+
     wrap.innerHTML = `
       <div class="msg__text">
         <div class="msg__content">${escapeHtml(text)}</div>
+        <div class="msg__timestamp">${escapeHtml(timestamp)}</div>
       </div>
     `;
 
@@ -71,7 +109,7 @@
   function renderMessage(role, text, opts) {
     // Skip empty messages
     if (!text || !text.trim()) return null;
-    
+
     const el = createMessageElement(role, text, opts);
     contentInner.appendChild(el);
     scrollToBottom();
@@ -82,8 +120,13 @@
     // Remove any existing thinking placeholder first
     removeThinkingPlaceholder();
 
-    thinkingElement = createMessageElement('assistant', 'Thinking', { isThinking: true });
-    thinkingElement.querySelector('.msg__content').classList.add('thinking-dots');
+    thinkingElement = document.createElement('div');
+    thinkingElement.className = 'msg msg--assistant msg--thinking';
+    thinkingElement.innerHTML = `
+      <div class="msg__text">
+        <div class="msg__content thinking-dots">Thinking</div>
+      </div>
+    `;
     contentInner.appendChild(thinkingElement);
     scrollToBottom();
   }
@@ -102,7 +145,7 @@
 
     const msgs = Array.isArray(data && data.messages) ? data.messages : [];
     for (const m of msgs) {
-      renderMessage(m.role, m.content);
+      renderMessage(m.role, m.content, { createdAt: m.createdAt });
     }
 
     scrollToBottom();
@@ -114,7 +157,7 @@
     isSending = true;
     updateSendState();
 
-    renderMessage('user', text);
+    renderMessage('user', text, { createdAt: new Date().toISOString() });
 
     textarea.value = '';
     textarea.focus();
@@ -131,7 +174,7 @@
       // If there's an immediate assistant response, render it
       if (response.assistant && response.assistant.content && response.assistant.content.trim()) {
         removeThinkingPlaceholder();
-        renderMessage('assistant', response.assistant.content);
+        renderMessage('assistant', response.assistant.content, { createdAt: new Date().toISOString() });
       }
       // Otherwise, messages will arrive via WebSocket
     } catch (err) {
@@ -139,6 +182,7 @@
       renderMessage(
         'assistant',
         `Error: ${err && err.message ? err.message : String(err)}`,
+        { createdAt: new Date().toISOString() }
       );
     } finally {
       isSending = false;
@@ -154,7 +198,7 @@
 
     socket.on('connect', () => {
       console.log('WebSocket connected');
-      
+
       // Register this socket for the user
       socket.emit('register', { threadId });
     });
@@ -165,18 +209,20 @@
 
     socket.on('new-message', (data) => {
       console.log('Received new message:', data);
-      
+
       // Only render if it's for the current thread
       if (data.threadId === threadId && data.message) {
         // Skip empty messages
         if (!data.message.content || !data.message.content.trim()) {
           return;
         }
-        
+
         // Remove thinking placeholder when first real message arrives
         removeThinkingPlaceholder();
-        
-        renderMessage(data.message.role, data.message.content);
+
+        renderMessage(data.message.role, data.message.content, {
+          createdAt: data.message.createdAt || new Date().toISOString(),
+        });
       }
     });
 
@@ -220,6 +266,7 @@
       renderMessage(
         'assistant',
         `Error loading messages: ${err && err.message ? err.message : String(err)}`,
+        { createdAt: new Date().toISOString() }
       );
     });
 

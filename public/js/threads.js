@@ -19,6 +19,34 @@
     return t.length > max ? `${t.slice(0, max - 1)}…` : t;
   }
 
+  function formatDate(dateString) {
+    if (!dateString) return 'No messages yet';
+    
+    const date = new Date(dateString);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 0) {
+      return 'Today';
+    } else if (diffDays === 1) {
+      return 'Yesterday';
+    } else if (diffDays < 7) {
+      return date.toLocaleDateString('en-US', { weekday: 'long' });
+    } else {
+      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    }
+  }
+
+  function getDeleteButtonSvg() {
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="3 6 5 6 21 6"></polyline>
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+      <line x1="10" y1="11" x2="10" y2="17"></line>
+      <line x1="14" y1="11" x2="14" y2="17"></line>
+    </svg>`;
+  }
+
   async function fetchJson(url, options) {
     const res = await fetch(url, {
       headers: { 'Content-Type': 'application/json' },
@@ -61,11 +89,7 @@
       .map((t) => {
         const fullTitle = t.displayTitle || t.title || 'New thread';
         const shownTitle = truncate(fullTitle, 40) || 'New thread';
-
-        const meta = t.lastMessageAt
-          ? new Date(t.lastMessageAt).toLocaleString()
-          : 'No messages yet';
-
+        const meta = formatDate(t.lastMessageAt || t.updatedAt);
         const isActive = activeThreadId && Number(activeThreadId) === Number(t.id);
 
         return `
@@ -74,7 +98,7 @@
                href="/chat?thread=${encodeURIComponent(t.id)}"
                title="${escapeHtml(fullTitle)}">
               <div class="thread__title">${escapeHtml(shownTitle)}</div>
-              <div class="thread__meta" title="${escapeHtml(meta)}">${escapeHtml(truncate(meta, 26))}</div>
+              <div class="thread__meta">${escapeHtml(meta)}</div>
             </a>
 
             <button
@@ -83,7 +107,7 @@
               aria-label="Delete thread"
               title="Delete thread"
               data-thread-delete="${escapeHtml(String(t.id))}">
-              🗑
+              ${getDeleteButtonSvg()}
             </button>
           </div>
         `;
@@ -100,7 +124,7 @@
         <div class="thread-card-row">
           <div class="thread-card" role="listitem" style="cursor: default; opacity: .75;">
             <div class="thread-card__title">No threads yet</div>
-            <div class="thread-card__meta">Tap “+ New thread” to start</div>
+            <div class="thread-card__meta">Tap "+ New thread" to start</div>
           </div>
         </div>
       `;
@@ -111,10 +135,7 @@
       .map((t) => {
         const fullTitle = t.displayTitle || t.title || 'New thread';
         const shownTitle = truncate(fullTitle, 44) || 'New thread';
-
-        const meta = t.lastMessageAt
-          ? `Last updated: ${new Date(t.lastMessageAt).toLocaleString()}`
-          : 'No messages yet';
+        const meta = formatDate(t.lastMessageAt || t.updatedAt);
 
         return `
           <div class="thread-card-row" role="listitem">
@@ -122,7 +143,7 @@
                href="/chat?thread=${encodeURIComponent(t.id)}"
                title="${escapeHtml(fullTitle)}">
               <div class="thread-card__title">${escapeHtml(shownTitle)}</div>
-              <div class="thread-card__meta" title="${escapeHtml(meta)}">${escapeHtml(truncate(meta, 52))}</div>
+              <div class="thread-card__meta">${escapeHtml(meta)}</div>
             </a>
 
             <button
@@ -131,7 +152,7 @@
               aria-label="Delete thread"
               title="Delete thread"
               data-thread-delete="${escapeHtml(String(t.id))}">
-              🗑
+              ${getDeleteButtonSvg()}
             </button>
           </div>
         `;
@@ -145,7 +166,6 @@
       if (!(el instanceof HTMLElement)) continue;
       el.dataset.busy = busy ? '1' : '0';
 
-      // Disable only if it's a real form control
       if (el instanceof HTMLButtonElement) {
         el.disabled = busy;
       }
@@ -209,14 +229,12 @@
           method: 'DELETE',
         });
 
-        // If user deleted the thread currently open in /chat, bounce to /threads.
         const activeThreadId = getActiveThreadIdFromUrl();
         if (window.location.pathname.startsWith('/chat') && activeThreadId === threadId) {
           window.location.href = '/threads';
           return;
         }
 
-        // Otherwise refresh lists in-place.
         const data = await fetchJson('/api/threads', { method: 'GET' });
         const threads = Array.isArray(data?.threads) ? data.threads : [];
         renderSidebarHistory(threads);
@@ -238,6 +256,8 @@
       renderSidebarHistory(threads);
       renderMobileThreadsList(threads);
     } catch (err) {
+      console.error('Failed to load threads:', err);
+      
       const host1 = document.querySelector('[data-threads-history]');
       if (host1) {
         host1.innerHTML = `
