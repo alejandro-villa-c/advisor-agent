@@ -547,3 +547,62 @@ export const calendarEvents = pgTable(
     ),
   }),
 );
+
+export const agentTaskStatusEnum = pgEnum('agent_task_status', [
+  'queued',
+  'running',
+  'waiting',
+  'completed',
+  'failed',
+]);
+
+export const agentTasks = pgTable('agent_tasks', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id').notNull(),
+
+  status: agentTaskStatusEnum('status').notNull().default('queued'),
+  goal: text('goal').notNull(),
+
+  // Agent memory / working state (LLM-visible)
+  memory: jsonb('memory').notNull().default({}),
+
+  // When waiting: { kind: 'gmail_reply', threadId: '...', fromEmail: '...', sinceIso: '...' }
+  waiting: jsonb('waiting'),
+
+  lastError: text('last_error'),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const agentTaskMessages = pgTable('agent_task_messages', {
+  id: serial('id').primaryKey(),
+  taskId: integer('task_id').notNull(),
+  userId: integer('user_id').notNull(),
+
+  // 'system' | 'user' | 'assistant' | 'tool'
+  role: text('role').notNull(),
+  content: text('content').notNull(),
+
+  // Tool message metadata (optional)
+  toolName: text('tool_name'),
+  toolCallId: text('tool_call_id'),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const agentTaskToolCalls = pgTable('agent_task_tool_calls', {
+  id: serial('id').primaryKey(),
+  taskId: integer('task_id').notNull(),
+  userId: integer('user_id').notNull(),
+
+  toolName: text('tool_name').notNull(),
+  toolCallId: text('tool_call_id').notNull(),
+
+  input: jsonb('input').notNull(),
+  output: jsonb('output'),
+  status: text('status').notNull(), // 'ok' | 'error' | 'await'
+  error: text('error'),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});

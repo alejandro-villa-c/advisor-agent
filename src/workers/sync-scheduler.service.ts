@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PgBossService } from '../jobs/pgboss.service';
-import { SYNC_TICK_JOB } from '../jobs/job.constants';
+import { AGENT_TICK_JOB, SYNC_TICK_JOB } from '../jobs/job.constants';
 
 @Injectable()
 export class SyncSchedulerService implements OnModuleInit {
@@ -10,15 +10,22 @@ export class SyncSchedulerService implements OnModuleInit {
 
   async onModuleInit(): Promise<void> {
     try {
-      // Schedule the job itself. pg-boss stores schedules in DB; re-calling is typically safe.
+      // Sync scheduler (existing)
       await this.pgBoss.client.schedule(SYNC_TICK_JOB, '*/10 * * * *', {});
       this.logger.log(`Scheduled ${SYNC_TICK_JOB} every 10 minutes`);
 
       await this.pgBoss.client.send(SYNC_TICK_JOB, { reason: 'startup' });
       this.logger.log(`Enqueued ${SYNC_TICK_JOB} immediately (startup)`);
+
+      // Agent tick scheduler (new)
+      await this.pgBoss.client.schedule(AGENT_TICK_JOB, '*/2 * * * *', {});
+      this.logger.log(`Scheduled ${AGENT_TICK_JOB} every 2 minutes`);
+
+      await this.pgBoss.client.send(AGENT_TICK_JOB, { reason: 'startup' });
+      this.logger.log(`Enqueued ${AGENT_TICK_JOB} immediately (startup)`);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(`Failed to schedule ${SYNC_TICK_JOB}: ${message}`);
+      this.logger.error(`Failed to schedule jobs: ${message}`);
     }
   }
 }

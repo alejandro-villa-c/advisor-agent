@@ -4,7 +4,11 @@ import { PgBossService } from '../jobs/pgboss.service';
 import { DbService } from '../db/db.service';
 import { documentChunks, documents, gmailMessages, integrationStates } from '../db/schema';
 import { GmailApiService } from '../modules/integrations/google/gmail-api.service';
-import { GMAIL_SYNC_MESSAGES_JOB, RAG_EMBED_DOCUMENTS_JOB } from '../jobs/job.constants';
+import {
+  AGENT_REACT_JOB,
+  GMAIL_SYNC_MESSAGES_JOB,
+  RAG_EMBED_DOCUMENTS_JOB,
+} from '../jobs/job.constants';
 
 export type GmailSyncJobData = {
   userId: number;
@@ -53,7 +57,7 @@ export class GmailSyncWorker implements OnModuleInit {
               `[${GMAIL_SYNC_MESSAGES_JOB}] FAILED job=${String(job.id)} userId=${job.data?.userId} ` +
                 (err instanceof Error ? err.stack : String(err)),
             );
-            throw err; // keep the job marked failed so pg-boss retry rules apply
+            throw err;
           }
         }
       },
@@ -127,11 +131,14 @@ export class GmailSyncWorker implements OnModuleInit {
     });
 
     const changedSourceIds: string[] = [];
+    const touchedThreadIds = new Set<string>();
 
     let processed = 0;
 
     for (const id of uniqueIds) {
       const msg = await this.gmailApi.getMessage(userId, id);
+
+      if (msg.threadId) touchedThreadIds.add(msg.threadId);
 
       const sentAt =
         typeof msg.internalDateMs === 'number' && Number.isFinite(msg.internalDateMs)
@@ -260,7 +267,7 @@ export class GmailSyncWorker implements OnModuleInit {
       },
     });
 
-    // Repair behavior: include docs that are missing chunks, even if unchanged
+    // Repair behavior: include docs that are missing chunkIndex=0, even if unchanged
     const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'gmail_email',
@@ -279,8 +286,17 @@ export class GmailSyncWorker implements OnModuleInit {
       ],
     });
 
+    // ✅ "gmailsyncworker query thing": wake agent waiting tasks for touched threads
+    const threads = Array.from(touchedThreadIds).filter(Boolean);
+    for (const batch of chunkArray(threads, 200)) {
+      await this.pgBossService.client.send(AGENT_REACT_JOB, {
+        userId,
+        gmailThreadIds: batch,
+      });
+    }
+
     this.logger.log(
-      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length}`,
+      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} touchedThreads=${threads.length}`,
     );
   }
 
@@ -358,17 +374,20 @@ export class GmailSyncWorker implements OnModuleInit {
         .from(documents)
         .leftJoin(
           documentChunks,
-          and(eq(documentChunks.userId, documents.userId), eq(documentChunks.documentId, documents.id)),
+          and(
+            eq(documentChunks.userId, documents.userId),
+            eq(documentChunks.documentId, documents.id),
+            eq(documentChunks.chunkIndex, 0),
+          ),
         )
         .where(
           and(
             eq(documents.userId, input.userId),
             eq(documents.source, input.source),
             inArray(documents.sourceId, chunk),
+            sql`${documentChunks.id} IS NULL`,
           ),
-        )
-        .groupBy(documents.id)
-        .having(sql`count(${documentChunks.id}) = 0`);
+        );
 
       for (const r of rows) out.push(r.id);
     }
@@ -431,12 +450,7 @@ function buildGmailQuery(input: {
     input.baseQuery?.trim() ||
     'in:inbox -in:spam -in:trash -in:chats';
 
-  const hasTime =
-    /\bnewer_than:\d+[dmy]\b/i.test(base) ||
-    /\bafter:\S+/i.test(base) ||
-    /\bbefore:\S+/i.test(base);
-
-  if (hasTime) return base;
+  if (hasTimeFilter(base)) return base;
 
   if (input.mode === 'initial') {
     const daysBack = clampInt(input.daysBack ?? 90, 1, 3650);
@@ -444,15 +458,22 @@ function buildGmailQuery(input: {
   }
 
   if (input.lastSyncedAt) {
-    const last = Date.parse(input.lastSyncedAt);
-    if (Number.isFinite(last)) {
-      const days = Math.ceil((Date.now() - last) / 86_400_000);
-      const newerThanDays = clampInt(days + 1, 1, 365);
-      return `${base} newer_than:${newerThanDays}d`;
+    const lastMs = Date.parse(input.lastSyncedAt);
+    if (Number.isFinite(lastMs)) {
+      const afterDate = new Date(lastMs - 86_400_000);
+      const after = formatGmailAfterDate(afterDate);
+      return `${base} after:${after}`;
     }
   }
 
   return `${base} newer_than:30d`;
+}
+
+function formatGmailAfterDate(d: Date): string {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}/${m}/${day}`;
 }
 
 function clampInt(n: number, min: number, max: number): number {
@@ -471,6 +492,7 @@ function capText(s: string, maxLen: number): string {
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
   const a = arr ?? [];
+  if (a.length === 0) return [];
   if (a.length <= size) return [a];
   const out: T[][] = [];
   for (let i = 0; i < a.length; i += size) out.push(a.slice(i, i + size));
@@ -478,5 +500,10 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
 }
 
 function hasTimeFilter(q: string): boolean {
-  return /\bnewer_than:\d+[dmy]\b/i.test(q) || /\bafter:\S+/i.test(q) || /\bbefore:\S+/i.test(q);
+  return (
+    /\bnewer_than:\d+[dmy]\b/i.test(q) ||
+    /\bolder_than:\d+[dmy]\b/i.test(q) ||
+    /\bafter:\S+/i.test(q) ||
+    /\bbefore:\S+/i.test(q)
+  );
 }

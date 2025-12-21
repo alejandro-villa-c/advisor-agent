@@ -4,6 +4,7 @@ import { PgBossService } from '../jobs/pgboss.service';
 import { DbService } from '../db/db.service';
 import { integrationStates, oauthAccounts } from '../db/schema';
 import {
+  AGENT_TICK_JOB,
   CALENDAR_SYNC_EVENTS_JOB,
   GMAIL_SYNC_MESSAGES_JOB,
   HUBSPOT_SYNC_CONTACTS_JOB,
@@ -59,6 +60,10 @@ export class SyncTickWorker implements OnModuleInit {
     const userIds = Array.from(byUser.keys());
     if (userIds.length === 0) {
       this.logger.log(`[${SYNC_TICK_JOB}] no connected users`);
+
+      // Still tick agent (waiting tasks can exist even if no integrations are connected now)
+      await this.pgBoss.client.send(AGENT_TICK_JOB, { reason: 'sync_tick_no_users' });
+
       return;
     }
 
@@ -124,6 +129,9 @@ export class SyncTickWorker implements OnModuleInit {
         }
       }
     }
+
+    // Backup agent tick (even though we separately schedule it every 2 min)
+    await this.pgBoss.client.send(AGENT_TICK_JOB, { reason: 'sync_tick' });
 
     this.logger.log(`[${SYNC_TICK_JOB}] done job=${String(job.id)} enqueued=${enqueued}`);
   }

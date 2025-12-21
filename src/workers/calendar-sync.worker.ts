@@ -4,7 +4,11 @@ import { PgBossService } from '../jobs/pgboss.service';
 import { DbService } from '../db/db.service';
 import { calendarEvents, documentChunks, documents, integrationStates } from '../db/schema';
 import { CalendarApiService } from '../modules/integrations/google/calendar-api.service';
-import { CALENDAR_SYNC_EVENTS_JOB, RAG_EMBED_DOCUMENTS_JOB } from '../jobs/job.constants';
+import {
+  AGENT_REACT_JOB,
+  CALENDAR_SYNC_EVENTS_JOB,
+  RAG_EMBED_DOCUMENTS_JOB,
+} from '../jobs/job.constants';
 
 export type CalendarSyncJobData = {
   userId: number;
@@ -52,7 +56,7 @@ export class CalendarSyncWorker implements OnModuleInit {
               `[${CALENDAR_SYNC_EVENTS_JOB}] FAILED job=${String(job.id)} userId=${job.data?.userId} ` +
                 (err instanceof Error ? err.stack : String(err)),
             );
-            throw err; // keep the job marked failed so pg-boss retry rules apply
+            throw err;
           }
         }
       },
@@ -230,7 +234,7 @@ export class CalendarSyncWorker implements OnModuleInit {
       },
     });
 
-    // Repair behavior: include docs that are missing chunks, even if unchanged
+    // Repair behavior: include docs that are missing chunkIndex=0, even if unchanged
     const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'calendar_event',
@@ -249,8 +253,17 @@ export class CalendarSyncWorker implements OnModuleInit {
       ],
     });
 
+    // Wake agent for calendar changes (future-proof; currently only gmail waiting is implemented)
+    const changed = Array.from(new Set(changedSourceIds)).filter(Boolean);
+    for (const batch of chunkArray(changed, 200)) {
+      await this.pgBossService.client.send(AGENT_REACT_JOB, {
+        userId,
+        calendarSourceIds: batch,
+      });
+    }
+
     this.logger.log(
-      `[${CALENDAR_SYNC_EVENTS_JOB}] done job=${String(job.id)} userId=${userId} processed=${processed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length}`,
+      `[${CALENDAR_SYNC_EVENTS_JOB}] done job=${String(job.id)} userId=${userId} processed=${processed} pages=${pages} changedDocs=${changed.length} repairedDocs=${repairDocIds.length}`,
     );
   }
 
@@ -331,6 +344,7 @@ export class CalendarSyncWorker implements OnModuleInit {
           and(
             eq(documentChunks.userId, documents.userId),
             eq(documentChunks.documentId, documents.id),
+            eq(documentChunks.chunkIndex, 0),
           ),
         )
         .where(
@@ -338,10 +352,9 @@ export class CalendarSyncWorker implements OnModuleInit {
             eq(documents.userId, input.userId),
             eq(documents.source, input.source),
             inArray(documents.sourceId, chunk),
+            sql`${documentChunks.id} IS NULL`,
           ),
-        )
-        .groupBy(documents.id)
-        .having(sql`count(${documentChunks.id}) = 0`);
+        );
 
       for (const r of rows) out.push(r.id);
     }
@@ -416,6 +429,7 @@ function capText(s: string, maxLen: number): string {
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
   const a = arr ?? [];
+  if (a.length === 0) return [];
   if (a.length <= size) return [a];
   const out: T[][] = [];
   for (let i = 0; i < a.length; i += size) out.push(a.slice(i, i + size));

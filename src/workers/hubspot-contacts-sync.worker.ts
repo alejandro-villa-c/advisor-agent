@@ -88,7 +88,6 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
       if (!nextAfter) break;
       after = nextAfter;
 
-      // safety cap
       if (page >= 50) {
         this.logger.warn(`[${HUBSPOT_SYNC_CONTACTS_JOB}] safety stop at page=${page}`);
         break;
@@ -116,7 +115,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
         },
       });
 
-    // 4) Enqueue embed for changed docs OR docs that are missing chunks (repair behavior)
+    // 4) Enqueue embed for changed docs OR docs that are missing chunkIndex=0 (repair behavior)
     const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
       userId,
       source: 'hubspot_contact',
@@ -316,6 +315,7 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
           and(
             eq(documentChunks.userId, documents.userId),
             eq(documentChunks.documentId, documents.id),
+            eq(documentChunks.chunkIndex, 0),
           ),
         )
         .where(
@@ -323,10 +323,9 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
             eq(documents.userId, input.userId),
             eq(documents.source, input.source),
             inArray(documents.sourceId, chunk),
+            sql`${documentChunks.id} IS NULL`,
           ),
-        )
-        .groupBy(documents.id)
-        .having(sql`count(${documentChunks.id}) = 0`);
+        );
 
       for (const r of rows) out.push(r.id);
     }

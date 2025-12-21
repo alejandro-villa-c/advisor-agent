@@ -1,6 +1,9 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PgBoss } from 'pg-boss';
 import {
+  AGENT_REACT_JOB,
+  AGENT_RUN_TASK_JOB,
+  AGENT_TICK_JOB,
   CALENDAR_SYNC_EVENTS_JOB,
   GMAIL_SYNC_MESSAGES_JOB,
   HUBSPOT_SYNC_CONTACTS_JOB,
@@ -44,6 +47,9 @@ export class PgBossService implements OnModuleInit, OnModuleDestroy {
       CALENDAR_SYNC_EVENTS_JOB,
       RAG_EMBED_DOCUMENTS_JOB,
       SYNC_TICK_JOB,
+      AGENT_TICK_JOB,
+      AGENT_REACT_JOB,
+      AGENT_RUN_TASK_JOB,
     ];
 
     for (const queueName of queues) {

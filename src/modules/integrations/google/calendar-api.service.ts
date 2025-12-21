@@ -12,6 +12,36 @@ export type CalendarEventSummary = {
   raw: unknown;
 };
 
+export type CalendarBusyInterval = { startIso: string; endIso: string };
+
+export type CalendarCreateEventInput = {
+  calendarId?: string; // default "primary"
+  summary: string;
+  description?: string;
+  location?: string;
+
+  startIso: string; // ISO dateTime
+  endIso: string; // ISO dateTime
+  timeZone?: string; // optional; if omitted Google infers
+
+  attendees?: Array<{ email: string; displayName?: string }>;
+};
+
+export type CalendarUpdateEventInput = {
+  calendarId?: string;
+  eventId: string;
+
+  summary?: string;
+  description?: string;
+  location?: string;
+
+  startIso?: string;
+  endIso?: string;
+  timeZone?: string;
+
+  attendees?: Array<{ email: string; displayName?: string }>;
+};
+
 @Injectable()
 export class CalendarApiService {
   private readonly baseUrl = 'https://www.googleapis.com/calendar/v3';
@@ -111,6 +141,139 @@ export class CalendarApiService {
 
     // If paging is needed, callers should use listEventsPage() loop.
     return first.events;
+  }
+
+  /**
+   * Free/Busy query.
+   *
+   * Requires OAuth scope:
+   * - https://www.googleapis.com/auth/calendar.readonly (or .events.readonly)
+   * If you already requested calendar read/write, you’re good.
+   */
+  async getBusyIntervals(
+    userId: number,
+    input: { calendarId?: string; timeMinIso: string; timeMaxIso: string; timeZone?: string },
+  ): Promise<CalendarBusyInterval[]> {
+    const calendarId = input.calendarId ?? 'primary';
+
+    const body: Record<string, unknown> = {
+      timeMin: input.timeMinIso,
+      timeMax: input.timeMaxIso,
+      items: [{ id: calendarId }],
+    };
+
+    if (input.timeZone?.trim()) body.timeZone = input.timeZone.trim();
+
+    const data = await this.calendarRequest(userId, 'POST', `/freeBusy`, body);
+
+    const calendars = readRecord(data, 'calendars');
+    const cal = calendars ? readRecord(calendars, calendarId) : null;
+    const busy = cal ? cal['busy'] : null;
+
+    const out: CalendarBusyInterval[] = [];
+    if (Array.isArray(busy)) {
+      for (const b of busy) {
+        if (!isRecord(b)) continue;
+        const start = typeof b.start === 'string' ? b.start : null;
+        const end = typeof b.end === 'string' ? b.end : null;
+        if (start && end) out.push({ startIso: start, endIso: end });
+      }
+    }
+
+    return out;
+  }
+
+  /**
+   * Create an event.
+   *
+   * Requires OAuth scope:
+   * - https://www.googleapis.com/auth/calendar.events
+   */
+  async createEvent(userId: number, input: CalendarCreateEventInput): Promise<{ id: string }> {
+    const calendarId = input.calendarId ?? 'primary';
+
+    const summary = (input.summary ?? '').trim();
+    if (!summary) throw new Error('Calendar: createEvent missing "summary"');
+
+    const body: Record<string, unknown> = {
+      summary,
+      ...(input.description?.trim() ? { description: input.description.trim() } : {}),
+      ...(input.location?.trim() ? { location: input.location.trim() } : {}),
+      start: input.timeZone?.trim()
+        ? { dateTime: input.startIso, timeZone: input.timeZone.trim() }
+        : { dateTime: input.startIso },
+      end: input.timeZone?.trim()
+        ? { dateTime: input.endIso, timeZone: input.timeZone.trim() }
+        : { dateTime: input.endIso },
+      ...(input.attendees && input.attendees.length > 0
+        ? {
+            attendees: input.attendees
+              .map((a) => ({
+                email: (a.email ?? '').trim(),
+                ...(a.displayName?.trim() ? { displayName: a.displayName.trim() } : {}),
+              }))
+              .filter((a) => Boolean(a.email)),
+          }
+        : {}),
+    };
+
+    const data = await this.calendarRequest(
+      userId,
+      'POST',
+      `/calendars/${encodeURIComponent(calendarId)}/events`,
+      body,
+    );
+
+    const id = readString(data, 'id');
+    if (!id) throw new Error('Calendar: createEvent succeeded but returned no id');
+
+    return { id };
+  }
+
+  /**
+   * Update an event (PATCH).
+   */
+  async updateEvent(userId: number, input: CalendarUpdateEventInput): Promise<{ id: string }> {
+    const calendarId = input.calendarId ?? 'primary';
+    const eventId = (input.eventId ?? '').trim();
+    if (!eventId) throw new Error('Calendar: updateEvent missing "eventId"');
+
+    const body: Record<string, unknown> = {};
+
+    if (typeof input.summary === 'string') body.summary = input.summary;
+    if (typeof input.description === 'string') body.description = input.description;
+    if (typeof input.location === 'string') body.location = input.location;
+
+    if (typeof input.startIso === 'string') {
+      body.start = input.timeZone?.trim()
+        ? { dateTime: input.startIso, timeZone: input.timeZone.trim() }
+        : { dateTime: input.startIso };
+    }
+
+    if (typeof input.endIso === 'string') {
+      body.end = input.timeZone?.trim()
+        ? { dateTime: input.endIso, timeZone: input.timeZone.trim() }
+        : { dateTime: input.endIso };
+    }
+
+    if (Array.isArray(input.attendees)) {
+      body.attendees = input.attendees
+        .map((a) => ({
+          email: (a.email ?? '').trim(),
+          ...(a.displayName?.trim() ? { displayName: a.displayName.trim() } : {}),
+        }))
+        .filter((a) => Boolean(a.email));
+    }
+
+    const data = await this.calendarRequest(
+      userId,
+      'PATCH',
+      `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
+      body,
+    );
+
+    const id = readString(data, 'id') ?? eventId;
+    return { id };
   }
 
   private async calendarRequest(

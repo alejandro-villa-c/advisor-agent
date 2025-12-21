@@ -95,7 +95,7 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
       changedSourceIds,
     });
 
-    // 2) NEW: “repair mode” — if any hubspot_note docs exist without chunks, force-queue embedding
+    // 2) “repair mode” — if any hubspot_note docs exist without chunks, force-queue embedding
     // This solves the "notes exist, but have 0 chunks forever" deadlock.
     const missingChunkDocIds = await this.findHubspotNoteDocumentIdsMissingChunks({ userId });
 

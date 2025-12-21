@@ -8,6 +8,7 @@ import { JobsModule } from './jobs/jobs.module';
 import { RagModule } from './modules/rag/rag.module';
 import { ChatModule } from './modules/chat/chat.module';
 import { ThreadsModule } from './modules/threads/threads.module';
+import { AgentModule } from './modules/agent/agent.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { ThreadsModule } from './modules/threads/threads.module';
     RagModule,
     ChatModule,
     ThreadsModule,
+    AgentModule,
   ],
 })
 export class AppModule {}

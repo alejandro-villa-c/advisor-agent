@@ -12,9 +12,13 @@ import { SyncSchedulerService } from './workers/sync-scheduler.service';
 import { SyncTickWorker } from './workers/sync-tick.worker';
 import { GmailSyncWorker } from './workers/gmail-sync.worker';
 import { CalendarSyncWorker } from './workers/calendar-sync.worker';
+import { AgentReactWorker } from './workers/agent-react.worker';
+import { AgentRunTaskWorker } from './workers/agent-run-task.worker';
+import { AgentTickWorker } from './workers/agent-tick.worker';
+import { AgentModule } from './modules/agent/agent.module';
 
 @Module({
-  imports: [DbModule, JobsModule, HubspotModule, RagModule, GoogleModule],
+  imports: [DbModule, JobsModule, HubspotModule, RagModule, GoogleModule, AgentModule],
   providers: [
     HubspotContactsSyncWorker,
     HubspotNotesSyncWorker,
@@ -23,6 +27,9 @@ import { CalendarSyncWorker } from './workers/calendar-sync.worker';
     RagEmbedWorker,
     SyncSchedulerService,
     SyncTickWorker,
+    AgentReactWorker,
+    AgentRunTaskWorker,
+    AgentTickWorker,
   ],
 })
 export class WorkerModule {}
