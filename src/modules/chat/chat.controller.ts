@@ -10,7 +10,7 @@ export class ChatController {
   async message(
     @Req() req: Request,
     @Body() body: { threadId?: number; content?: string },
-  ): Promise<{ threadId: number; assistant: { content: string } }> {
+  ): Promise<{ threadId: number; assistant: { content: string } | null }> {
     const userId = req.session.userId;
     if (!userId) throw new UnauthorizedException();
 
@@ -20,9 +20,10 @@ export class ChatController {
       text: String(body.content ?? ''),
     });
 
+    // Return null for assistant if empty (agent will respond via WebSocket)
     return {
       threadId: result.threadId,
-      assistant: { content: result.assistant },
+      assistant: result.assistant ? { content: result.assistant } : null,
     };
   }
 }

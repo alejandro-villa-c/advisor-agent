@@ -5,17 +5,43 @@ export type SchedulingIntent = {
   isSchedulingRequest: boolean;
   contactName: string | null;
   durationMinutes: number | null;
-  preferredTimeframe: string | null; // e.g., "next week", "tomorrow afternoon"
+  preferredTimeframe: string | null;
   confidence: number;
 };
 
 export type UserResponseIntent = {
-  type: 'approval' | 'rejection' | 'duration' | 'email' | 'other';
+  type:
+    | 'approval'
+    | 'rejection'
+    | 'duration'
+    | 'email'
+    | 'cancellation'
+    | 'change_contact'
+    | 'other';
   approved?: boolean;
   durationMinutes?: number;
   email?: string;
+  newContactName?: string;
   rawText: string;
   confidence: number;
+};
+
+export type FlowControlIntent = {
+  intent: 'continue' | 'cancel' | 'change_contact' | 'restart';
+  newContactName?: string;
+  reason?: string;
+  confidence: number;
+};
+
+export type ContactSelectionResult = {
+  needsClarification: boolean;
+  topCandidates: Array<{
+    displayName: string;
+    email: string | null;
+    source: 'hubspot' | 'gmail';
+    confidence: number;
+  }>;
+  reason?: string;
 };
 
 @Injectable()
@@ -29,7 +55,6 @@ export class AgentNlpService {
    * and extract relevant entities.
    */
   async parseSchedulingGoal(goal: string): Promise<SchedulingIntent> {
-    // Fast fallback if LLM not configured
     if (!this.llm.isConfigured()) {
       return this.parseSchedulingGoalHeuristic(goal);
     }
@@ -85,8 +110,96 @@ Be flexible with how people phrase requests. "Set up time with", "arrange a call
         confidence: typeof parsed.confidence === 'number' ? clamp01(parsed.confidence) : 0.5,
       };
     } catch (err) {
-      this.logger.warn(`parseSchedulingGoal LLM failed, using heuristic: ${err}`);
+      this.logger.warn(`parseSchedulingGoal LLM failed, using heuristic: ${String(err)}`);
       return this.parseSchedulingGoalHeuristic(goal);
+    }
+  }
+
+  /**
+   * Check if the user wants to cancel the current flow or change to a different contact.
+   * This should be called before processing any user response during a scheduling flow.
+   */
+  async parseFlowControlIntent(input: {
+    userMessage: string;
+    currentPhase: string;
+    currentContactName?: string;
+  }): Promise<FlowControlIntent> {
+    if (!this.llm.isConfigured()) {
+      return this.parseFlowControlHeuristic(input.userMessage);
+    }
+
+    const systemPrompt = `You are analyzing whether a user wants to continue, cancel, or change their current scheduling request.
+
+Current state:
+- Phase: ${input.currentPhase}
+- Contact being scheduled with: ${input.currentContactName || 'not yet selected'}
+
+Determine the user's intent. Return ONLY valid JSON matching this schema:
+{
+  "intent": "continue" | "cancel" | "change_contact" | "restart",
+  "newContactName": string | null (only if intent is "change_contact"),
+  "reason": string | null (brief explanation),
+  "confidence": number (0-1)
+}
+
+Guidelines:
+- "continue": User is providing information for the current flow (duration, approval, etc.)
+- "cancel": User explicitly wants to stop/cancel/abort the scheduling process
+- "change_contact": User wants to schedule with a different person instead
+- "restart": User wants to start over completely
+
+Examples:
+- "never mind" -> {"intent": "cancel", "newContactName": null, "reason": "User said never mind", "confidence": 0.9}
+- "cancel" -> {"intent": "cancel", "newContactName": null, "reason": "Explicit cancel", "confidence": 0.95}
+- "stop" -> {"intent": "cancel", "newContactName": null, "reason": "User said stop", "confidence": 0.9}
+- "forget it" -> {"intent": "cancel", "newContactName": null, "reason": "User wants to forget it", "confidence": 0.9}
+- "I don't want to schedule anymore" -> {"intent": "cancel", "newContactName": null, "reason": "User no longer wants to schedule", "confidence": 0.95}
+- "actually, schedule with Bob instead" -> {"intent": "change_contact", "newContactName": "Bob", "reason": "User wants different contact", "confidence": 0.95}
+- "wait, I meant John Smith not Jane" -> {"intent": "change_contact", "newContactName": "John Smith", "reason": "User correcting contact name", "confidence": 0.9}
+- "let's do Mike Johnson instead" -> {"intent": "change_contact", "newContactName": "Mike Johnson", "reason": "User changed mind on contact", "confidence": 0.95}
+- "start over" -> {"intent": "restart", "newContactName": null, "reason": "User wants to restart", "confidence": 0.9}
+- "30 minutes" -> {"intent": "continue", "newContactName": null, "reason": "User providing duration", "confidence": 0.95}
+- "yes" -> {"intent": "continue", "newContactName": null, "reason": "User confirming", "confidence": 0.95}
+- "looks good" -> {"intent": "continue", "newContactName": null, "reason": "User approving", "confidence": 0.95}
+- "no, find different times" -> {"intent": "continue", "newContactName": null, "reason": "User wants different times but still scheduling", "confidence": 0.85}
+- "their email is john@example.com" -> {"intent": "continue", "newContactName": null, "reason": "User providing email", "confidence": 0.95}
+
+Be careful to distinguish between:
+- Rejecting proposed times (intent: continue) vs canceling the whole process (intent: cancel)
+- Providing alternative preferences (intent: continue) vs wanting a different contact (intent: change_contact)`;
+
+    try {
+      const raw = await this.llm.complete({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: input.userMessage },
+        ],
+        temperature: 0.0,
+      });
+
+      const parsed = safeJsonParse(raw);
+      if (!isRecord(parsed)) {
+        return this.parseFlowControlHeuristic(input.userMessage);
+      }
+
+      const intent = ['continue', 'cancel', 'change_contact', 'restart'].includes(
+        String(parsed.intent),
+      )
+        ? (parsed.intent as FlowControlIntent['intent'])
+        : 'continue';
+
+      return {
+        intent,
+        newContactName:
+          typeof parsed.newContactName === 'string'
+            ? parsed.newContactName.trim() || undefined
+            : undefined,
+        reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
+        confidence: typeof parsed.confidence === 'number' ? clamp01(parsed.confidence) : 0.5,
+      };
+    } catch (err) {
+      this.logger.warn(`parseFlowControlIntent LLM failed, using heuristic: ${String(err)}`);
+      return this.parseFlowControlHeuristic(input.userMessage);
     }
   }
 
@@ -99,7 +212,6 @@ Be flexible with how people phrase requests. "Set up time with", "arrange a call
   }): Promise<UserResponseIntent> {
     const { userMessage, agentAskedFor } = input;
 
-    // Fast fallback if LLM not configured
     if (!this.llm.isConfigured()) {
       return this.parseUserResponseHeuristic(userMessage);
     }
@@ -119,29 +231,35 @@ Determine what the user is communicating and extract any relevant information.
 
 Return ONLY valid JSON matching this schema:
 {
-  "type": "approval" | "rejection" | "duration" | "email" | "other",
+  "type": "approval" | "rejection" | "duration" | "email" | "cancellation" | "change_contact" | "other",
   "approved": boolean | null (only for approval/rejection),
   "durationMinutes": number | null (only if user specified a duration),
   "email": string | null (only if user provided an email),
+  "newContactName": string | null (only if user wants to change contact),
   "confidence": number (0-1)
 }
 
 Examples when asked for approval:
-- "yes" -> {"type": "approval", "approved": true, "durationMinutes": null, "email": null, "confidence": 0.95}
-- "looks good, send it" -> {"type": "approval", "approved": true, "durationMinutes": null, "email": null, "confidence": 0.95}
-- "perfect, go ahead" -> {"type": "approval", "approved": true, "durationMinutes": null, "email": null, "confidence": 0.95}
-- "no, find different times" -> {"type": "rejection", "approved": false, "durationMinutes": null, "email": null, "confidence": 0.9}
-- "actually, can we do earlier in the day?" -> {"type": "rejection", "approved": false, "durationMinutes": null, "email": null, "confidence": 0.85}
+- "yes" -> {"type": "approval", "approved": true, "durationMinutes": null, "email": null, "newContactName": null, "confidence": 0.95}
+- "looks good, send it" -> {"type": "approval", "approved": true, "durationMinutes": null, "email": null, "newContactName": null, "confidence": 0.95}
+- "perfect, go ahead" -> {"type": "approval", "approved": true, "durationMinutes": null, "email": null, "newContactName": null, "confidence": 0.95}
+- "no, find different times" -> {"type": "rejection", "approved": false, "durationMinutes": null, "email": null, "newContactName": null, "confidence": 0.9}
+- "actually, can we do earlier in the day?" -> {"type": "rejection", "approved": false, "durationMinutes": null, "email": null, "newContactName": null, "confidence": 0.85}
+- "cancel this" -> {"type": "cancellation", "approved": null, "durationMinutes": null, "email": null, "newContactName": null, "confidence": 0.95}
+- "never mind" -> {"type": "cancellation", "approved": null, "durationMinutes": null, "email": null, "newContactName": null, "confidence": 0.9}
+- "schedule with Bob instead" -> {"type": "change_contact", "approved": null, "durationMinutes": null, "email": null, "newContactName": "Bob", "confidence": 0.95}
 
 Examples when asked for duration:
-- "30 minutes" -> {"type": "duration", "approved": null, "durationMinutes": 30, "email": null, "confidence": 0.95}
-- "about an hour" -> {"type": "duration", "approved": null, "durationMinutes": 60, "email": null, "confidence": 0.9}
-- "half an hour should be fine" -> {"type": "duration", "approved": null, "durationMinutes": 30, "email": null, "confidence": 0.9}
-- "let's do 45 min" -> {"type": "duration", "approved": null, "durationMinutes": 45, "email": null, "confidence": 0.95}
+- "30 minutes" -> {"type": "duration", "approved": null, "durationMinutes": 30, "email": null, "newContactName": null, "confidence": 0.95}
+- "about an hour" -> {"type": "duration", "approved": null, "durationMinutes": 60, "email": null, "newContactName": null, "confidence": 0.9}
+- "half an hour should be fine" -> {"type": "duration", "approved": null, "durationMinutes": 30, "email": null, "newContactName": null, "confidence": 0.9}
+- "let's do 45 min" -> {"type": "duration", "approved": null, "durationMinutes": 45, "email": null, "newContactName": null, "confidence": 0.95}
+- "forget it" -> {"type": "cancellation", "approved": null, "durationMinutes": null, "email": null, "newContactName": null, "confidence": 0.9}
 
 Examples when asked for email:
-- "sara@example.com" -> {"type": "email", "approved": null, "durationMinutes": null, "email": "sara@example.com", "confidence": 0.95}
-- "her email is jane.doe@company.org" -> {"type": "email", "approved": null, "durationMinutes": null, "email": "jane.doe@company.org", "confidence": 0.95}`;
+- "sara@example.com" -> {"type": "email", "approved": null, "durationMinutes": null, "email": "sara@example.com", "newContactName": null, "confidence": 0.95}
+- "her email is jane.doe@company.org" -> {"type": "email", "approved": null, "durationMinutes": null, "email": "jane.doe@company.org", "newContactName": null, "confidence": 0.95}
+- "I don't have it, cancel" -> {"type": "cancellation", "approved": null, "durationMinutes": null, "email": null, "newContactName": null, "confidence": 0.85}`;
 
     try {
       const raw = await this.llm.complete({
@@ -157,9 +275,15 @@ Examples when asked for email:
         return this.parseUserResponseHeuristic(userMessage);
       }
 
-      const type = ['approval', 'rejection', 'duration', 'email', 'other'].includes(
-        String(parsed.type),
-      )
+      const type = [
+        'approval',
+        'rejection',
+        'duration',
+        'email',
+        'cancellation',
+        'change_contact',
+        'other',
+      ].includes(String(parsed.type))
         ? (parsed.type as UserResponseIntent['type'])
         : 'other';
 
@@ -174,11 +298,15 @@ Examples when asked for email:
           typeof parsed.email === 'string' && parsed.email.includes('@')
             ? parsed.email.trim()
             : undefined,
+        newContactName:
+          typeof parsed.newContactName === 'string'
+            ? parsed.newContactName.trim() || undefined
+            : undefined,
         rawText: userMessage,
         confidence: typeof parsed.confidence === 'number' ? clamp01(parsed.confidence) : 0.5,
       };
     } catch (err) {
-      this.logger.warn(`parseUserResponse LLM failed, using heuristic: ${err}`);
+      this.logger.warn(`parseUserResponse LLM failed, using heuristic: ${String(err)}`);
       return this.parseUserResponseHeuristic(userMessage);
     }
   }
@@ -188,7 +316,6 @@ Examples when asked for email:
   private parseSchedulingGoalHeuristic(goal: string): SchedulingIntent {
     const g = String(goal ?? '').toLowerCase();
 
-    // Check if it's a scheduling request
     const schedulingVerbs = ['schedule', 'book', 'set up', 'arrange', 'find time', 'plan'];
     const meetingWords = ['meeting', 'call', 'chat', 'appointment', 'session', 'sync'];
 
@@ -209,10 +336,7 @@ Examples when asked for email:
       };
     }
 
-    // Extract contact name
     const contactName = this.extractContactNameHeuristic(goal);
-
-    // Extract duration
     const durationMinutes = this.extractDurationHeuristic(goal);
 
     return {
@@ -227,7 +351,6 @@ Examples when asked for email:
   private extractContactNameHeuristic(goal: string): string | null {
     const g = String(goal ?? '').trim();
 
-    // More flexible patterns
     const patterns = [
       /(?:schedule|book|set\s*up|arrange|plan)\s+(?:a\s+)?(?:meeting|call|chat|appointment|session|sync|time)\s+with\s+(.+?)(?:\s+for\s+\d|\s+at\s+|\s+on\s+|\s+next\s+|\s+tomorrow|\s+this\s+|$)/i,
       /(?:find\s+time|meet)\s+with\s+(.+?)(?:\s+for\s+\d|\s+at\s+|\s+on\s+|\s+next\s+|\s+tomorrow|\s+this\s+|$)/i,
@@ -250,15 +373,6 @@ Examples when asked for email:
   private extractDurationHeuristic(text: string): number | null {
     const s = String(text ?? '').toLowerCase();
 
-    // Patterns for duration
-    const patterns: Array<{ regex: RegExp; multiplier: number }> = [
-      { regex: /(\d+)\s*(?:minute|minutes|min|mins)\b/, multiplier: 1 },
-      { regex: /(\d+)\s*(?:hour|hours|hr|hrs)\b/, multiplier: 60 },
-      { regex: /half\s*(?:an\s*)?hour/, multiplier: 30 }, // Special case
-      { regex: /quarter\s*(?:of\s*an?\s*)?hour/, multiplier: 15 }, // Special case
-    ];
-
-    // Check for "half hour" first
     if (/half\s*(?:an\s*)?hour/.test(s)) {
       return 30;
     }
@@ -267,19 +381,97 @@ Examples when asked for email:
       return 15;
     }
 
-    for (const { regex, multiplier } of patterns) {
-      const m = s.match(regex);
-      if (m && m[1]) {
-        return Number(m[1]) * multiplier;
-      }
+    const minuteMatch = s.match(/(\d+)\s*(?:minute|minutes|min|mins)\b/);
+    if (minuteMatch) {
+      return Number(minuteMatch[1]);
+    }
+
+    const hourMatch = s.match(/(\d+)\s*(?:hour|hours|hr|hrs)\b/);
+    if (hourMatch) {
+      return Number(hourMatch[1]) * 60;
     }
 
     return null;
   }
 
+  private parseFlowControlHeuristic(userMessage: string): FlowControlIntent {
+    const s = String(userMessage ?? '')
+      .trim()
+      .toLowerCase();
+
+    // Check for cancellation
+    const cancelPatterns = [
+      /\b(cancel|stop|abort|quit|exit|nevermind|never\s*mind|forget\s*it|don'?t\s+bother)\b/,
+      /\b(i\s+don'?t\s+want\s+to|no\s+longer\s+want|not\s+anymore)\b/,
+    ];
+
+    for (const pattern of cancelPatterns) {
+      if (pattern.test(s)) {
+        return { intent: 'cancel', confidence: 0.8 };
+      }
+    }
+
+    // Check for change contact
+    const changePatterns = [
+      /(?:schedule|book|meet)\s+(?:with\s+)?(.+?)\s+instead/i,
+      /(?:actually|wait),?\s+(?:I\s+meant|schedule\s+with)\s+(.+)/i,
+      /(?:let'?s?\s+do|switch\s+to)\s+(.+?)\s+instead/i,
+    ];
+
+    for (const pattern of changePatterns) {
+      const match = userMessage.match(pattern);
+      if (match && match[1]) {
+        return {
+          intent: 'change_contact',
+          newContactName: match[1].trim(),
+          confidence: 0.75,
+        };
+      }
+    }
+
+    // Check for restart
+    if (/\b(start\s*over|restart|begin\s*again)\b/.test(s)) {
+      return { intent: 'restart', confidence: 0.8 };
+    }
+
+    // Default to continue
+    return { intent: 'continue', confidence: 0.7 };
+  }
+
   private parseUserResponseHeuristic(userMessage: string): UserResponseIntent {
     const s = String(userMessage ?? '').trim();
     const lower = s.toLowerCase();
+
+    // Check for cancellation first
+    const cancelPatterns = [/\b(cancel|stop|abort|quit|nevermind|never\s*mind|forget\s*it)\b/];
+
+    for (const pattern of cancelPatterns) {
+      if (pattern.test(lower)) {
+        return {
+          type: 'cancellation',
+          rawText: s,
+          confidence: 0.8,
+        };
+      }
+    }
+
+    // Check for change contact
+    const changePatterns = [
+      /(?:schedule|book|meet)\s+(?:with\s+)?(.+?)\s+instead/i,
+      /(?:actually|wait),?\s+(.+?)\s+instead/i,
+    ];
+
+    for (const pattern of changePatterns) {
+      const match = s.match(pattern);
+      if (match && match[1]) {
+        return {
+          type: 'change_contact',
+          newContactName: match[1].trim(),
+          rawText: s,
+          confidence: 0.75,
+        };
+      }
+    }
 
     // Check for email
     const emailMatch = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
@@ -336,8 +528,6 @@ Examples when asked for email:
       "doesn't work",
       "don't work",
       "won't work",
-      'cannot',
-      "can't",
     ];
 
     const hasApproval = approvalWords.some((w) => lower.includes(w));
@@ -367,12 +557,257 @@ Examples when asked for email:
       confidence: 0.3,
     };
   }
+
+  /**
+   * Use LLM to select the best contact match or determine if clarification is needed.
+   */
+  async selectBestContact(input: {
+    queryName: string;
+    candidates: Array<{
+      displayName: string;
+      email: string | null;
+      source: 'hubspot' | 'gmail';
+    }>;
+  }): Promise<ContactSelectionResult> {
+    if (input.candidates.length === 0) {
+      return { needsClarification: false, topCandidates: [] };
+    }
+
+    if (input.candidates.length === 1) {
+      return {
+        needsClarification: false,
+        topCandidates: [{ ...input.candidates[0], confidence: 0.9 }],
+      };
+    }
+
+    // Quick check: if we have multiple candidates with different emails, we likely need clarification
+    const uniqueEmails = new Set(
+      input.candidates.filter((c) => c.email).map((c) => c.email!.toLowerCase()),
+    );
+    const hasMultipleEmails = uniqueEmails.size > 1;
+
+    if (!this.llm.isConfigured()) {
+      return this.selectBestContactHeuristic(input, hasMultipleEmails);
+    }
+
+    const candidateList = input.candidates
+      .map(
+        (c, i) =>
+          `${i + 1}. "${c.displayName}" - email: ${c.email || 'none'} - source: ${c.source}`,
+      )
+      .join('\n');
+
+    this.logger.debug(
+      `selectBestContact: query="${input.queryName}", candidates:\n${candidateList}`,
+    );
+
+    const systemPrompt = `You are helping match a contact name to a list of candidates.
+
+The user is looking for: "${input.queryName}"
+
+Here are the candidates:
+${candidateList}
+
+Analyze the candidates and determine:
+1. If there's a SINGLE clear best match (name matches exactly and there's only one valid email)
+2. If multiple candidates could be the right person (ESPECIALLY if they have different emails), we MUST ask the user to clarify
+
+IMPORTANT: If there are multiple candidates with DIFFERENT email addresses that could match the query name, you MUST set needsClarification to true. The user needs to choose which email address to use.
+
+Return ONLY valid JSON matching this schema:
+{
+  "needsClarification": boolean,
+  "topCandidates": [
+    {
+      "index": number (1-based index from the list),
+      "confidence": number (0-1),
+      "reason": string
+    }
+  ],
+  "overallReason": string
+}
+
+Guidelines:
+- If there are 2+ candidates with different emails that match the name well, ALWAYS set needsClarification: true
+- noreply@ or automated emails should be ranked lower than personal emails
+- A "via GitHub" or "via Slack" display name suggests an automated notification, not a real contact
+- If one candidate is clearly a personal email (like john@gmail.com) and another is automated (noreply@github.com), prefer the personal one
+- But if there are multiple plausible personal emails, ask for clarification
+
+Examples:
+- Query "Angel Reyes", candidates ["Angel Reyes (angel@gmail.com)", "Angel Reyes via GitHub (noreply@github.com)"] -> needsClarification: false, pick the gmail one (noreply is clearly automated)
+- Query "Angel Reyes", candidates ["Angel Reyes (angel@gmail.com)", "Angel Reyes (angel.reyes@company.com)"] -> needsClarification: true (two valid personal emails)
+- Query "John", candidates ["John Doe (john@x.com)", "John Smith (johns@y.com)"] -> needsClarification: true (different people)
+- Query "Sara Smith", candidates ["Sara Smith (sara@x.com)", "Sarah Smithers (sarah@y.com)"] -> needsClarification: false, first is exact match`;
+
+    try {
+      const raw = await this.llm.complete({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Find the best match for: "${input.queryName}"` },
+        ],
+        temperature: 0.0,
+      });
+
+      this.logger.debug(`selectBestContact LLM response: ${raw}`);
+
+      const parsed = safeJsonParse(raw);
+      if (!isRecord(parsed)) {
+        return this.selectBestContactHeuristic(input, hasMultipleEmails);
+      }
+
+      const needsClarification = parsed.needsClarification === true;
+      const topCandidatesRaw = Array.isArray(parsed.topCandidates) ? parsed.topCandidates : [];
+
+      const topCandidates: ContactSelectionResult['topCandidates'] = [];
+
+      for (const tc of topCandidatesRaw) {
+        if (!isRecord(tc)) continue;
+        const index = typeof tc.index === 'number' ? tc.index : 0;
+        const confidence = typeof tc.confidence === 'number' ? clamp01(tc.confidence) : 0.5;
+
+        const candidate = input.candidates[index - 1];
+        if (!candidate) continue;
+
+        topCandidates.push({
+          displayName: candidate.displayName,
+          email: candidate.email,
+          source: candidate.source,
+          confidence,
+        });
+      }
+
+      // If LLM returned empty, fall back to heuristic
+      if (topCandidates.length === 0) {
+        return this.selectBestContactHeuristic(input, hasMultipleEmails);
+      }
+
+      // Safety check: if we have multiple different emails and LLM said no clarification needed,
+      // but the top candidates have different emails, override and ask for clarification
+      if (!needsClarification && topCandidates.length > 1) {
+        const topEmails = new Set(
+          topCandidates.filter((c) => c.email).map((c) => c.email!.toLowerCase()),
+        );
+        if (topEmails.size > 1) {
+          this.logger.debug(
+            'selectBestContact: LLM said no clarification but multiple different emails in top candidates, forcing clarification',
+          );
+          return {
+            needsClarification: true,
+            topCandidates,
+            reason: 'Multiple candidates with different email addresses found.',
+          };
+        }
+      }
+
+      return {
+        needsClarification,
+        topCandidates,
+        reason: typeof parsed.overallReason === 'string' ? parsed.overallReason : undefined,
+      };
+    } catch (err) {
+      this.logger.warn(`selectBestContact LLM failed, using heuristic: ${String(err)}`);
+      return this.selectBestContactHeuristic(input, hasMultipleEmails);
+    }
+  }
+
+  private selectBestContactHeuristic(
+    input: {
+      queryName: string;
+      candidates: Array<{
+        displayName: string;
+        email: string | null;
+        source: 'hubspot' | 'gmail';
+      }>;
+    },
+    hasMultipleEmails: boolean = false,
+  ): ContactSelectionResult {
+    const queryLower = input.queryName.toLowerCase().trim();
+    const queryWords = queryLower.split(/\s+/).filter((w) => w.length > 1);
+
+    const scored = input.candidates.map((c) => {
+      const nameLower = c.displayName.toLowerCase();
+      const nameWords = nameLower.split(/\s+/).filter((w) => w.length > 1);
+
+      let score = 0;
+
+      // Exact match
+      if (nameLower === queryLower) {
+        score += 100;
+      }
+      // All query words present in name
+      else if (queryWords.every((qw) => nameLower.includes(qw))) {
+        score += 80;
+      }
+      // Some words match
+      else {
+        const matchingWords = queryWords.filter((qw) =>
+          nameWords.some((nw) => nw.includes(qw) || qw.includes(nw)),
+        );
+        score += matchingWords.length * 20;
+      }
+
+      // Has email
+      if (c.email) score += 15;
+
+      // Penalize noreply/automated emails
+      if (c.email) {
+        const emailLower = c.email.toLowerCase();
+        if (
+          emailLower.includes('noreply') ||
+          emailLower.includes('no-reply') ||
+          emailLower.includes('notifications') ||
+          emailLower.includes('mailer-daemon')
+        ) {
+          score -= 50;
+        }
+      }
+
+      // Penalize "via" in display name (automated notifications)
+      if (nameLower.includes(' via ')) {
+        score -= 40;
+      }
+
+      // HubSpot preference
+      if (c.source === 'hubspot') score += 5;
+
+      return { candidate: c, score };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+
+    // Filter to only good matches (score > 30)
+    const goodMatches = scored.filter((s) => s.score > 30);
+
+    // Check if we need clarification
+    // Need clarification if:
+    // 1. Multiple good matches with different emails, OR
+    // 2. Top scores are very close
+    const topScore = goodMatches[0]?.score ?? 0;
+    const closeMatches = goodMatches.filter((s) => s.score >= topScore - 15);
+
+    // Get unique emails among close matches
+    const closeMatchEmails = new Set(
+      closeMatches.filter((s) => s.candidate.email).map((s) => s.candidate.email!.toLowerCase()),
+    );
+
+    // Need clarification if there are multiple close matches with different emails
+    const needsClarification =
+      closeMatchEmails.size > 1 || (hasMultipleEmails && closeMatches.length > 1);
+
+    return {
+      needsClarification,
+      topCandidates: scored.slice(0, 5).map((s) => ({
+        ...s.candidate,
+        confidence: Math.min(1, Math.max(0, s.score / 100)),
+      })),
+    };
+  }
 }
 
 function safeJsonParse(text: string): unknown {
   if (!text) return null;
   try {
-    // Handle potential markdown code blocks
     const cleaned = text
       .replace(/```json\s*/g, '')
       .replace(/```\s*/g, '')

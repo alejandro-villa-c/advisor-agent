@@ -43,7 +43,7 @@ export class AgentRunnerService {
   ) {}
 
   async runTask(taskId: number): Promise<void> {
-    const task = await this.tasks.getTask(taskId);
+    let task = await this.tasks.getTask(taskId);
     if (!task) {
       this.logger.warn(`[agent] task not found taskId=${taskId}`);
       return;
@@ -59,6 +59,13 @@ export class AgentRunnerService {
 
       await this.tasks.setWaiting(taskId, null);
       await this.tasks.setStatus(taskId, 'running', null);
+
+      // Re-fetch task to get latest memory after status change
+      task = await this.tasks.getTask(taskId);
+      if (!task) {
+        this.logger.warn(`[agent] task not found after status update taskId=${taskId}`);
+        return;
+      }
 
       // Check if this is a scheduling task and handle the multi-step flow
       const schedulingResult = await this.handleSchedulingFlow(taskId, task);
@@ -191,13 +198,13 @@ export class AgentRunnerService {
         AGENT_REACT_JOB,
         { taskId },
         {
-          singletonKey: `agent.react:${taskId}`,
-          singletonSeconds: 30,
+          singletonKey: `agent.react:${taskId}:${Date.now()}`,
+          singletonSeconds: 5,
         },
       );
     } catch (err: unknown) {
       this.logger.warn(
-        `[${AGENT_REACT_JOB}] enqueue failed taskId=${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+        `enqueueReact failed for taskId=${taskId}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -221,26 +228,26 @@ export class AgentRunnerService {
     const meeting = isRecord(mem['meeting']) ? mem['meeting'] : null;
     const phase = meeting ? (typeof meeting['phase'] === 'string' ? meeting['phase'] : null) : null;
 
-    // Get the latest user message to understand context
     const uiMessages = await this.tasks.getMessagesForUi(taskId);
     const lastUser = [...uiMessages].reverse().find((m) => m.role === 'user');
 
-    // PHASE: Initial request - use NLP to parse and find contact
     if (!meeting) {
       return await this.startSchedulingFlow(taskId, task);
     }
 
-    // PHASE: Waiting for duration from user
+    // PHASE: Need contact clarification
+    if (phase === 'need_contact_clarification') {
+      return await this.handleContactClarificationResponse(taskId, task, lastUser?.content ?? '');
+    }
+
     if (phase === 'need_duration') {
       return await this.handleDurationResponse(taskId, task, lastUser?.content ?? '');
     }
 
-    // PHASE: Waiting for user approval of proposed slots
     if (phase === 'need_user_approval') {
       return await this.handleUserApprovalResponse(taskId, task, lastUser?.content ?? '');
     }
 
-    // PHASE: Waiting for contact reply
     if (phase === 'waiting_contact_reply') {
       return await this.handleContactReply(taskId, task, lastUser?.content ?? '');
     }
@@ -261,7 +268,6 @@ export class AgentRunnerService {
 
     const contactName = parsed.contactName;
     if (!contactName) {
-      // Ask user to clarify who they want to meet with
       await this.tasks.appendMessage({
         taskId,
         userId: task.userId,
@@ -284,20 +290,58 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    // Search for the contact in HubSpot
-    const matches = await this.syncedDataTools.findHubspotContactsLocal({
-      userId: task.userId,
-      query: contactName,
-      limit: 10,
-    });
+    // Search for the contact in BOTH HubSpot AND Gmail senders
+    const [hubspotMatches, gmailSenders] = await Promise.all([
+      this.syncedDataTools.findHubspotContactsLocal({
+        userId: task.userId,
+        query: contactName,
+        limit: 10,
+      }),
+      this.syncedDataTools.findGmailSendersLocal({
+        userId: task.userId,
+        query: contactName,
+        limit: 20,
+      }),
+    ]);
 
-    const best = pickBestContact(matches, contactName);
-    if (!best) {
+    // Build candidate list
+    const candidates: Array<{
+      source: 'hubspot' | 'gmail';
+      displayName: string;
+      email: string | null;
+      hubspotContactId: string | null;
+    }> = [];
+
+    for (const h of hubspotMatches) {
+      const displayName = `${h.firstName ?? ''} ${h.lastName ?? ''}`.trim() || h.email || 'Unknown';
+      candidates.push({
+        source: 'hubspot',
+        displayName,
+        email: h.email,
+        hubspotContactId: h.id,
+      });
+    }
+
+    for (const g of gmailSenders) {
+      // Check if we already have this email from HubSpot
+      const emailLower = g.email.toLowerCase();
+      const alreadyHave = candidates.some((c) => c.email && c.email.toLowerCase() === emailLower);
+      if (!alreadyHave) {
+        candidates.push({
+          source: 'gmail',
+          displayName: g.displayName || g.email,
+          email: g.email,
+          hubspotContactId: null,
+        });
+      }
+    }
+
+    if (candidates.length === 0) {
       await this.tasks.appendMessage({
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `I couldn't find a contact matching "${contactName}" in HubSpot. Could you provide their email address?`,
+        content: `I couldn't find a contact matching "${contactName}" in HubSpot or your email history. Could you provide their email address?`,
       });
 
       await this.tasks.mergeMemory(taskId, {
@@ -320,28 +364,77 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    if (!best.email) {
+    // Get unique emails
+    const uniqueEmails = new Set(
+      candidates.filter((c) => c.email).map((c) => c.email!.toLowerCase()),
+    );
+
+    // If we have multiple email options, ask user to clarify
+    if (uniqueEmails.size > 1) {
+      // Show all candidates with emails to user
+      const optionsToShow = candidates.filter((c) => c.email);
+
+      const optionsList = optionsToShow
+        .map((c, i) => `${i + 1}. ${c.displayName} (${c.email})`)
+        .join('\n');
+
+      const candidateOptions = optionsToShow.map((c, i) => ({
+        index: i + 1,
+        displayName: c.displayName,
+        email: c.email,
+        source: c.source,
+        hubspotContactId: c.hubspotContactId,
+      }));
+
       await this.tasks.appendMessage({
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `I found "${best.displayName}" in HubSpot, but they don't have an email address on file. Please provide their email address.`,
+        content: `I found multiple email addresses for "${contactName}". Which one should I use?\n\n${optionsList}\n\nPlease reply with the number.`,
+      });
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_contact_clarification',
+          contactQuery: contactName,
+          candidateOptions,
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'Which contact did you mean? Reply with the number.',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // We have zero or one unique email - pick the first candidate with an email
+    const best = candidates.find((c) => c.email) ?? candidates[0];
+
+    if (!best || !best.email) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I found "${contactName}" but I don't have an email address on file. Please provide their email address.`,
       });
 
       await this.tasks.mergeMemory(taskId, {
         meeting: {
           phase: 'need_duration',
           contact: {
-            name: best.displayName,
+            name: best?.displayName ?? contactName,
             email: null,
-            hubspotContactId: best.hubspotContactId,
+            hubspotContactId: best?.hubspotContactId ?? null,
           },
         },
       });
 
       await this.tasks.setWaiting(taskId, {
         kind: 'user_message',
-        prompt: `Please provide the email address for ${best.displayName}.`,
+        prompt: `Please provide the email address.`,
         sinceIso: new Date().toISOString(),
       });
       await this.tasks.setStatus(taskId, 'waiting', null);
@@ -350,9 +443,9 @@ export class AgentRunnerService {
 
     // Use duration from NLP parsing if available
     const durationFromGoal = parsed.durationMinutes;
+    const sourceNote = best.source === 'hubspot' ? '' : ' (from your email history)';
 
     if (durationFromGoal === null) {
-      // Need to ask for duration
       await this.tasks.mergeMemory(taskId, {
         meeting: {
           phase: 'need_duration',
@@ -368,7 +461,7 @@ export class AgentRunnerService {
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `I found ${best.displayName} (${best.email}). How long should the meeting be? (e.g., "30 minutes", "1 hour")`,
+        content: `I found ${best.displayName} (${best.email})${sourceNote}. How long should the meeting be? (e.g., "30 minutes", "1 hour")`,
       });
 
       await this.tasks.setWaiting(taskId, {
@@ -380,14 +473,13 @@ export class AgentRunnerService {
       return 'handled';
     }
 
-    // Duration was specified, proceed to find slots and ask for approval
     return await this.findSlotsAndAskApproval(
       taskId,
       task,
       {
         name: best.displayName,
         email: best.email,
-        hubspotContactId: best.hubspotContactId,
+        hubspotContactId: best.hubspotContactId ?? '',
       },
       durationFromGoal,
     );
@@ -397,23 +489,68 @@ export class AgentRunnerService {
     taskId: number,
     task: AgentTaskRow,
     userResponse: string,
-  ): Promise<'handled'> {
+  ): Promise<'handled' | 'not_scheduling'> {
     const mem = task.memory ?? {};
     const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
     const contact = isRecord(meeting['contact']) ? meeting['contact'] : {};
     const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
+    const contactName = typeof contact['name'] === 'string' ? contact['name'] : '';
+
+    // Check for cancellation or contact change first
+    const flowControlResult = await this.handleFlowControl(
+      taskId,
+      task,
+      userResponse,
+      'need_duration',
+      contactName,
+    );
+    if (flowControlResult === 'handled') {
+      return 'handled';
+    }
 
     // Use NLP to parse the response
-    // Determine what we're asking for based on current state
     const agentAskedFor = contactEmail ? 'duration' : 'email';
     const parsed = await this.nlp.parseUserResponse({
       userMessage: userResponse,
       agentAskedFor,
     });
 
+    // Check for cancellation in the parsed response
+    if (parsed.type === 'cancellation') {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `No problem, I've cancelled the scheduling request. Let me know if you need anything else.`,
+      });
+
+      await this.tasks.mergeMemory(taskId, { meeting: null });
+      await this.tasks.setStatus(taskId, 'completed', null);
+      return 'handled';
+    }
+
+    // Check for contact change
+    if (parsed.type === 'change_contact' && parsed.newContactName) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Got it, let me find ${parsed.newContactName} instead.`,
+      });
+
+      await this.tasks.mergeMemory(taskId, { meeting: null });
+
+      const updatedTask: AgentTaskRow = {
+        ...task,
+        goal: `Schedule a meeting with ${parsed.newContactName}`,
+        memory: {},
+      };
+
+      return await this.startSchedulingFlow(taskId, updatedTask);
+    }
+
     // Check if user provided an email (in case we were waiting for that)
     if (parsed.type === 'email' && parsed.email) {
-      // Update contact with email
       const updatedContact = {
         ...contact,
         email: parsed.email,
@@ -444,7 +581,6 @@ export class AgentRunnerService {
 
     // Check for duration
     if (parsed.type === 'duration' && parsed.durationMinutes) {
-      // Make sure we have an email
       if (!contactEmail) {
         await this.tasks.appendMessage({
           taskId,
@@ -466,7 +602,7 @@ export class AgentRunnerService {
         taskId,
         task,
         {
-          name: typeof contact['name'] === 'string' ? contact['name'] : '',
+          name: contactName,
           email: contactEmail,
           hubspotContactId:
             typeof contact['hubspotContactId'] === 'string' ? contact['hubspotContactId'] : '',
@@ -481,7 +617,7 @@ export class AgentRunnerService {
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `I didn't quite catch that. Could you please provide the email address for the contact?`,
+        content: `I didn't quite catch that. Could you please provide the email address for the contact? (Or say "cancel" if you'd like to stop)`,
       });
 
       await this.tasks.setWaiting(taskId, {
@@ -494,7 +630,7 @@ export class AgentRunnerService {
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `I didn't quite catch that. Could you please specify how long the meeting should be? (e.g., "30 minutes", "1 hour", or "half an hour")`,
+        content: `I didn't quite catch that. Could you please specify how long the meeting should be? (e.g., "30 minutes", "1 hour", or "half an hour"). Say "cancel" if you'd like to stop.`,
       });
 
       await this.tasks.setWaiting(taskId, {
@@ -596,7 +732,7 @@ export class AgentRunnerService {
     taskId: number,
     task: AgentTaskRow,
     userResponse: string,
-  ): Promise<'handled'> {
+  ): Promise<'handled' | 'not_scheduling'> {
     const mem = task.memory ?? {};
     const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
     const contact = isRecord(meeting['contact']) ? meeting['contact'] : {};
@@ -605,6 +741,19 @@ export class AgentRunnerService {
       typeof meeting['durationMinutes'] === 'number' ? meeting['durationMinutes'] : 30;
     const timeZone =
       typeof meeting['timezone'] === 'string' ? meeting['timezone'] : 'America/Santo_Domingo';
+    const contactName = typeof contact['name'] === 'string' ? contact['name'] : '';
+
+    // Check for cancellation or contact change first
+    const flowControlResult = await this.handleFlowControl(
+      taskId,
+      task,
+      userResponse,
+      'need_user_approval',
+      contactName,
+    );
+    if (flowControlResult === 'handled') {
+      return 'handled';
+    }
 
     // Safely parse proposed slots
     const proposed: ProposedSlot[] = proposedRaw
@@ -622,11 +771,43 @@ export class AgentRunnerService {
       agentAskedFor: 'approval',
     });
 
+    // Check for cancellation in the parsed response
+    if (parsed.type === 'cancellation') {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `No problem, I've cancelled the scheduling request. Let me know if you need anything else.`,
+      });
+
+      await this.tasks.mergeMemory(taskId, { meeting: null });
+      await this.tasks.setStatus(taskId, 'completed', null);
+      return 'handled';
+    }
+
+    // Check for contact change
+    if (parsed.type === 'change_contact' && parsed.newContactName) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Got it, let me find ${parsed.newContactName} instead.`,
+      });
+
+      await this.tasks.mergeMemory(taskId, { meeting: null });
+
+      const updatedTask: AgentTaskRow = {
+        ...task,
+        goal: `Schedule a meeting with ${parsed.newContactName}`,
+        memory: {},
+      };
+
+      return await this.startSchedulingFlow(taskId, updatedTask);
+    }
+
     // Check for approval
     if (parsed.type === 'approval' && parsed.approved === true) {
-      // User approved - send email to contact
       const contactEmail = typeof contact['email'] === 'string' ? contact['email'] : '';
-      const contactName = typeof contact['name'] === 'string' ? contact['name'] : '';
 
       if (!contactEmail) {
         await this.tasks.appendMessage({
@@ -667,8 +848,7 @@ export class AgentRunnerService {
 
       const gmailThreadId = extractThreadIdFromSendResult(sendRes);
 
-      // AFTER sending, get the latest timestamp to ensure we only pick up replies
-      // that come after our sent message
+      // AFTER sending, get the latest timestamp
       const threadMessages = await this.gmailApi.getThreadMessages(
         task.userId,
         gmailThreadId || '',
@@ -680,7 +860,7 @@ export class AgentRunnerService {
 
       const sinceIso = new Date().toISOString();
 
-      // Track previously proposed times - safely parse existing array
+      // Track previously proposed times
       const previouslyProposedRaw = Array.isArray(meeting['previouslyProposed'])
         ? meeting['previouslyProposed']
         : [];
@@ -730,10 +910,9 @@ export class AgentRunnerService {
         taskId,
         userId: task.userId,
         role: 'assistant',
-        content: `No problem. Would you like me to find different time slots, or do you have specific times in mind?`,
+        content: `No problem. Would you like me to find different time slots, or do you have specific times in mind? (Say "cancel" if you'd like to stop)`,
       });
 
-      // Go back to needing approval with potential for new slots
       await this.tasks.mergeMemory(taskId, {
         meeting: {
           ...meeting,
@@ -755,7 +934,7 @@ export class AgentRunnerService {
       taskId,
       userId: task.userId,
       role: 'assistant',
-      content: `I didn't quite catch that. Should I send these time options to the contact? (Reply "yes" to send, or "no" if you'd like different times)`,
+      content: `I didn't quite catch that. Should I send these time options to the contact? (Reply "yes" to send, "no" for different times, or "cancel" to stop)`,
     });
 
     await this.tasks.setWaiting(taskId, {
@@ -1570,54 +1749,243 @@ export class AgentRunnerService {
       return { kind: 'error', error: msg };
     }
   }
+
+  /**
+   * Handle cancellation or contact change during scheduling flow.
+   * Returns 'handled' if the user wanted to cancel/change, null if they want to continue.
+   */
+  private async handleFlowControl(
+    taskId: number,
+    task: AgentTaskRow,
+    userMessage: string,
+    currentPhase: string,
+    currentContactName?: string,
+  ): Promise<'handled' | 'not_scheduling' | null> {
+    const flowControl = await this.nlp.parseFlowControlIntent({
+      userMessage,
+      currentPhase,
+      currentContactName,
+    });
+
+    if (flowControl.intent === 'continue') {
+      return null; // Continue with normal flow
+    }
+
+    if (flowControl.intent === 'cancel') {
+      // User wants to cancel the scheduling flow
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `No problem, I've cancelled the scheduling request. Let me know if you need anything else.`,
+      });
+
+      // Clear meeting memory and complete the task
+      await this.tasks.mergeMemory(taskId, {
+        meeting: null,
+      });
+
+      await this.tasks.setStatus(taskId, 'completed', null);
+      return 'handled';
+    }
+
+    if (flowControl.intent === 'change_contact' && flowControl.newContactName) {
+      // User wants to schedule with a different person
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Got it, let me find ${flowControl.newContactName} instead.`,
+      });
+
+      // Clear the old meeting memory and restart with new contact
+      await this.tasks.mergeMemory(taskId, {
+        meeting: null,
+      });
+
+      // Update the task goal to reflect the new contact
+      const originalGoal = task.goal;
+      const newGoal = originalGoal.replace(
+        /with\s+.+?(?=\s+for\s+|\s+at\s+|\s+on\s+|$)/i,
+        `with ${flowControl.newContactName}`,
+      );
+
+      // Re-run the scheduling flow with the new contact
+      const updatedTask: AgentTaskRow = {
+        ...task,
+        goal: newGoal,
+        memory: {},
+      };
+
+      return await this.startSchedulingFlow(taskId, updatedTask);
+    }
+
+    if (flowControl.intent === 'restart') {
+      // User wants to start over
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `Let's start over. Who would you like to schedule a meeting with?`,
+      });
+
+      // Clear meeting memory
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_contact',
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'Who would you like to meet with?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    return null;
+  }
+
+  private async handleContactClarificationResponse(
+    taskId: number,
+    task: AgentTaskRow,
+    userResponse: string,
+  ): Promise<'handled'> {
+    const mem = task.memory ?? {};
+    const meeting = isRecord(mem['meeting']) ? mem['meeting'] : {};
+    const candidateOptionsRaw = Array.isArray(meeting['candidateOptions'])
+      ? meeting['candidateOptions']
+      : [];
+
+    // Parse candidate options safely
+    const candidateOptions = candidateOptionsRaw
+      .filter((c): c is Record<string, unknown> => isRecord(c))
+      .map((c) => ({
+        index: typeof c.index === 'number' ? c.index : 0,
+        displayName: typeof c.displayName === 'string' ? c.displayName : '',
+        email: typeof c.email === 'string' ? c.email : null,
+        source: typeof c.source === 'string' ? c.source : 'gmail',
+        hubspotContactId: typeof c.hubspotContactId === 'string' ? c.hubspotContactId : null,
+      }))
+      .filter((c) => c.index > 0 && c.displayName);
+
+    // Check for cancellation first
+    const flowControlResult = await this.handleFlowControl(
+      taskId,
+      task,
+      userResponse,
+      'need_contact_clarification',
+    );
+    if (flowControlResult === 'handled') {
+      return 'handled';
+    }
+
+    // Try to parse the user's selection
+    const response = userResponse.trim();
+
+    // Check for number selection
+    const numberMatch = response.match(/^(\d+)/);
+    let selectedCandidate: (typeof candidateOptions)[number] | null = null;
+
+    if (numberMatch) {
+      const index = parseInt(numberMatch[1], 10);
+      selectedCandidate = candidateOptions.find((c) => c.index === index) ?? null;
+    }
+
+    // If no number, try to match by name or email
+    if (!selectedCandidate) {
+      const responseLower = response.toLowerCase();
+      for (const candidate of candidateOptions) {
+        if (
+          candidate.displayName.toLowerCase().includes(responseLower) ||
+          responseLower.includes(candidate.displayName.toLowerCase()) ||
+          (candidate.email && candidate.email.toLowerCase().includes(responseLower))
+        ) {
+          selectedCandidate = candidate;
+          break;
+        }
+      }
+    }
+
+    if (!selectedCandidate) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I didn't understand your selection. Please reply with the number (1, 2, 3, etc.) of the contact you'd like to schedule with, or say "cancel" to stop.`,
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'Which contact number?',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    const { displayName, email, hubspotContactId } = selectedCandidate;
+
+    if (!email) {
+      await this.tasks.appendMessage({
+        taskId,
+        userId: task.userId,
+        role: 'assistant',
+        content: `I found ${displayName}, but I don't have an email address for them. Could you provide it?`,
+      });
+
+      await this.tasks.mergeMemory(taskId, {
+        meeting: {
+          phase: 'need_duration',
+          contact: {
+            name: displayName,
+            email: null,
+            hubspotContactId,
+          },
+        },
+      });
+
+      await this.tasks.setWaiting(taskId, {
+        kind: 'user_message',
+        prompt: 'Please provide the email address.',
+        sinceIso: new Date().toISOString(),
+      });
+      await this.tasks.setStatus(taskId, 'waiting', null);
+      return 'handled';
+    }
+
+    // We have the contact - now ask for duration
+    await this.tasks.mergeMemory(taskId, {
+      meeting: {
+        phase: 'need_duration',
+        contact: {
+          name: displayName,
+          email,
+          hubspotContactId,
+        },
+      },
+    });
+
+    await this.tasks.appendMessage({
+      taskId,
+      userId: task.userId,
+      role: 'assistant',
+      content: `Great, I'll schedule with ${displayName} (${email}). How long should the meeting be? (e.g., "30 minutes", "1 hour")`,
+    });
+
+    await this.tasks.setWaiting(taskId, {
+      kind: 'user_message',
+      prompt: 'How long should the meeting be?',
+      sinceIso: new Date().toISOString(),
+    });
+    await this.tasks.setStatus(taskId, 'waiting', null);
+    return 'handled';
+  }
 }
 
 // HELPER FUNCTIONS
-
-// HELPER FUNCTIONS
-
-function pickBestContact(
-  matches: Array<{
-    id: string;
-    email: string | null;
-    firstName: string | null;
-    lastName: string | null;
-  }>,
-  query: string,
-): { hubspotContactId: string; email: string | null; displayName: string } | null {
-  if (!Array.isArray(matches) || matches.length === 0) return null;
-
-  const qn = normalizeName(query);
-
-  const scored = matches.map((m) => {
-    const full = `${m.firstName ?? ''} ${m.lastName ?? ''}`.trim();
-    const fn = normalizeName(full);
-    const exact = fn && qn && fn === qn ? 100 : 0;
-    const contains = fn && qn && fn.includes(qn) ? 50 : 0;
-    const hasEmail = m.email ? 10 : 0;
-    const score = exact + contains + hasEmail;
-    return { m, full, score };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-
-  const best = scored[0];
-  const displayName = best.full || query;
-
-  return {
-    hubspotContactId: String(best.m.id),
-    email: best.m.email ?? null,
-    displayName,
-  };
-}
-
-function normalizeName(s: string): string {
-  return String(s ?? '')
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .replace(/[^a-z0-9 ]/g, '');
-}
 
 function extractThreadIdFromSendResult(sendRes: unknown): string {
   if (!sendRes || typeof sendRes !== 'object') return '';

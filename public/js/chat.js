@@ -69,6 +69,9 @@
   }
 
   function renderMessage(role, text, opts) {
+    // Skip empty messages
+    if (!text || !text.trim()) return null;
+    
     const el = createMessageElement(role, text, opts);
     contentInner.appendChild(el);
     scrollToBottom();
@@ -79,8 +82,10 @@
     // Remove any existing thinking placeholder first
     removeThinkingPlaceholder();
 
-    thinkingElement = renderMessage('assistant', 'Thinking', { isThinking: true });
+    thinkingElement = createMessageElement('assistant', 'Thinking', { isThinking: true });
     thinkingElement.querySelector('.msg__content').classList.add('thinking-dots');
+    contentInner.appendChild(thinkingElement);
+    scrollToBottom();
   }
 
   function removeThinkingPlaceholder() {
@@ -118,12 +123,17 @@
     showThinkingPlaceholder();
 
     try {
-      await fetchJson('/api/chat/message', {
+      const response = await fetchJson('/api/chat/message', {
         method: 'POST',
         body: JSON.stringify({ threadId, content: text }),
       });
 
-      // Messages will arrive via WebSocket and replace the thinking placeholder
+      // If there's an immediate assistant response, render it
+      if (response.assistant && response.assistant.content && response.assistant.content.trim()) {
+        removeThinkingPlaceholder();
+        renderMessage('assistant', response.assistant.content);
+      }
+      // Otherwise, messages will arrive via WebSocket
     } catch (err) {
       removeThinkingPlaceholder();
       renderMessage(
@@ -158,6 +168,11 @@
       
       // Only render if it's for the current thread
       if (data.threadId === threadId && data.message) {
+        // Skip empty messages
+        if (!data.message.content || !data.message.content.trim()) {
+          return;
+        }
+        
         // Remove thinking placeholder when first real message arrives
         removeThinkingPlaceholder();
         

@@ -17,7 +17,6 @@ export class AgentSyncedDataToolsService {
     const q = (input.query ?? '').trim();
     if (!q) return [];
 
-    // Split query into individual words for better matching
     const queryWords = q
       .toLowerCase()
       .split(/\s+/)
@@ -25,8 +24,6 @@ export class AgentSyncedDataToolsService {
 
     if (queryWords.length === 0) return [];
 
-    // Build conditions for each word to match against firstName, lastName, or email
-    // This ensures we match contacts where ALL words appear somewhere in their name
     const wordConditions = queryWords.map(
       (word) => sql`(
         LOWER(${hubspotContacts.firstName}) LIKE ${`%${escapeLike(word)}%`} OR
@@ -35,7 +32,6 @@ export class AgentSyncedDataToolsService {
       )`,
     );
 
-    // All words must match
     const rows = await this.dbService.db
       .select({
         id: hubspotContacts.hubspotContactId,
@@ -53,6 +49,70 @@ export class AgentSyncedDataToolsService {
       firstName: r.firstName ?? null,
       lastName: r.lastName ?? null,
     }));
+  }
+
+  async findGmailSendersLocal(input: { userId: number; query: string; limit: number }): Promise<
+    Array<{
+      email: string;
+      displayName: string | null;
+      lastContactedAt: Date | null;
+    }>
+  > {
+    const q = (input.query ?? '').trim();
+    if (!q) return [];
+
+    const queryWords = q
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 1);
+
+    if (queryWords.length === 0) return [];
+
+    const wordConditions = queryWords.map(
+      (word) => sql`LOWER(${gmailMessages.from}) LIKE ${`%${escapeLike(word)}%`}`,
+    );
+
+    const rows = await this.dbService.db
+      .select({
+        from: gmailMessages.from,
+        sentAt: gmailMessages.sentAt,
+      })
+      .from(gmailMessages)
+      .where(
+        and(
+          eq(gmailMessages.userId, input.userId),
+          sql`${gmailMessages.from} IS NOT NULL`,
+          ...wordConditions,
+        ),
+      )
+      .orderBy(sql`${gmailMessages.sentAt} DESC NULLS LAST`)
+      .limit(100);
+
+    const seenEmails = new Set<string>();
+    const results: Array<{
+      email: string;
+      displayName: string | null;
+      lastContactedAt: Date | null;
+    }> = [];
+
+    for (const row of rows) {
+      const parsed = parseEmailFromHeader(row.from ?? '');
+      if (!parsed.email) continue;
+
+      const emailLower = parsed.email.toLowerCase();
+      if (seenEmails.has(emailLower)) continue;
+      seenEmails.add(emailLower);
+
+      results.push({
+        email: parsed.email,
+        displayName: parsed.displayName,
+        lastContactedAt: row.sentAt ? new Date(row.sentAt) : null,
+      });
+
+      if (results.length >= clampInt(input.limit, 1, 50)) break;
+    }
+
+    return results;
   }
 
   async searchGmailMessagesLocal(input: { userId: number; query: string; limit: number }): Promise<
@@ -198,6 +258,33 @@ function clampInt(n: number, min: number, max: number): number {
 
 function escapeLike(s: string): string {
   return s.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
+}
+
+function parseEmailFromHeader(header: string): {
+  email: string | null;
+  displayName: string | null;
+} {
+  const s = (header ?? '').trim();
+  if (!s) return { email: null, displayName: null };
+
+  const angleMatch = s.match(/^(.+?)\s*<([^>]+)>$/);
+  if (angleMatch) {
+    const displayName = angleMatch[1].trim().replace(/^["']|["']$/g, '') || null;
+    const email = angleMatch[2].trim();
+    return { email: email || null, displayName };
+  }
+
+  const justAngleMatch = s.match(/^<([^>]+)>$/);
+  if (justAngleMatch) {
+    return { email: justAngleMatch[1].trim() || null, displayName: null };
+  }
+
+  const emailMatch = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  if (emailMatch) {
+    return { email: emailMatch[0], displayName: null };
+  }
+
+  return { email: null, displayName: null };
 }
 
 function mergeIntervals(

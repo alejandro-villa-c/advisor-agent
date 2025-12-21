@@ -125,15 +125,9 @@ export class ChatService {
     });
 
     if (resumed) {
-      const assistant = `Got it — continuing that task now.`;
-      await this.dbService.db.insert(messages).values({
-        userId,
-        threadId,
-        role: 'assistant',
-        content: assistant,
-        meta: { agentTaskId: resumed.taskId, kind: 'agent_resume' },
-      });
-      return { threadId, assistant };
+      // Don't show any message here - the agent will respond appropriately
+      // based on what the user said (continue, cancel, change contact, etc.)
+      return { threadId, assistant: '' };
     }
 
     // Memory (ongoing instructions)
@@ -243,22 +237,16 @@ export class ChatService {
   }): Promise<{ taskId: number } | null> {
     const waiting = await this.agentTasks.listWaitingTasksForUser(input.userId, 50);
 
-    // Only resume if:
-    // 1. waiting.kind === 'user_message'
-    // 2. The task is associated with THIS thread (via chatBridge.threadId)
-    // 3. The new text looks like it answers the prompt (heuristic)
     const match = waiting.find((t) => {
       if (!isRecord(t.waiting)) return false;
       const kind = typeof t.waiting.kind === 'string' ? t.waiting.kind : '';
       if (kind !== 'user_message') return false;
 
-      // Check that this task is associated with the current thread
       const mem = t.memory ?? {};
       const chatBridge = isRecord(mem['chatBridge']) ? mem['chatBridge'] : null;
       const taskThreadId =
         chatBridge && typeof chatBridge['threadId'] === 'number' ? chatBridge['threadId'] : null;
 
-      // Only resume if the task belongs to this thread
       if (taskThreadId !== input.threadId) return false;
 
       return shouldResumeUserMessageWaiting(input.advisorReplyText);
@@ -278,13 +266,13 @@ export class ChatService {
       content: input.advisorReplyText,
     });
 
-    // Enqueue the agent run.
+    // Enqueue the agent run - use timestamp in key to avoid deduplication issues
     await this.pgBoss.client.send(
       AGENT_RUN_TASK_JOB,
       { taskId: match.id },
       {
-        singletonKey: `agent.runTask:${match.id}`,
-        singletonSeconds: 60,
+        singletonKey: `agent.runTask:${match.id}:${Date.now()}`,
+        singletonSeconds: 5,
       },
     );
 
