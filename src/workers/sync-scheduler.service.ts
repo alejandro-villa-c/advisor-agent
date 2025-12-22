@@ -23,10 +23,10 @@ export class SyncSchedulerService implements OnModuleInit {
     private readonly config: ConfigService,
   ) {
     // Load cron expressions from env or use defaults
-    this.syncTickCron = this.config.get<string>('SYNC_TICK_CRON', '*/3 * * * *');
+    this.syncTickCron = this.config.get<string>('SYNC_TICK_CRON', '*/1 * * * *');
     this.agentTickCron = this.config.get<string>('AGENT_TICK_CRON', '*/1 * * * *');
     this.instructionTickCron = this.config.get<string>('INSTRUCTION_TICK_CRON', '*/1 * * * *');
-    this.ragRepairCron = this.config.get<string>('RAG_REPAIR_CRON', '*/5 * * * *');
+    this.ragRepairCron = this.config.get<string>('RAG_REPAIR_CRON', '*/1 * * * *');
   }
 
   async onModuleInit(): Promise<void> {

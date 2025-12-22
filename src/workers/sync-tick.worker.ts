@@ -120,28 +120,12 @@ export class SyncTickWorker implements OnModuleInit {
         if (flags.hasGoogle) {
           const gmailBackfill = readGmailBackfill(stateByKey.get(`${userId}:gmail`));
 
-          // FIX: Only use backfill.lastRunAt for backfill scheduling, NOT lastSyncedAt.
-          // If backfill has never run (lastRunAt is null), always trigger it.
-          // This prevents incremental sync from blocking backfill from ever starting.
+          // Gmail backfill - runs until complete, then stops
           if (!gmailBackfill.done) {
             const shouldRunBackfill =
               gmailBackfill.lastRunAt === null || shouldRun(gmailBackfill.lastRunAt, 10);
 
             if (shouldRunBackfill) {
-              await this.enqueueJob(
-                GMAIL_SYNC_MESSAGES_JOB,
-                {
-                  userId,
-                  mode: 'backfill',
-                  maxPages: 25,
-                  maxMessages: 4000,
-                  pageToken: gmailBackfill.nextPageToken,
-                },
-                {
-                  singletonKey: `gmail_backfill:${userId}`,
-                  singletonSeconds: 600,
-                },
-              );
               await this.enqueueJob(
                 GMAIL_SYNC_MESSAGES_JOB,
                 {
@@ -160,7 +144,8 @@ export class SyncTickWorker implements OnModuleInit {
             }
           }
 
-          if (shouldRun(lastSyncedAtByKey.get(`${userId}:gmail`), 3)) {
+          // Gmail incremental - every 1 minute for fast email detection
+          if (shouldRun(lastSyncedAtByKey.get(`${userId}:gmail`), 1)) {
             await this.enqueueJob(
               GMAIL_SYNC_MESSAGES_JOB,
               {
@@ -171,13 +156,14 @@ export class SyncTickWorker implements OnModuleInit {
               },
               {
                 singletonKey: `gmail_incremental:${userId}`,
-                singletonSeconds: 180,
+                singletonSeconds: 60,
               },
             );
             enqueued += 1;
           }
 
-          if (shouldRun(lastSyncedAtByKey.get(`${userId}:calendar`), 60)) {
+          // Calendar - every 2 minutes for fast event detection
+          if (shouldRun(lastSyncedAtByKey.get(`${userId}:calendar`), 1)) {
             await this.enqueueJob(
               CALENDAR_SYNC_EVENTS_JOB,
               {
@@ -189,7 +175,7 @@ export class SyncTickWorker implements OnModuleInit {
               },
               {
                 singletonKey: `calendar_sync:${userId}`,
-                singletonSeconds: 3600,
+                singletonSeconds: 60,
               },
             );
             enqueued += 1;
@@ -197,20 +183,22 @@ export class SyncTickWorker implements OnModuleInit {
         }
 
         if (flags.hasHubspot) {
-          if (shouldRun(lastSyncedAtByKey.get(`${userId}:hubspot_notes`), 15)) {
+          // HubSpot notes - every 1 minute for fast trigger detection
+          if (shouldRun(lastSyncedAtByKey.get(`${userId}:hubspot_notes`), 1)) {
             await this.enqueueJob(
               HUBSPOT_SYNC_NOTES_JOB,
               { userId },
-              { singletonKey: `hubspot_notes:${userId}`, singletonSeconds: 900 },
+              { singletonKey: `hubspot_notes:${userId}`, singletonSeconds: 60 },
             );
             enqueued += 1;
           }
 
-          if (shouldRun(lastSyncedAtByKey.get(`${userId}:hubspot_contacts`), 15)) {
+          // HubSpot contacts - every 1 minute for fast trigger detection
+          if (shouldRun(lastSyncedAtByKey.get(`${userId}:hubspot_contacts`), 1)) {
             await this.enqueueJob(
               HUBSPOT_SYNC_CONTACTS_JOB,
               { userId },
-              { singletonKey: `hubspot_contacts:${userId}`, singletonSeconds: 900 },
+              { singletonKey: `hubspot_contacts:${userId}`, singletonSeconds: 60 },
             );
             enqueued += 1;
           }
