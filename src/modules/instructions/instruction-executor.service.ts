@@ -292,12 +292,20 @@ AVAILABLE TOOLS:
 
 GUIDELINES:
 - Match trigger events to instructions based on intent, not just keywords
-- Only act when an instruction clearly applies
+- Only act when an instruction clearly applies TO THIS SPECIFIC TRIGGER TYPE
 - Generate appropriate content for required fields (email body, subject, notes, etc.)
 - Use data from the trigger event to populate action parameters
 - For gmail_received triggers: sender info is in sender.email, sender.firstName, sender.lastName, sender.name
 - Skip automated emails (noreply@, notifications, newsletters, system-generated)
 - When in doubt, don't act
+
+CRITICAL TRIGGER MATCHING RULES:
+- Instructions about "when I receive an email" or "when someone emails me" ONLY match gmail_received triggers
+- Instructions about "when I create a contact" or "when a contact is added" ONLY match hubspot_contact_created triggers
+- Instructions about "when I add a calendar event" ONLY match calendar_event_created triggers
+- Do NOT match an instruction to a trigger of a different type
+- The trigger type "${trigger.type}" must logically match the instruction's "when" condition
+- If trigger is hubspot_contact_created, do NOT try to create that same contact again
 
 CONTENT GENERATION RULES:
 - NEVER use placeholders like [Your Name], [Company], [Date], etc.
@@ -310,7 +318,7 @@ CONTENT GENERATION RULES:
 Return ONLY valid JSON:
 {
   "shouldAct": boolean,
-  "matchingInstructionIndex": number | null,
+  "matchingInstructionIndex": number | null,  // 1-based index from the instruction list above, or null if no match
   "reasoning": string,
   "actions": [
     {
@@ -319,7 +327,9 @@ Return ONLY valid JSON:
       "params": { ... }
     }
   ]
-}`;
+}
+
+IMPORTANT: If shouldAct is true, matchingInstructionIndex MUST be the 1-based index (1, 2, 3...) of the matching instruction from the list above.`;
 
     try {
       const raw = await this.llm.complete({
@@ -342,10 +352,19 @@ Return ONLY valid JSON:
       }
 
       const shouldAct = parsed.shouldAct === true;
-      const matchingIndex =
+      let matchingIndex =
         typeof parsed.matchingInstructionIndex === 'number'
           ? parsed.matchingInstructionIndex
           : null;
+
+      // Fallback: if shouldAct is true but no valid index, and there's only one instruction, use it
+      if (
+        shouldAct &&
+        (matchingIndex === null || matchingIndex === 0) &&
+        instructions.length === 1
+      ) {
+        matchingIndex = 1;
+      }
 
       const matchingInstruction =
         matchingIndex !== null && matchingIndex >= 1 && matchingIndex <= instructions.length
