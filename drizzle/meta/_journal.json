@@ -64,6 +64,13 @@
       "when": 1766375681159,
       "tag": "0008_fix_rate_limits_unique_constraint",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1766380046585,
+      "tag": "0009_remove_unused_tables",
+      "breakpoints": true
     }
   ]
 }

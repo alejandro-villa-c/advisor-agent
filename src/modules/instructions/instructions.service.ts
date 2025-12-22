@@ -521,42 +521,24 @@ Examples of NON-conflicts:
 
   /**
    * Increment rate limit counter
-   * Uses try/catch pattern to handle both insert and update scenarios
+   * Uses PostgreSQL upsert (INSERT ... ON CONFLICT DO UPDATE) for atomicity
    */
   async incrementRateLimit(userId: number): Promise<void> {
     const now = new Date();
     const hourWindow = new Date(now);
     hourWindow.setMinutes(0, 0, 0);
 
-    try {
-      // Try to insert first
-      await this.dbService.db.insert(proactiveActionRateLimits).values({
+    await this.dbService.db
+      .insert(proactiveActionRateLimits)
+      .values({
         userId,
         hourWindow,
         actionCount: 1,
+      })
+      .onConflictDoUpdate({
+        target: [proactiveActionRateLimits.userId, proactiveActionRateLimits.hourWindow],
+        set: { actionCount: sql`${proactiveActionRateLimits.actionCount} + 1` },
       });
-    } catch (err: unknown) {
-      // If insert fails (conflict), update instead
-      const message = err instanceof Error ? err.message : String(err);
-      if (
-        message.includes('unique') ||
-        message.includes('duplicate') ||
-        message.includes('conflict') ||
-        message.includes('violates')
-      ) {
-        await this.dbService.db
-          .update(proactiveActionRateLimits)
-          .set({ actionCount: sql`${proactiveActionRateLimits.actionCount} + 1` })
-          .where(
-            and(
-              eq(proactiveActionRateLimits.userId, userId),
-              eq(proactiveActionRateLimits.hourWindow, hourWindow),
-            ),
-          );
-      } else {
-        throw err;
-      }
-    }
   }
 
   /**

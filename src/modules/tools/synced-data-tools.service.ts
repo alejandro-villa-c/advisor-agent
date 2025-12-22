@@ -4,7 +4,7 @@ import { DbService } from '../../db/db.service';
 import { calendarEvents, gmailMessages, hubspotContacts } from '../../db/schema';
 
 @Injectable()
-export class AgentSyncedDataToolsService {
+export class SyncedDataToolsService {
   constructor(private readonly dbService: DbService) {}
 
   async findHubspotContactsLocal(input: {

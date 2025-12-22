@@ -1,6 +1,6 @@
 import { Controller, Get, Query, Req, UnauthorizedException } from '@nestjs/common';
 import type { Request } from 'express';
-import { RagService } from './rag.service';
+import { RagSearchRow, RagService } from './rag.service';
 
 @Controller('/api/rag')
 export class RagController {
@@ -11,7 +11,7 @@ export class RagController {
     @Req() req: Request,
     @Query('q') q: string,
     @Query('k') k?: string,
-  ): Promise<{ results: any[] }> {
+  ): Promise<{ results: RagSearchRow[] }> {
     const userId = req.session.userId;
     if (!userId) throw new UnauthorizedException();
 

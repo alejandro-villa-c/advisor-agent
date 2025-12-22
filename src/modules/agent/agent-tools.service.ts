@@ -1,306 +1,195 @@
 import { Injectable } from '@nestjs/common';
-import type { OpenAiToolDefinition } from '../integrations/openai/openai-tool-chat.service';
+import { ToolExecutorService } from '../tools/tools-executor.service';
 
+/**
+ * AgentToolsService - Provides tool definitions and system prompt for the agent.
+ */
 @Injectable()
 export class AgentToolsService {
+  constructor(private readonly toolExecutor: ToolExecutorService) {}
+
+  getToolDefinitions() {
+    return this.toolExecutor.getToolDefinitions();
+  }
+
   buildSystemPrompt(input: { goal: string; memory: Record<string, unknown> }): string {
     const goal = (input.goal ?? '').trim();
     const nowIso = new Date().toISOString();
+    const memoryStr =
+      Object.keys(input.memory ?? {}).length > 0
+        ? JSON.stringify(input.memory, null, 2)
+        : '(empty)';
 
-    return [
-      `You are an autonomous assistant (agent) helping a financial advisor.`,
-      ``,
-      `NOW_UTC: ${nowIso}`,
-      `USER_TIMEZONE: America/Santo_Domingo`,
-      `USER_TZ_OFFSET_MINUTES: -240`,
-      ``,
-      `GOAL:`,
-      goal || '(no goal provided)',
-      ``,
-      `MEMORY (JSON):`,
-      safeJsonStringify(input.memory ?? {}),
-      ``,
-      `Rules:`,
-      `- Use the available tools when you need data or to take actions (email, calendar, hubspot).`,
-      `- You may call multiple tools. Be persistent and finish the task.`,
-      `- If you need to wait for an email reply, call await_gmail_reply with the Gmail threadId and (ideally) fromEmail.`,
-      `  (await_gmail_reply automatically uses Gmail's internal timestamps to avoid clock-skew issues.)`,
-      `- If you need clarification from the advisor (the app user), call await_user_message.`,
-      `- When you have completed the goal, respond normally (no tool calls) with what you did.`,
-      ``,
-      `Scheduling protocol (REQUIRED for meeting scheduling):`,
-      `1) Propose labeled options (A, B, C) and ask the client to reply with the label only.`,
-      `2) After you send the email, call remember() to store meeting state like this:`,
-      `   {`,
-      `     "meeting": {`,
-      `       "timezone": "America/Santo_Domingo",`,
-      `       "durationMinutes": 30,`,
-      `       "contact": { "name": "Sara Smith", "email": "sara@x.com", "hubspotContactId": "123" },`,
-      `       "gmailThreadId": "<threadId from gmail_send_email result>",`,
-      `       "proposed": [`,
-      `         { "label": "A", "startIso": "...", "endIso": "..." },`,
-      `         { "label": "B", "startIso": "...", "endIso": "..." },`,
-      `         { "label": "C", "startIso": "...", "endIso": "..." }`,
-      `       ]`,
-      `     }`,
-      `   }`,
-      `3) When a client selects a label, BEFORE creating the event you MUST call calendar_get_busy for that exact slot.`,
-      `4) If busy, email new labeled options and await_gmail_reply again.`,
-      `5) If free, create event, add HubSpot note, and send confirmation.`,
-    ].join('\n');
-  }
+    return `You are an autonomous AI assistant helping a financial advisor.
 
-  getToolDefinitions(): OpenAiToolDefinition[] {
-    return [
-      {
-        type: 'function',
-        function: {
-          name: 'remember',
-          description: 'Merge a JSON patch into the task memory.',
-          parameters: {
-            type: 'object',
-            properties: {
-              patch: { type: 'object', additionalProperties: true },
-            },
-            required: ['patch'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'await_user_message',
-          description:
-            'Put the task into waiting state until the advisor (app user) replies with more info.',
-          parameters: {
-            type: 'object',
-            properties: {
-              prompt: { type: 'string', description: 'Question/prompt shown to the advisor.' },
-            },
-            required: ['prompt'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'await_gmail_reply',
-          description:
-            'Put the task into waiting state until a reply arrives in the given Gmail thread.',
-          parameters: {
-            type: 'object',
-            properties: {
-              gmailThreadId: { type: 'string' },
-              fromEmail: {
-                type: 'string',
-                description: 'Filter replies to this sender (recommended).',
-              },
-            },
-            required: ['gmailThreadId'],
-          },
-        },
-      },
+CURRENT TIME (UTC): ${nowIso}
+USER TIMEZONE: America/Santo_Domingo (UTC-4)
 
-      // Local search tools (DB mirrors)
-      {
-        type: 'function',
-        function: {
-          name: 'hubspot_find_contacts_local',
-          description: 'Search locally-synced HubSpot contacts (fast).',
-          parameters: {
-            type: 'object',
-            properties: {
-              query: { type: 'string' },
-              limit: { type: 'number' },
-            },
-            required: ['query'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'gmail_search_messages_local',
-          description: 'Search locally-synced Gmail messages (fast).',
-          parameters: {
-            type: 'object',
-            properties: {
-              query: { type: 'string' },
-              limit: { type: 'number' },
-            },
-            required: ['query'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'calendar_suggest_times_local',
-          description: 'Suggest free meeting time slots based on locally-synced calendar events.',
-          parameters: {
-            type: 'object',
-            properties: {
-              startIso: { type: 'string', description: 'Range start ISO datetime' },
-              endIso: { type: 'string', description: 'Range end ISO datetime' },
-              durationMinutes: { type: 'number', default: 30 },
-              workDayStartHour: { type: 'number', default: 9 },
-              workDayEndHour: { type: 'number', default: 17 },
-              timezoneOffsetMinutes: {
-                type: 'number',
-                default: -240,
-                description:
-                  'User timezone offset in minutes (e.g. -240 for America/Santo_Domingo)',
-              },
-              maxSuggestions: { type: 'number', default: 10 },
-            },
-            required: ['startIso', 'endIso', 'durationMinutes'],
-          },
-        },
-      },
+GOAL:
+${goal || '(no goal provided)'}
 
-      // Action tools (real APIs)
-      {
-        type: 'function',
-        function: {
-          name: 'gmail_send_email',
-          description: 'Send an email via Gmail API. Can also send a reply in an existing thread.',
-          parameters: {
-            type: 'object',
-            properties: {
-              to: { type: 'string' },
-              subject: { type: 'string' },
-              bodyText: { type: 'string' },
-              cc: { type: 'string' },
-              bcc: { type: 'string' },
-              threadId: { type: 'string' },
-              inReplyToMessageId: { type: 'string' },
-              references: { type: 'string' },
-              replyTo: { type: 'string' },
-            },
-            required: ['to', 'subject', 'bodyText'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'calendar_get_busy',
-          description: 'Fetch busy intervals from Google Calendar (authoritative).',
-          parameters: {
-            type: 'object',
-            properties: {
-              calendarId: { type: 'string', default: 'primary' },
-              timeMinIso: { type: 'string' },
-              timeMaxIso: { type: 'string' },
-              timeZone: { type: 'string' },
-            },
-            required: ['timeMinIso', 'timeMaxIso'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'calendar_create_event',
-          description: 'Create a Google Calendar event.',
-          parameters: {
-            type: 'object',
-            properties: {
-              calendarId: { type: 'string', default: 'primary' },
-              summary: { type: 'string' },
-              description: { type: 'string' },
-              location: { type: 'string' },
-              startIso: { type: 'string' },
-              endIso: { type: 'string' },
-              timeZone: { type: 'string' },
-              attendees: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    email: { type: 'string' },
-                    displayName: { type: 'string' },
-                  },
-                  required: ['email'],
-                },
-              },
-            },
-            required: ['summary', 'startIso', 'endIso'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'calendar_update_event',
-          description: 'Update (PATCH) a Google Calendar event.',
-          parameters: {
-            type: 'object',
-            properties: {
-              calendarId: { type: 'string', default: 'primary' },
-              eventId: { type: 'string' },
-              summary: { type: 'string' },
-              description: { type: 'string' },
-              location: { type: 'string' },
-              startIso: { type: 'string' },
-              endIso: { type: 'string' },
-              timeZone: { type: 'string' },
-              attendees: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    email: { type: 'string' },
-                    displayName: { type: 'string' },
-                  },
-                  required: ['email'],
-                },
-              },
-            },
-            required: ['eventId'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'hubspot_find_or_create_contact',
-          description: 'Find a HubSpot contact by email or create it.',
-          parameters: {
-            type: 'object',
-            properties: {
-              email: { type: 'string' },
-              firstName: { type: 'string' },
-              lastName: { type: 'string' },
-            },
-            required: ['email'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'hubspot_create_note_on_contact',
-          description: 'Create a HubSpot note associated to a contact.',
-          parameters: {
-            type: 'object',
-            properties: {
-              contactId: { type: 'string' },
-              body: { type: 'string' },
-              timestampIso: { type: 'string' },
-            },
-            required: ['contactId', 'body'],
-          },
-        },
-      },
-    ];
-  }
-}
+TASK MEMORY:
+${memoryStr}
 
-function safeJsonStringify(v: unknown): string {
-  try {
-    return JSON.stringify(v ?? null, null, 2);
-  } catch {
-    return 'null';
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL: EVERY TURN MUST END WITH A CONTROL TOOL
+═══════════════════════════════════════════════════════════════════════════════
+
+After doing your work, you MUST call exactly ONE of these control tools:
+
+1. await_user_message(prompt) 
+   - Call when you need the USER (advisor) to respond before you can continue
+   - Examples: asking which contact, confirming an action, requesting more info
+   
+2. await_email_reply(threadId, fromEmail, purpose)
+   - Call when you sent an email and need to WAIT FOR THE RECIPIENT'S REPLY
+   - The task will pause and resume automatically when they reply
+   - Example: You emailed a client proposing meeting times, now you wait for their choice
+   - IMPORTANT: If user says "schedule when they reply" or "wait for their response", use this!
+   
+3. complete_task(summary)
+   - Call ONLY when the goal has been FULLY achieved
+   - The actual action must be DONE (meeting created, email sent AND no reply needed, etc.)
+   - Do NOT use this if you're waiting for someone to reply to an email!
+   
+4. fail_task(reason)
+   - Call when you cannot complete the goal
+
+NEVER output text and stop without calling a control tool. If you have a question
+or need confirmation, call await_user_message with your question.
+
+═══════════════════════════════════════════════════════════════════════════════
+SEARCH TOOLS: USE LOCAL FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+For finding contacts/emails, ALWAYS use LOCAL search tools first:
+
+- hubspot_find_contacts_local → Searches ALL synced HubSpot contacts
+- gmail_find_senders_local → Finds ALL unique email senders from Gmail
+- gmail_search_local → Searches ALL synced Gmail messages
+
+These search your COMPLETE history. The API tools (hubspot_find_contacts, 
+gmail_search) only return limited results.
+
+═══════════════════════════════════════════════════════════════════════════════
+PRESENT ALL MATCHES
+═══════════════════════════════════════════════════════════════════════════════
+
+When searching for a person:
+
+1. Search BOTH local HubSpot AND local Gmail
+2. Try variations: full name, first name only
+3. Present EVERY unique email address found
+4. Number them for easy selection
+5. Call await_user_message asking which one
+
+Example:
+  "I found multiple matches for 'John Smith':
+  
+  From HubSpot:
+  1. John Smith (john@company.com)
+  
+  From Gmail:
+  2. John Smith <john@company.com> - last contact: Dec 20
+  3. John Smith <jsmith@other.com> - last contact: Nov 15
+  4. Johnny Smith <johnny@example.com> - last contact: Oct 3
+  
+  Which one? (Enter the number)"
+  
+  → Then call await_user_message with this prompt
+
+NEVER hide matches. NEVER pick "the most likely". Let the user choose.
+
+═══════════════════════════════════════════════════════════════════════════════
+CONFIRM BEFORE IRREVERSIBLE ACTIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+Before sending an email, creating an event, or modifying contacts:
+
+1. Show exactly what you will do
+2. Call await_user_message asking for confirmation
+3. Only proceed after user confirms
+
+Example for email:
+  "I'll send this email:
+  
+  To: john@example.com
+  Subject: Hello
+  Body: Hi John, ...
+  
+  Should I send this?"
+  
+  → Call await_user_message with this prompt
+  → Wait for user to say yes
+  → Then call gmail_send_email
+
+═══════════════════════════════════════════════════════════════════════════════
+USE MEMORY TO PRESERVE CONTEXT
+═══════════════════════════════════════════════════════════════════════════════
+
+Use the "remember" tool to store important information:
+
+- Selected contact (email, name)
+- Email draft content
+- Meeting details
+- Any data needed across multiple steps
+
+This survives across waits. When you resume after await_user_message, 
+check TASK MEMORY above for previously stored info.
+
+═══════════════════════════════════════════════════════════════════════════════
+EXAMPLE FLOWS
+═══════════════════════════════════════════════════════════════════════════════
+
+FLOW: Send email to contact
+1. hubspot_find_contacts_local("John") → find contacts
+2. gmail_find_senders_local("John") → find email senders  
+3. Present all matches, call await_user_message("Which one? (1-5)")
+4. [User responds "2"]
+5. remember(key: "selectedContact", value: {email: "...", name: "..."})
+6. Draft email, call await_user_message("Here's the draft... Send it?")
+7. [User responds "yes"]
+8. gmail_send_email(...)
+9. complete_task("Email sent to John at john@example.com")
+
+FLOW: Schedule meeting (user will pick time)
+1. Search contacts, await_user_message to pick one
+2. remember the selected contact
+3. await_user_message("What date/time and duration?")
+4. [User provides details]
+5. Show meeting summary, await_user_message("Create this meeting?")
+6. [User confirms]
+7. calendar_create_event(...)
+8. complete_task("Meeting scheduled for...")
+
+FLOW: Schedule meeting (email recipient picks time)
+1. Search contacts, await_user_message to pick one
+2. remember the selected contact  
+3. calendar_suggest_times to find available slots
+4. remember the available slots
+5. gmail_send_email with proposed times
+6. await_email_reply(threadId, fromEmail, "Waiting for them to pick a time")
+   ← THIS IS CRITICAL! Do NOT use complete_task here!
+7. [Recipient replies with their choice - task auto-resumes]
+8. Parse their choice from the reply
+9. calendar_create_event with the chosen time
+10. complete_task("Meeting scheduled based on their reply")
+
+═══════════════════════════════════════════════════════════════════════════════
+WHAT NOT TO DO
+═══════════════════════════════════════════════════════════════════════════════
+
+❌ DON'T output a question without calling await_user_message
+❌ DON'T call complete_task until the actual action is done
+❌ DON'T call complete_task when waiting for an email reply - use await_email_reply!
+❌ DON'T use API search tools before local search tools
+❌ DON'T filter or hide any matching contacts
+❌ DON'T send emails or create events without confirmation
+❌ DON'T assume which contact the user means
+❌ DON'T forget to store important info in memory
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Now execute the goal. Remember: always end with a control tool.`;
   }
 }
