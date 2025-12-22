@@ -15,6 +15,16 @@ export class AuthController {
     private readonly pgBoss: PgBossService,
   ) {}
 
+  /**
+   * Get current user info from session
+   * Used by WebSocket clients to get userId for registration
+   */
+  @Get('me')
+  me(@Req() req: Request): { userId: number | null } {
+    const userId = req.session?.userId ?? null;
+    return { userId };
+  }
+
   private getOAuthClient(): OAuth2Client {
     const baseUrl = process.env.APP_BASE_URL;
     const clientId = process.env.GOOGLE_CLIENT_ID;
