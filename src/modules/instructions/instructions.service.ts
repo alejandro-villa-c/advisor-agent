@@ -199,25 +199,26 @@ ${existingList}
 New instruction:
 "${newInstruction}"
 
-A conflict exists if:
-- The new instruction directly contradicts an existing one (e.g., "ignore all emails" vs "reply to all emails")
-- The new instruction would cause opposite actions for the same trigger
+A conflict exists ONLY if:
+- The new instruction directly CONTRADICTS an existing one (opposite actions on the same data)
 - The instructions would create an infinite loop
+- Example: "delete all emails" vs "reply to all emails" (can't reply to deleted emails)
+- Example: "ignore contact X" vs "always email contact X" (direct contradiction)
+
+NOT a conflict (these are fine):
+- Same trigger, different actions (e.g., "reply to emails" AND "add note for emails" - both can happen)
+- Same trigger, different filters (e.g., "reply to clients" AND "add note for emails from John")
+- Complementary actions (e.g., "send welcome email" AND "create note" for new contacts)
+- Different triggers entirely
+
+Be VERY lenient - only flag true logical contradictions where both instructions cannot possibly coexist.
 
 Return ONLY valid JSON:
 {
   "hasConflict": boolean,
   "conflictingIndex": number | null,  // 1-based index of conflicting instruction, or null
   "reason": string | null  // Brief explanation if conflict exists
-}
-
-Examples of conflicts:
-- "When I receive an email, delete it" conflicts with "When I receive an email, reply with thanks"
-- "Ignore all contacts" conflicts with "Create a note for every contact"
-
-Examples of NON-conflicts:
-- "When I receive an email from clients, reply" and "When I receive spam, ignore" (different conditions)
-- "Send welcome email to new contacts" and "Add note when contact created" (different actions, same trigger is OK)`;
+}`;
 
     try {
       const raw = await this.llm.complete({
