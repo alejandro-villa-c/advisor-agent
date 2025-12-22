@@ -424,7 +424,7 @@ export class InstructionTickWorker implements OnModuleInit {
 
       triggers.push({
         type: triggerType,
-        summary: `Calendar event ${isNew || createdRecently ? 'created' : 'updated'}: ${event.summary ?? '(no title)'}`,
+        summary: `Calendar event ${isNew || createdRecently ? 'created' : 'updated'}: ${event.summary ?? '(no title)'} (${event.googleEventId})`,
         data: {
           googleEventId: event.googleEventId,
           summary: event.summary,
@@ -503,7 +503,7 @@ export class InstructionTickWorker implements OnModuleInit {
 
       triggers.push({
         type: triggerType,
-        summary: `HubSpot contact ${isNew || createdRecently ? 'created' : 'updated'}: ${displayName}`,
+        summary: `HubSpot contact ${isNew || createdRecently ? 'created' : 'updated'}: ${displayName} (${contact.hubspotContactId})`,
         data: {
           hubspotContactId: contact.hubspotContactId,
           email: contact.email,

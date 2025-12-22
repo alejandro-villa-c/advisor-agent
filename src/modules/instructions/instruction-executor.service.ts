@@ -77,15 +77,15 @@ export class InstructionExecutorService {
       }
 
       // Check if this specific instruction already processed this trigger
-      const triggerKey = `${trigger.type}:${trigger.summary}:inst${instruction.id}`;
       const alreadyProcessed = await this.instructionsService.isTriggerProcessed(
         userId,
         trigger.type,
-        triggerKey,
+        trigger.summary,
+        instruction.id,
       );
       if (alreadyProcessed) {
         this.logger.debug(
-          `[InstructionExecutor] Instruction ${instruction.id} already processed trigger: ${trigger.type}`,
+          `[InstructionExecutor] Instruction ${instruction.id} already processed trigger: ${trigger.type} - ${trigger.summary}`,
         );
         continue;
       }

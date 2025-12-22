@@ -375,28 +375,44 @@ Examples of NON-conflicts:
   }
 
   /**
-   * Check if a trigger has already been processed (idempotency)
-   * Uses triggerType + triggerSummary as a composite key
+   * Check if a trigger has already been processed for a specific instruction (idempotency)
+   * Uses triggerType + unique trigger identifier + instructionId as a composite key
    */
   async isTriggerProcessed(
     userId: number,
     triggerType: string,
-    triggerSummary: string,
+    triggerKey: string,
+    instructionId?: number,
   ): Promise<boolean> {
-    // Check if we've processed this exact trigger in the last hour
-    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    // Check if we've processed this exact trigger in the last 24 hours
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    // Build the where conditions
+    const conditions = [
+      eq(proactiveActions.userId, userId),
+      sql`${proactiveActions.triggerType} = ${triggerType}`,
+      gt(proactiveActions.createdAt, oneDayAgo),
+    ];
+
+    // If instruction ID is provided, check for that specific instruction
+    if (instructionId !== undefined) {
+      conditions.push(eq(proactiveActions.instructionId, instructionId));
+    }
+
+    // Check triggerSummary contains the unique identifier
+    // triggerKey format: "triggerType:summary:instN" or just "summary"
+    const summaryPart = triggerKey.includes(':inst')
+      ? triggerKey.split(':inst')[0].replace(`${triggerType}:`, '')
+      : triggerKey;
+
+    if (summaryPart) {
+      conditions.push(eq(proactiveActions.triggerSummary, summaryPart));
+    }
 
     const existing = await this.dbService.db
       .select({ id: proactiveActions.id })
       .from(proactiveActions)
-      .where(
-        and(
-          eq(proactiveActions.userId, userId),
-          sql`${proactiveActions.triggerType} = ${triggerType}`,
-          eq(proactiveActions.triggerSummary, triggerSummary),
-          gt(proactiveActions.createdAt, oneHourAgo),
-        ),
-      )
+      .where(and(...conditions))
       .limit(1);
 
     return existing.length > 0;
