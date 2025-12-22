@@ -201,7 +201,7 @@ export class ChatWebSocketGateway implements OnGatewayConnection, OnGatewayDisco
     threadId: number,
     message: { role: string; content: string },
   ): void {
-    this.emitToThread(userId, threadId, 'new-message', {
+    this.emitToThread(userId, threadId, 'new_message', {
       threadId,
       message,
     });

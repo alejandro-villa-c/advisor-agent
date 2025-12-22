@@ -205,7 +205,7 @@
 
       // Register this socket for the current thread
       // Fetch userId from the page or session
-      fetch('/api/auth/me', { credentials: 'same-origin' })
+      fetch('/auth/me', { credentials: 'same-origin' })
         .then(res => res.json())
         .then(data => {
           const userId = data.userId || data.id;
@@ -228,7 +228,7 @@
       console.log('WebSocket disconnected:', reason);
     });
 
-    socket.on('new-message', (data) => {
+    socket.on('new_message', (data) => {
       console.log('Received new message:', data);
 
       // Only render if it's for the current thread

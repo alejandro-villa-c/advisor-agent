@@ -42,7 +42,7 @@
       console.log('[Instructions] WebSocket connected:', socket.id);
 
       // Fetch userId and register
-      fetch('/api/auth/me', { credentials: 'same-origin' })
+      fetch('/auth/me', { credentials: 'same-origin' })
         .then(res => res.json())
         .then(data => {
           const userId = data.userId || data.id;
