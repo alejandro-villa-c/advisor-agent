@@ -9,7 +9,6 @@ import { InstructionsService } from './instructions.service';
 import { InstructionsController } from './instructions.controller';
 import { InstructionExecutorService } from './instruction-executor.service';
 import { ConfigModule } from '@nestjs/config';
-import { ToolsModule } from '../tools/tools.module';
 import { WebSocketModule } from '../websocket/websocket.module';
 
 @Module({
@@ -20,7 +19,6 @@ import { WebSocketModule } from '../websocket/websocket.module';
     GoogleModule,
     HubspotModule,
     ConfigModule,
-    ToolsModule,
     WebSocketModule,
   ],
   controllers: [InstructionsController],

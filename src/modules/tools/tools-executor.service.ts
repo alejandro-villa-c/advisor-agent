@@ -3,6 +3,7 @@ import { GmailApiService } from '../integrations/google/gmail-api.service';
 import { CalendarApiService } from '../integrations/google/calendar-api.service';
 import { HubspotApiService } from '../integrations/hubspot/hubspot-api.service';
 import { SyncedDataToolsService } from './synced-data-tools.service';
+import { InstructionsService } from '../instructions/instructions.service';
 
 export type ToolExecutionResult = {
   success: boolean;
@@ -26,6 +27,7 @@ export class ToolExecutorService {
     private readonly calendarApi: CalendarApiService,
     private readonly hubspotApi: HubspotApiService,
     private readonly syncedDataTools: SyncedDataToolsService,
+    private readonly instructionsService: InstructionsService,
   ) {}
 
   /**
@@ -498,6 +500,59 @@ export class ToolExecutorService {
               limit: { type: 'number', description: 'Max notes to return (default 10)' },
             },
             required: ['contactId'],
+          },
+        },
+      },
+
+      // =========================================================================
+      // INSTRUCTION MANAGEMENT TOOLS
+      // =========================================================================
+      {
+        type: 'function',
+        function: {
+          name: 'list_instructions',
+          description:
+            'List all ongoing instructions for the user. Use to see what automated rules are currently set up.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'delete_instruction',
+          description:
+            'Delete an ongoing instruction by ID. Use when the user wants to remove an automated rule.',
+          parameters: {
+            type: 'object',
+            properties: {
+              instructionId: {
+                type: 'number',
+                description: 'The ID of the instruction to delete',
+              },
+            },
+            required: ['instructionId'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'toggle_instruction',
+          description:
+            'Pause or resume an ongoing instruction by ID. Use to temporarily disable/enable an automated rule without deleting it.',
+          parameters: {
+            type: 'object',
+            properties: {
+              instructionId: {
+                type: 'number',
+                description: 'The ID of the instruction to toggle',
+              },
+            },
+            required: ['instructionId'],
           },
         },
       },
@@ -1025,6 +1080,46 @@ export class ToolExecutorService {
             timestamp: n.timestamp,
           })),
         };
+      }
+
+      // =========================================================================
+      // INSTRUCTION MANAGEMENT TOOLS
+      // =========================================================================
+      case 'list_instructions': {
+        const instructions = await this.instructionsService.listInstructions(userId);
+        return {
+          count: instructions.length,
+          instructions: instructions.map((inst) => ({
+            id: inst.id,
+            instruction: inst.instruction,
+            isActive: inst.isActive,
+            createdAt: inst.createdAt.toISOString(),
+          })),
+        };
+      }
+
+      case 'delete_instruction': {
+        const instructionId = safeNumber(params.instructionId, 0);
+        if (!instructionId) {
+          throw new Error('instructionId is required');
+        }
+        const deleted = await this.instructionsService.deleteInstruction(userId, instructionId);
+        if (!deleted) {
+          throw new Error(`Instruction ${instructionId} not found or not owned by user`);
+        }
+        return { deleted: true, instructionId };
+      }
+
+      case 'toggle_instruction': {
+        const instructionId = safeNumber(params.instructionId, 0);
+        if (!instructionId) {
+          throw new Error('instructionId is required');
+        }
+        const result = await this.instructionsService.toggleInstruction(userId, instructionId);
+        if (!result) {
+          throw new Error(`Instruction ${instructionId} not found or not owned by user`);
+        }
+        return { toggled: true, instructionId, isActive: result.isActive };
       }
 
       // =========================================================================
