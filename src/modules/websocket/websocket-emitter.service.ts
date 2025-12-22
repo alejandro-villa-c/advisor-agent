@@ -1,5 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
 
+export type ActivityLogEvent = {
+  id: number;
+  triggerType: string;
+  triggerSummary: string;
+  instructionText: string;
+  actionTaken: string;
+  status: 'running' | 'completed' | 'failed';
+  error?: string;
+};
+
 @Injectable()
 export class WebSocketEmitterService {
   private readonly logger = new Logger(WebSocketEmitterService.name);
@@ -24,6 +34,14 @@ export class WebSocketEmitterService {
       return true;
     }
 
+    return this.emit(userId, 'new_message', { threadId, message });
+  }
+
+  async emitActivityLog(userId: number, activity: ActivityLogEvent): Promise<boolean> {
+    return this.emit(userId, 'activity_log', activity);
+  }
+
+  private async emit(userId: number, event: string, data: unknown): Promise<boolean> {
     const url = `${this.webServerUrl}/internal/websocket/emit`;
 
     // Retry up to 2 times with a small delay
@@ -37,8 +55,8 @@ export class WebSocketEmitterService {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             userId,
-            threadId,
-            message,
+            event,
+            data,
             secret: this.secret,
           }),
           signal: controller.signal,
@@ -53,7 +71,7 @@ export class WebSocketEmitterService {
           );
 
           if (attempt < 2) {
-            await this.delay(500); // Wait 500ms before retry
+            await this.delay(500);
             continue;
           }
           return false;
@@ -62,7 +80,7 @@ export class WebSocketEmitterService {
         const result = (await response.json()) as { ok: boolean };
 
         if (result.ok) {
-          this.logger.debug(`WebSocket emit success: user=${userId} thread=${threadId}`);
+          this.logger.debug(`WebSocket emit success: user=${userId} event=${event}`);
         }
 
         return result.ok === true;

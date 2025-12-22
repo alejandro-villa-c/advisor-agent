@@ -223,13 +223,18 @@ export class InstructionTickWorker implements OnModuleInit {
 
   /**
    * Filter instructions to only those that were created BEFORE the trigger event occurred.
+   * Allows a small tolerance window (5 minutes) to handle near-simultaneous creation.
    */
   private filterInstructionsByTriggerTime(
     instructions: InstructionRow[],
     eventTimestamp: Date,
   ): InstructionRow[] {
+    // Add 5 minute tolerance - instruction created within 5 min of event is still valid
+    const toleranceMs = 5 * 60 * 1000;
+    const adjustedEventTime = eventTimestamp.getTime() + toleranceMs;
+
     return instructions.filter((inst) => {
-      return inst.createdAt.getTime() < eventTimestamp.getTime();
+      return inst.createdAt.getTime() < adjustedEventTime;
     });
   }
 

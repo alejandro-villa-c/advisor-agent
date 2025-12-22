@@ -1,8 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { DbService } from '../../db/db.service';
 import { OpenAiChatService } from '../integrations/openai/openai-chat.service';
-import { ToolExecutorService } from '../tools/tools-executor.service';
+import { GmailApiService } from '../integrations/google/gmail-api.service';
+import { CalendarApiService } from '../integrations/google/calendar-api.service';
+import { HubspotApiService } from '../integrations/hubspot/hubspot-api.service';
 import { InstructionsService, InstructionRow } from './instructions.service';
+import { WebSocketEmitterService } from '../websocket/websocket-emitter.service';
 
 export type TriggerEvent = {
   type:
@@ -32,17 +35,6 @@ type ActionPlan = {
   reasoning: string;
 };
 
-/**
- * InstructionExecutorService - Executes proactive actions based on ongoing instructions.
- *
- * This service:
- * 1. Receives trigger events (new email, calendar change, etc.)
- * 2. Uses LLM to determine if any active instruction applies
- * 3. Plans and executes actions using the shared ToolExecutorService
- *
- * Uses the shared ToolExecutorService for actual tool execution,
- * which is also used by the AgentRunnerService.
- */
 @Injectable()
 export class InstructionExecutorService {
   private readonly logger = new Logger(InstructionExecutorService.name);
@@ -51,7 +43,10 @@ export class InstructionExecutorService {
     private readonly dbService: DbService,
     private readonly llm: OpenAiChatService,
     private readonly instructionsService: InstructionsService,
-    private readonly toolExecutor: ToolExecutorService,
+    private readonly gmailApi: GmailApiService,
+    private readonly calendarApi: CalendarApiService,
+    private readonly hubspotApi: HubspotApiService,
+    private readonly wsEmitter: WebSocketEmitterService,
   ) {}
 
   /**
@@ -65,8 +60,8 @@ export class InstructionExecutorService {
   ): Promise<void> {
     if (instructions.length === 0) return;
 
-    // Safety: Check for self-loop (agent's own emails)
-    if (this.isSelfGeneratedTrigger(trigger)) {
+    // Safety: Check for self-loop (agent's own actions)
+    if (this.isSelfGeneratedTrigger(userId, trigger)) {
       this.logger.debug(`[InstructionExecutor] Skipping self-generated trigger: ${trigger.type}`);
       return;
     }
@@ -119,35 +114,67 @@ export class InstructionExecutorService {
         status: 'running',
       });
 
+      // Emit WebSocket event for new activity
+      await this.wsEmitter.emitActivityLog(userId, {
+        id: actionLogId,
+        triggerType: trigger.type,
+        triggerSummary: trigger.summary,
+        instructionText: plan.matchingInstructionText ?? '',
+        actionTaken: `${action.tool}: ${action.description}`,
+        status: 'running',
+      });
+
       try {
-        // Use shared ToolExecutorService
-        const result = await this.toolExecutor.execute(userId, action.tool, action.params);
+        const result = await this.executeAction(userId, action);
 
-        if (result.success) {
-          // Update log to completed
-          await this.instructionsService.updateProactiveAction(actionLogId, {
-            status: 'completed',
-            actionResult: result.data,
-          });
-
-          // Increment rate limit counter
-          await this.instructionsService.incrementRateLimit(userId);
-        } else {
-          // Update log to failed
-          await this.instructionsService.updateProactiveAction(actionLogId, {
-            status: 'failed',
-            error: result.error,
-          });
+        // Track created resources to prevent self-triggered loops
+        if (result && typeof result === 'object') {
+          const resourceId = result.contactId || result.eventId || result.noteId;
+          if (resourceId && typeof resourceId === 'string') {
+            this.instructionsService.trackCreatedResource(userId, resourceId);
+          }
         }
+
+        // Update log to completed
+        await this.instructionsService.updateProactiveAction(actionLogId, {
+          status: 'completed',
+          actionResult: result,
+        });
+
+        // Emit WebSocket event for completed action
+        await this.wsEmitter.emitActivityLog(userId, {
+          id: actionLogId,
+          triggerType: trigger.type,
+          triggerSummary: trigger.summary,
+          instructionText: plan.matchingInstructionText ?? '',
+          actionTaken: `${action.tool}: ${action.description}`,
+          status: 'completed',
+        });
+
+        // Increment rate limit counter
+        await this.instructionsService.incrementRateLimit(userId);
       } catch (err) {
         this.logger.error(
           `[InstructionExecutor] Action failed: ${err instanceof Error ? err.message : String(err)}`,
         );
 
+        const errorMessage = err instanceof Error ? err.message : String(err);
+
         // Update log to failed
         await this.instructionsService.updateProactiveAction(actionLogId, {
           status: 'failed',
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessage,
+        });
+
+        // Emit WebSocket event for failed action
+        await this.wsEmitter.emitActivityLog(userId, {
+          id: actionLogId,
+          triggerType: trigger.type,
+          triggerSummary: trigger.summary,
+          instructionText: plan.matchingInstructionText ?? '',
+          actionTaken: `${action.tool}: ${action.description}`,
+          status: 'failed',
+          error: errorMessage,
         });
       }
     }
@@ -156,7 +183,8 @@ export class InstructionExecutorService {
   /**
    * Check if this trigger was generated by the agent itself (to prevent loops)
    */
-  private isSelfGeneratedTrigger(trigger: TriggerEvent): boolean {
+  private isSelfGeneratedTrigger(userId: number, trigger: TriggerEvent): boolean {
+    // Check for self-sent emails
     if (trigger.type === 'gmail_received') {
       const data = trigger.data;
 
@@ -171,6 +199,31 @@ export class InstructionExecutorService {
 
       if (snippet.includes('[sent by ai assistant]') || subject.includes('[automated]')) {
         return true;
+      }
+    }
+
+    // Check if this trigger is for a resource we recently created
+    // This prevents loops like: email → create contact → contact_created trigger → try to create again
+    if (
+      trigger.type === 'hubspot_contact_created' ||
+      trigger.type === 'hubspot_contact_updated' ||
+      trigger.type === 'hubspot_note_created' ||
+      trigger.type === 'calendar_event_created' ||
+      trigger.type === 'calendar_event_updated'
+    ) {
+      const resourceId = safeString(
+        trigger.data.contactId || trigger.data.eventId || trigger.data.noteId,
+      );
+      if (resourceId) {
+        // Check if we created this resource in recent actions (last 5 minutes)
+        const wasCreatedByUs = this.instructionsService.wasResourceCreatedByAgent(
+          userId,
+          resourceId,
+          5 * 60 * 1000, // 5 minute window
+        );
+        if (wasCreatedByUs) {
+          return true;
+        }
       }
     }
 
@@ -205,24 +258,7 @@ Summary: ${trigger.summary}
 Details: ${JSON.stringify(trigger.data, null, 2)}
     `.trim();
 
-    // Get tool definitions from shared service
-    const toolDefs = this.toolExecutor.getToolDefinitions();
-    const toolDescriptions = toolDefs
-      .filter(
-        (t) =>
-          ![
-            'await_user_message',
-            'await_email_reply',
-            'await_calendar_event',
-            'remember',
-            'complete_task',
-            'fail_task',
-          ].includes(t.function.name),
-      )
-      .map((t) => `- ${t.function.name}: ${t.function.description}`)
-      .join('\n');
-
-    const systemPrompt = `You are evaluating whether any ongoing instructions apply to a trigger event.
+    const systemPrompt = `You are an AI assistant that evaluates trigger events against user-defined instructions and plans appropriate actions.
 
 TRIGGER EVENT:
 ${triggerDescription}
@@ -231,101 +267,59 @@ USER'S ACTIVE INSTRUCTIONS:
 ${instructionsList}
 
 AVAILABLE TOOLS:
-${toolDescriptions}
 
-═══════════════════════════════════════════════════════════════════════════════
-CRITICAL: EXTRACTING DATA FROM TRIGGER EVENTS
-═══════════════════════════════════════════════════════════════════════════════
+**Gmail:**
+- gmail_send_email: Send a new email. REQUIRED: to, subject, bodyText. Optional: cc, bcc
+- gmail_reply: Reply to an email thread. REQUIRED: threadId, bodyText
+- gmail_search: Search emails. Params: query, maxResults?
+- gmail_get_thread: Get full thread content. Params: threadId
 
-For gmail_received triggers, the trigger data contains PARSED sender information.
-You MUST use ALL available fields when creating contacts:
+**Calendar:**
+- calendar_create_event: Create event. REQUIRED: summary, startIso, endIso. Optional: description, attendees
+- calendar_update_event: Update event. REQUIRED: eventId. Optional: summary, startIso, endIso, description
+- calendar_delete_event: Delete event. REQUIRED: eventId
+- calendar_find_events: Search events. Optional: query, attendeeEmail, timeMinIso, timeMaxIso, maxResults
 
-The "sender" object contains:
-- sender.email: The sender's email address (ALWAYS use this)
-- sender.firstName: First name (use if available, otherwise null)
-- sender.lastName: Last name (use if available, otherwise null)
-- sender.name: Full name (use if firstName/lastName not available)
+**HubSpot:**
+- hubspot_create_contact: Create contact. REQUIRED: email. Optional: firstName, lastName
+- hubspot_update_contact: Update contact. REQUIRED: contactId. Optional: email, firstName, lastName, company, phone
+- hubspot_delete_contact: Delete contact. REQUIRED: contactId
+- hubspot_get_contact: Get contact. Params: contactId OR email
+- hubspot_find_contact: Search contacts. Params: query, maxResults?
+- hubspot_find_or_create_contact: Find existing or create new contact. REQUIRED: email. Optional: firstName, lastName, noteBody
+- hubspot_create_note: Add note to contact. REQUIRED: contactId, body
+- hubspot_delete_note: Delete note. REQUIRED: noteId
 
-EXAMPLE - Trigger data contains:
-{
-  "sender": {
-    "email": "john.smith@example.com",
-    "firstName": "John",
-    "lastName": "Smith",
-    "name": "John Smith"
-  }
-}
+GUIDELINES:
+- Match trigger events to instructions based on intent, not just keywords
+- Only act when an instruction clearly applies
+- Generate appropriate content for required fields (email body, subject, notes, etc.)
+- Use data from the trigger event to populate action parameters
+- For gmail_received triggers: sender info is in sender.email, sender.firstName, sender.lastName, sender.name
+- Skip automated emails (noreply@, notifications, newsletters, system-generated)
+- When in doubt, don't act
 
-When using hubspot_find_or_create_contact, you MUST include:
-{
-  "email": "john.smith@example.com",
-  "firstName": "John",      // FROM sender.firstName
-  "lastName": "Smith",      // FROM sender.lastName
-  "noteBody": "..."
-}
-
-DO NOT omit firstName or lastName if they are present in the trigger data!
-
-═══════════════════════════════════════════════════════════════════════════════
-RESPONSE FORMAT
-═══════════════════════════════════════════════════════════════════════════════
+CONTENT GENERATION RULES:
+- NEVER use placeholders like [Your Name], [Company], [Date], etc.
+- If you don't have specific information, write naturally without it or use generic phrasing
+- For emails: write complete, ready-to-send content using only available data
+- Sign emails simply with "Best regards" or similar - do NOT add a name placeholder
+- Use actual values from trigger data (attendee names, event titles, dates, etc.)
+- Keep generated content professional, concise, and natural
 
 Return ONLY valid JSON:
 {
   "shouldAct": boolean,
-  "matchingInstructionIndex": number | null,  // 1-based index
+  "matchingInstructionIndex": number | null,
   "reasoning": string,
   "actions": [
     {
       "tool": string,
-      "description": string,  // Human-readable description
-      "params": { ... }       // Tool-specific parameters - INCLUDE ALL AVAILABLE DATA
+      "description": string,
+      "params": { ... }
     }
   ]
-}
-
-═══════════════════════════════════════════════════════════════════════════════
-IMPORTANT RULES
-═══════════════════════════════════════════════════════════════════════════════
-
-1. Only act if an instruction CLEARLY applies to this trigger
-2. Don't act on automated/system emails (noreply@, notifications, newsletters)
-3. Use hubspot_find_or_create_contact with ALL available contact fields (email, firstName, lastName)
-4. Be conservative - when in doubt, don't act
-5. NEVER act on emails from AI/automated systems
-6. For notes, include relevant context (email subject, snippet)
-
-═══════════════════════════════════════════════════════════════════════════════
-EXAMPLES
-═══════════════════════════════════════════════════════════════════════════════
-
-Instruction: "When someone emails me that's not in HubSpot, create a contact"
-Trigger: gmail_received with sender.email="alejandro@example.com", sender.firstName="Alejandro", sender.lastName="Villa"
-
-CORRECT action:
-{
-  "tool": "hubspot_find_or_create_contact",
-  "description": "Creating contact for Alejandro Villa",
-  "params": {
-    "email": "alejandro@example.com",
-    "firstName": "Alejandro",
-    "lastName": "Villa",
-    "noteBody": "Received email with subject: [subject]. Snippet: [snippet]"
-  }
-}
-
-WRONG (missing lastName):
-{
-  "tool": "hubspot_find_or_create_contact",
-  "params": {
-    "email": "alejandro@example.com",
-    "firstName": "Alejandro"
-  }
-}
-
-═══════════════════════════════════════════════════════════════════════════════
-
-Analyze the trigger and plan actions, making sure to include ALL available data fields.`;
+}`;
 
     try {
       const raw = await this.llm.complete({
@@ -391,6 +385,237 @@ Analyze the trigger and plan actions, making sure to include ALL available data 
       };
     }
   }
+
+  /**
+   * Execute a single action
+   */
+  private async executeAction(
+    userId: number,
+    action: { tool: string; description: string; params: Record<string, unknown> },
+  ): Promise<Record<string, unknown>> {
+    const { tool, params } = action;
+
+    switch (tool) {
+      // =========================================================================
+      // GMAIL TOOLS
+      // =========================================================================
+      case 'gmail_send_email': {
+        const result = await this.gmailApi.sendEmail(userId, {
+          to: safeString(params.to),
+          subject: safeString(params.subject),
+          bodyText: safeString(params.bodyText),
+          cc: safeStringOrUndefined(params.cc),
+          bcc: safeStringOrUndefined(params.bcc),
+        });
+        return { success: true, result };
+      }
+
+      case 'gmail_reply': {
+        const threadId = safeString(params.threadId);
+        const bodyText = safeString(params.bodyText);
+
+        // Get thread info for proper reply
+        const messages = await this.gmailApi.getThreadMessages(userId, threadId);
+        const lastMessage = messages[messages.length - 1];
+
+        const result = await this.gmailApi.sendEmail(userId, {
+          to: lastMessage?.headers.from ?? '',
+          subject: lastMessage?.headers.subject
+            ? `Re: ${lastMessage.headers.subject.replace(/^Re:\s*/i, '')}`
+            : 'Re:',
+          bodyText,
+          threadId,
+          inReplyToMessageId: lastMessage?.headers.messageId,
+        });
+        return { success: true, result };
+      }
+
+      case 'gmail_search': {
+        const query = safeString(params.query);
+        const maxResults = safeNumber(params.maxResults, 10);
+        const results = await this.gmailApi.listMessageIds(userId, { q: query, maxResults });
+        return { success: true, messageIds: results };
+      }
+
+      case 'gmail_get_thread': {
+        const threadId = safeString(params.threadId);
+        const messages = await this.gmailApi.getThreadMessages(userId, threadId);
+        return { success: true, messages };
+      }
+
+      // =========================================================================
+      // CALENDAR TOOLS
+      // =========================================================================
+      case 'calendar_create_event': {
+        const attendeesRaw = params.attendees;
+        const attendees = Array.isArray(attendeesRaw)
+          ? attendeesRaw
+              .map((a) => {
+                if (typeof a === 'string') return { email: a };
+                if (isRecord(a)) {
+                  return {
+                    email: safeString(a.email),
+                    displayName: safeStringOrUndefined(a.displayName),
+                  };
+                }
+                return null;
+              })
+              .filter((a): a is { email: string; displayName?: string } => a !== null && !!a.email)
+          : undefined;
+
+        const result = await this.calendarApi.createEvent(userId, {
+          summary: safeString(params.summary),
+          startIso: safeString(params.startIso),
+          endIso: safeString(params.endIso),
+          description: safeStringOrUndefined(params.description),
+          attendees,
+        });
+        return { success: true, eventId: result.id };
+      }
+
+      case 'calendar_update_event': {
+        const result = await this.calendarApi.updateEvent(userId, {
+          eventId: safeString(params.eventId),
+          summary: safeStringOrUndefined(params.summary),
+          startIso: safeStringOrUndefined(params.startIso),
+          endIso: safeStringOrUndefined(params.endIso),
+          description: safeStringOrUndefined(params.description),
+        });
+        return { success: true, eventId: result.id };
+      }
+
+      case 'calendar_delete_event': {
+        const eventId = safeString(params.eventId);
+        await this.calendarApi.deleteEvent(userId, eventId);
+        return { success: true, eventId, deleted: true };
+      }
+
+      case 'calendar_find_events': {
+        const query = safeStringOrUndefined(params.query);
+        const attendeeEmail = safeStringOrUndefined(params.attendeeEmail);
+        const timeMinIso = safeStringOrUndefined(params.timeMinIso) ?? new Date().toISOString();
+        const timeMaxIso =
+          safeStringOrUndefined(params.timeMaxIso) ??
+          new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+        const maxResults = safeNumber(params.maxResults, 10);
+
+        const events = await this.calendarApi.findEvents(userId, {
+          query,
+          attendeeEmail,
+          timeMinIso,
+          timeMaxIso,
+          maxResults,
+        });
+        return { success: true, events };
+      }
+
+      // =========================================================================
+      // HUBSPOT TOOLS
+      // =========================================================================
+      case 'hubspot_create_contact': {
+        const result = await this.hubspotApi.createContact(userId, {
+          email: safeString(params.email),
+          firstName: safeStringOrUndefined(params.firstName),
+          lastName: safeStringOrUndefined(params.lastName),
+        });
+        return { success: true, contactId: result.id };
+      }
+
+      case 'hubspot_update_contact': {
+        const contactId = safeString(params.contactId);
+        const result = await this.hubspotApi.updateContact(userId, contactId, {
+          email: safeStringOrUndefined(params.email),
+          firstName: safeStringOrUndefined(params.firstName),
+          lastName: safeStringOrUndefined(params.lastName),
+          company: safeStringOrUndefined(params.company),
+          phone: safeStringOrUndefined(params.phone),
+        });
+        return { success: true, contactId: result.id };
+      }
+
+      case 'hubspot_delete_contact': {
+        const contactId = safeString(params.contactId);
+        await this.hubspotApi.deleteContact(userId, contactId);
+        return { success: true, contactId, deleted: true };
+      }
+
+      case 'hubspot_get_contact': {
+        const contactId = safeStringOrUndefined(params.contactId);
+        const email = safeStringOrUndefined(params.email);
+
+        if (contactId) {
+          const contact = await this.hubspotApi.getContact(userId, contactId);
+          return { success: true, contact };
+        } else if (email) {
+          const contacts = await this.hubspotApi.searchContacts(userId, email, 1);
+          const contact = contacts.find((c) => c.email?.toLowerCase() === email.toLowerCase());
+          return { success: true, contact: contact ?? null, found: !!contact };
+        } else {
+          throw new Error('Either contactId or email is required');
+        }
+      }
+
+      case 'hubspot_find_contact': {
+        const query = safeString(params.query);
+        const maxResults = safeNumber(params.maxResults, 10);
+        const contacts = await this.hubspotApi.searchContacts(userId, query, maxResults);
+        return { success: true, contacts };
+      }
+
+      case 'hubspot_find_or_create_contact': {
+        const email = safeString(params.email);
+        const firstName = safeStringOrUndefined(params.firstName);
+        const lastName = safeStringOrUndefined(params.lastName);
+        const noteBody = safeStringOrUndefined(params.noteBody);
+
+        if (!email) {
+          throw new Error('Email is required for hubspot_find_or_create_contact');
+        }
+
+        // Use the existing findOrCreateContactByEmail method
+        const result = await this.hubspotApi.findOrCreateContactByEmail(userId, {
+          email,
+          firstName,
+          lastName,
+        });
+
+        // Add note if requested
+        let noteId: string | null = null;
+        if (noteBody && result.id) {
+          const noteResult = await this.hubspotApi.createNoteOnContact(userId, {
+            contactId: result.id,
+            body: noteBody,
+          });
+          noteId = noteResult.noteId;
+        }
+
+        return {
+          success: true,
+          contactId: result.id,
+          wasCreated: result.created,
+          alreadyExisted: !result.created,
+          noteId,
+        };
+      }
+
+      case 'hubspot_create_note': {
+        const result = await this.hubspotApi.createNoteOnContact(userId, {
+          contactId: safeString(params.contactId),
+          body: safeString(params.body),
+        });
+        return { success: true, noteId: result.noteId };
+      }
+
+      case 'hubspot_delete_note': {
+        const noteId = safeString(params.noteId);
+        await this.hubspotApi.deleteNote(userId, noteId);
+        return { success: true, noteId, deleted: true };
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${tool}`);
+    }
+  }
 }
 
 // =============================================================================
@@ -419,4 +644,20 @@ function safeString(value: unknown): string {
   if (value === null || value === undefined) return '';
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return '';
+}
+
+function safeStringOrUndefined(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return undefined;
+}
+
+function safeNumber(value: unknown, defaultValue: number): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = parseInt(value, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return defaultValue;
 }

@@ -386,26 +386,13 @@ Examples of NON-conflicts:
     // Check if we've processed this exact trigger in the last hour
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
 
-    // Cast to the enum type to satisfy TypeScript
-    const typedTriggerType = triggerType as
-      | 'gmail_received'
-      | 'gmail_sent'
-      | 'calendar_event_created'
-      | 'calendar_event_updated'
-      | 'calendar_event_deleted'
-      | 'hubspot_contact_created'
-      | 'hubspot_contact_updated'
-      | 'hubspot_contact_deleted'
-      | 'hubspot_note_created'
-      | 'hubspot_note_deleted';
-
     const existing = await this.dbService.db
       .select({ id: proactiveActions.id })
       .from(proactiveActions)
       .where(
         and(
           eq(proactiveActions.userId, userId),
-          eq(proactiveActions.triggerType, typedTriggerType),
+          sql`${proactiveActions.triggerType} = ${triggerType}`,
           eq(proactiveActions.triggerSummary, triggerSummary),
           gt(proactiveActions.createdAt, oneHourAgo),
         ),
@@ -521,24 +508,53 @@ Examples of NON-conflicts:
 
   /**
    * Increment rate limit counter
-   * Uses PostgreSQL upsert (INSERT ... ON CONFLICT DO UPDATE) for atomicity
+   * Uses check-then-update to avoid constraint issues
    */
   async incrementRateLimit(userId: number): Promise<void> {
     const now = new Date();
     const hourWindow = new Date(now);
     hourWindow.setMinutes(0, 0, 0);
+    hourWindow.setMilliseconds(0); // Important: zero out milliseconds for consistent matching
 
-    await this.dbService.db
-      .insert(proactiveActionRateLimits)
-      .values({
-        userId,
-        hourWindow,
-        actionCount: 1,
-      })
-      .onConflictDoUpdate({
-        target: [proactiveActionRateLimits.userId, proactiveActionRateLimits.hourWindow],
-        set: { actionCount: sql`${proactiveActionRateLimits.actionCount} + 1` },
-      });
+    // Check if record exists
+    const existing = await this.dbService.db
+      .select({ id: proactiveActionRateLimits.id })
+      .from(proactiveActionRateLimits)
+      .where(
+        and(
+          eq(proactiveActionRateLimits.userId, userId),
+          eq(proactiveActionRateLimits.hourWindow, hourWindow),
+        ),
+      )
+      .limit(1);
+
+    if (existing.length > 0) {
+      // Update existing record
+      await this.dbService.db
+        .update(proactiveActionRateLimits)
+        .set({ actionCount: sql`${proactiveActionRateLimits.actionCount} + 1` })
+        .where(eq(proactiveActionRateLimits.id, existing[0].id));
+    } else {
+      // Insert new record - wrap in try/catch for race condition
+      try {
+        await this.dbService.db.insert(proactiveActionRateLimits).values({
+          userId,
+          hourWindow,
+          actionCount: 1,
+        });
+      } catch {
+        // Race condition - another process inserted, so update instead
+        await this.dbService.db
+          .update(proactiveActionRateLimits)
+          .set({ actionCount: sql`${proactiveActionRateLimits.actionCount} + 1` })
+          .where(
+            and(
+              eq(proactiveActionRateLimits.userId, userId),
+              eq(proactiveActionRateLimits.hourWindow, hourWindow),
+            ),
+          );
+      }
+    }
   }
 
   /**
@@ -574,6 +590,35 @@ Examples of NON-conflicts:
       .update(instructionTriggerStates)
       .set({ state: merged, updatedAt: sql`now()` })
       .where(eq(instructionTriggerStates.userId, userId));
+  }
+
+  /**
+   * Track a resource ID that was created by the agent.
+   * This is stored in a simple in-memory cache with TTL.
+   */
+  private createdResourcesCache = new Map<string, number>(); // resourceId -> timestamp
+
+  trackCreatedResource(userId: number, resourceId: string): void {
+    const key = `${userId}:${resourceId}`;
+    this.createdResourcesCache.set(key, Date.now());
+
+    // Clean up old entries (older than 10 minutes)
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    for (const [k, timestamp] of this.createdResourcesCache.entries()) {
+      if (timestamp < cutoff) {
+        this.createdResourcesCache.delete(k);
+      }
+    }
+  }
+
+  /**
+   * Check if a resource was recently created by the agent.
+   */
+  wasResourceCreatedByAgent(userId: number, resourceId: string, windowMs: number): boolean {
+    const key = `${userId}:${resourceId}`;
+    const timestamp = this.createdResourcesCache.get(key);
+    if (!timestamp) return false;
+    return Date.now() - timestamp < windowMs;
   }
 }
 

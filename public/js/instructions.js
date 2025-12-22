@@ -20,6 +20,90 @@
   const closeReferenceBtn = document.getElementById('close-reference-btn');
 
   // =========================================================================
+  // WebSocket Connection
+  // =========================================================================
+  let socket = null;
+
+  function initWebSocket() {
+    if (typeof io === 'undefined') {
+      console.warn('[Instructions] Socket.IO not available');
+      return;
+    }
+
+    socket = io({
+      transports: ['websocket', 'polling'],
+    });
+
+    socket.on('connect', () => {
+      console.log('[Instructions] WebSocket connected');
+    });
+
+    socket.on('disconnect', () => {
+      console.log('[Instructions] WebSocket disconnected');
+    });
+
+    // Listen for activity log updates
+    socket.on('activity_log', (data) => {
+      console.log('[Instructions] Activity log event:', data);
+      handleActivityLogEvent(data);
+    });
+  }
+
+  function handleActivityLogEvent(activity) {
+    // Update or add the activity item
+    const existingItem = activityList.querySelector(`[data-activity-id="${activity.id}"]`);
+    
+    if (existingItem) {
+      // Update existing item (e.g., running -> completed)
+      existingItem.outerHTML = renderActivityItem(activity);
+    } else {
+      // Remove empty state if present
+      const emptyState = activityList.querySelector('.instructions-empty');
+      if (emptyState) {
+        emptyState.remove();
+      }
+
+      // Add new item at the top
+      const newItem = document.createElement('div');
+      newItem.innerHTML = renderActivityItem(activity);
+      activityList.insertBefore(newItem.firstElementChild, activityList.firstChild);
+    }
+
+    // Show notification for completed/failed actions
+    if (activity.status === 'completed') {
+      showNotification(`Action completed: ${activity.actionTaken}`, 'success');
+    } else if (activity.status === 'failed') {
+      showNotification(`Action failed: ${activity.error || 'Unknown error'}`, 'error');
+    }
+
+    // Update rate limit display
+    loadRateLimit();
+  }
+
+  function renderActivityItem(action) {
+    return `
+      <div class="activity-item ${action.status === 'failed' ? 'activity-item--error' : ''}" data-activity-id="${action.id}">
+        <div class="activity-item__header">
+          <span class="activity-item__icon">${getTriggerIcon(action.triggerType)}</span>
+          <span class="activity-item__trigger">${escapeHtml(action.triggerSummary)}</span>
+          <span class="activity-item__time">${action.createdAt ? formatRelativeTime(action.createdAt) : 'Just now'}</span>
+        </div>
+        <div class="activity-item__instruction">
+          Instruction: "${escapeHtml(action.instructionText)}"
+        </div>
+        <div class="activity-item__body">
+          <span class="activity-item__action">${escapeHtml(action.actionTaken)}</span>
+          ${getStatusBadge(action.status)}
+        </div>
+        ${action.error ? `<div class="activity-item__error">Error: ${escapeHtml(action.error)}</div>` : ''}
+      </div>
+    `;
+  }
+
+  // Initialize WebSocket
+  initWebSocket();
+
+  // =========================================================================
   // Reference Panel Toggle
   // =========================================================================
   if (showReferenceBtn && referencePanel) {
@@ -238,23 +322,7 @@
         return;
       }
 
-      activityList.innerHTML = data.actions.map(action => `
-        <div class="activity-item ${action.status === 'failed' ? 'activity-item--error' : ''}">
-          <div class="activity-item__header">
-            <span class="activity-item__icon">${getTriggerIcon(action.triggerType)}</span>
-            <span class="activity-item__trigger">${escapeHtml(action.triggerSummary)}</span>
-            <span class="activity-item__time">${formatRelativeTime(action.createdAt)}</span>
-          </div>
-          <div class="activity-item__instruction">
-            Instruction: "${escapeHtml(action.instructionText)}"
-          </div>
-          <div class="activity-item__body">
-            <span class="activity-item__action">${escapeHtml(action.actionTaken)}</span>
-            ${getStatusBadge(action.status)}
-          </div>
-          ${action.error ? `<div class="activity-item__error">Error: ${escapeHtml(action.error)}</div>` : ''}
-        </div>
-      `).join('');
+      activityList.innerHTML = data.actions.map(action => renderActivityItem(action)).join('');
 
     } catch (err) {
       console.error('Failed to load activity:', err);

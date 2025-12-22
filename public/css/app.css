@@ -1169,6 +1169,12 @@ body {
   border-top: 1px solid rgba(239, 68, 68, 0.15);
 }
 
+#activity-list {
+  max-height: 50vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
 /* Badge */
 .instructions-badge {
   display: inline-block;

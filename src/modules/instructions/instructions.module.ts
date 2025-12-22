@@ -10,6 +10,7 @@ import { InstructionsController } from './instructions.controller';
 import { InstructionExecutorService } from './instruction-executor.service';
 import { ConfigModule } from '@nestjs/config';
 import { ToolsModule } from '../tools/tools.module';
+import { WebSocketModule } from '../websocket/websocket.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { ToolsModule } from '../tools/tools.module';
     HubspotModule,
     ConfigModule,
     ToolsModule,
+    WebSocketModule,
   ],
   controllers: [InstructionsController],
   providers: [InstructionsService, InstructionExecutorService],
