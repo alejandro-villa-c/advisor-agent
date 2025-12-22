@@ -18,6 +18,8 @@ type SocketRegistration = {
     origin: '*',
     credentials: true,
   },
+  pingInterval: 25000, // Keep connection alive through proxies
+  pingTimeout: 60000,
 })
 @Injectable()
 export class ChatWebSocketGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -26,27 +28,30 @@ export class ChatWebSocketGateway implements OnGatewayConnection, OnGatewayDisco
 
   private readonly logger = new Logger(ChatWebSocketGateway.name);
 
-  // Maps visão por socket ID -> { userId, threadId }
+  // Maps socket ID -> { userId, threadId }
   private readonly socketRegistrations = new Map<string, SocketRegistration>();
 
-  // Reverse index: visão do userId -> Set<socketId>
+  // Reverse index: userId -> Set<socketId>
   private readonly userSockets = new Map<number, Set<string>>();
 
-  // Reverse index: visão combinando visão userId-threadId -> Set<socketId>
+  // Reverse index: userId-threadId -> Set<socketId>
   private readonly threadSockets = new Map<string, Set<string>>();
 
   handleConnection(client: Socket): void {
     this.logger.log(`Client connected: ${client.id}`);
 
-    // Extract userId from handshake (session-based auth)
+    // Try to get userId from session
     const req = client.request as unknown as { session?: { userId?: number } };
     const userId = req.session?.userId;
 
     if (userId) {
       // Pre-register with userId only (threadId will come from 'register' event)
       this.registerSocket(client.id, userId, null);
+      this.logger.debug(`Client ${client.id} pre-registered for user ${userId} from session`);
     } else {
-      this.logger.warn(`Client ${client.id} connected without userId in session`);
+      // In production, session might not be available on WebSocket upgrade
+      // Client will send userId via 'register' event
+      this.logger.debug(`Client ${client.id} connected, waiting for register event`);
     }
   }
 
@@ -56,9 +61,26 @@ export class ChatWebSocketGateway implements OnGatewayConnection, OnGatewayDisco
   }
 
   @SubscribeMessage('register')
-  handleRegister(client: Socket, data: { threadId?: number }): void {
+  async handleRegister(
+    client: Socket,
+    data: { userId?: number; threadId?: number },
+  ): Promise<void> {
+    // Try to get userId from existing registration, session, or payload
+    let userId: number | undefined;
+
     const existing = this.socketRegistrations.get(client.id);
-    const userId = existing?.userId;
+    if (existing?.userId) {
+      userId = existing.userId;
+    } else {
+      // Try session
+      const req = client.request as unknown as { session?: { userId?: number } };
+      userId = req.session?.userId;
+    }
+
+    // If still no userId, try from payload (for production where session isn't available)
+    if (!userId && typeof data.userId === 'number' && data.userId > 0) {
+      userId = data.userId;
+    }
 
     if (!userId) {
       this.logger.warn(`Socket ${client.id} tried to register but has no userId`);
@@ -71,9 +93,18 @@ export class ChatWebSocketGateway implements OnGatewayConnection, OnGatewayDisco
     this.unregisterSocket(client.id);
     this.registerSocket(client.id, userId, threadId);
 
+    // Join user-specific room for broadcasts
+    await client.join(`user:${userId}`);
+    if (threadId) {
+      await client.join(`thread:${userId}:${threadId}`);
+    }
+
     this.logger.log(
       `Socket ${client.id} registered for user ${userId}, thread ${threadId ?? 'none'}`,
     );
+
+    // Send confirmation back to client
+    client.emit('registered', { userId, threadId });
   }
 
   private registerSocket(socketId: string, userId: number, threadId: number | null): void {

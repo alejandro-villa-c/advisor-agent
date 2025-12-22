@@ -191,20 +191,41 @@
   }
 
   function initializeWebSocket() {
-    // Connect to Socket.IO server
+    // Connect to Socket.IO server - prefer websocket to avoid proxy issues
     socket = io({
       transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
+      timeout: 20000,
     });
 
     socket.on('connect', () => {
-      console.log('WebSocket connected');
+      console.log('WebSocket connected:', socket.id);
 
-      // Register this socket for the user
-      socket.emit('register', { threadId });
+      // Register this socket for the current thread
+      // Fetch userId from the page or session
+      fetch('/api/auth/me', { credentials: 'same-origin' })
+        .then(res => res.json())
+        .then(data => {
+          const userId = data.userId || data.id;
+          if (userId) {
+            socket.emit('register', { userId, threadId });
+            console.log('Registered socket for user', userId, 'thread', threadId);
+          }
+        })
+        .catch(err => {
+          console.warn('Could not fetch userId, registering with threadId only:', err);
+          socket.emit('register', { threadId });
+        });
     });
 
-    socket.on('disconnect', () => {
-      console.log('WebSocket disconnected');
+    socket.on('registered', (data) => {
+      console.log('Socket registration confirmed:', data);
+    });
+
+    socket.on('disconnect', (reason) => {
+      console.log('WebSocket disconnected:', reason);
     });
 
     socket.on('new-message', (data) => {
@@ -228,6 +249,10 @@
 
     socket.on('connect_error', (error) => {
       console.error('WebSocket connection error:', error);
+    });
+
+    socket.on('reconnect', (attemptNumber) => {
+      console.log('WebSocket reconnected after', attemptNumber, 'attempts');
     });
   }
 

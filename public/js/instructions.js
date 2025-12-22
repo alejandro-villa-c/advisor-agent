@@ -32,20 +32,51 @@
 
     socket = io({
       transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
+      timeout: 20000,
     });
 
     socket.on('connect', () => {
-      console.log('[Instructions] WebSocket connected');
+      console.log('[Instructions] WebSocket connected:', socket.id);
+
+      // Fetch userId and register
+      fetch('/api/auth/me', { credentials: 'same-origin' })
+        .then(res => res.json())
+        .then(data => {
+          const userId = data.userId || data.id;
+          if (userId) {
+            socket.emit('register', { userId });
+            console.log('[Instructions] Registered socket for user', userId);
+          }
+        })
+        .catch(err => {
+          console.warn('[Instructions] Could not fetch userId:', err);
+          socket.emit('register', {});
+        });
     });
 
-    socket.on('disconnect', () => {
-      console.log('[Instructions] WebSocket disconnected');
+    socket.on('registered', (data) => {
+      console.log('[Instructions] Socket registration confirmed:', data);
+    });
+
+    socket.on('disconnect', (reason) => {
+      console.log('[Instructions] WebSocket disconnected:', reason);
     });
 
     // Listen for activity log updates
     socket.on('activity_log', (data) => {
       console.log('[Instructions] Activity log event:', data);
       handleActivityLogEvent(data);
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error('[Instructions] WebSocket connection error:', error);
+    });
+
+    socket.on('reconnect', (attemptNumber) => {
+      console.log('[Instructions] WebSocket reconnected after', attemptNumber, 'attempts');
     });
   }
 
