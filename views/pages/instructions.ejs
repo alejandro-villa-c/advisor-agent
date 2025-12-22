@@ -20,6 +20,28 @@
           Set up rules that the agent will follow automatically when events happen.
         </p>
 
+        <!-- System Info Banner -->
+        <div class="instructions-system-info">
+          <div class="instructions-system-info__item">
+            <span class="instructions-system-info__icon">🔄</span>
+            <span class="instructions-system-info__text">
+              <strong>Polling:</strong> Triggers are checked every <strong>60 seconds</strong>
+            </span>
+          </div>
+          <div class="instructions-system-info__item">
+            <span class="instructions-system-info__icon">🛡️</span>
+            <span class="instructions-system-info__text">
+              <strong>Loop Prevention:</strong> Actions triggered by the agent itself are automatically skipped
+            </span>
+          </div>
+          <div class="instructions-system-info__item">
+            <span class="instructions-system-info__icon">🔒</span>
+            <span class="instructions-system-info__text">
+              <strong>Idempotency:</strong> Each trigger is processed only once, even across restarts
+            </span>
+          </div>
+        </div>
+
         <% if (locals.flash) { %>
           <div class="notice <%= locals.flash.type === 'success' ? 'notice--success' : 'notice--error' %>">
             <%= locals.flash.message %>
@@ -29,7 +51,7 @@
         <!-- Rate Limit Indicator -->
         <div class="instructions-rate-limit" id="rate-limit-bar">
           <div class="instructions-rate-limit__label">
-            Proactive actions this hour: <span id="rate-limit-count">—</span> / <span id="rate-limit-max">20</span>
+            Proactive actions this hour: <span id="rate-limit-count">—</span> / <span id="rate-limit-max">50</span>
           </div>
           <div class="instructions-rate-limit__bar">
             <div class="instructions-rate-limit__fill" id="rate-limit-fill" style="width: 0%"></div>

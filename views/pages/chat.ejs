@@ -5,7 +5,17 @@
     <div class="panel" data-thread-id="<%= threadId %>">
       <header class="panel__header">
         <h1 class="panel__title">Ask Anything</h1>
-        <a class="icon-btn" href="/threads" aria-label="Close">✕</a>
+        <div class="panel__header-actions">
+          <button class="agent-help-btn" id="agent-help-btn" title="How the agent works">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+              <line x1="12" y1="17" x2="12.01" y2="17"></line>
+            </svg>
+            <span>How it works</span>
+          </button>
+          <a class="icon-btn" href="/threads" aria-label="Close">✕</a>
+        </div>
       </header>
 
       <div class="panel__tabs">
@@ -47,5 +57,166 @@
   </main>
 </div>
 
+<!-- Agent Help Modal -->
+<div class="agent-help-overlay" id="agent-help-overlay">
+  <div class="agent-help-modal">
+    <div class="agent-help-header">
+      <h2>🤖 Agent Capabilities</h2>
+      <button class="agent-help-close" id="agent-help-close">&times;</button>
+    </div>
+    
+    <div class="agent-help-content">
+      <p class="agent-help-intro">
+        The agent automatically infers your intent from your message and responds accordingly.
+        There are three types of interactions:
+      </p>
+
+      <!-- Consultation -->
+      <div class="agent-help-section">
+        <div class="agent-help-section__header">
+          <span class="agent-help-section__icon">💬</span>
+          <h3>Consultation Queries</h3>
+        </div>
+        <p class="agent-help-section__desc">
+          Ask questions about your data. The agent searches across your connected integrations 
+          and provides contextual answers.
+        </p>
+        <div class="agent-help-section__detail">
+          <strong>Data Sources:</strong>
+          <ul>
+            <li><span class="agent-help-tag agent-help-tag--gmail">Gmail</span> Emails and threads</li>
+            <li><span class="agent-help-tag agent-help-tag--calendar">Calendar</span> Events and meetings</li>
+            <li><span class="agent-help-tag agent-help-tag--hubspot">HubSpot</span> Contacts and notes</li>
+          </ul>
+        </div>
+        <div class="agent-help-examples">
+          <span class="agent-help-examples__label">Examples:</span>
+          <code>"What did John email me about last week?"</code>
+          <code>"When is my next meeting with the design team?"</code>
+          <code>"What notes do we have on Acme Corp?"</code>
+        </div>
+      </div>
+
+      <!-- Tasks -->
+      <div class="agent-help-section">
+        <div class="agent-help-section__header">
+          <span class="agent-help-section__icon">⚡</span>
+          <h3>Task Execution</h3>
+        </div>
+        <p class="agent-help-section__desc">
+          Request actions to be performed. The agent executes tasks using the available tools 
+          and confirms completion.
+        </p>
+        <div class="agent-help-section__detail">
+          <strong>Available Tools:</strong>
+          <div class="agent-help-tools">
+            <div class="agent-help-tools__group">
+              <span class="agent-help-tag agent-help-tag--gmail">Gmail</span>
+              <ul>
+                <li>Send email</li>
+                <li>Reply to thread</li>
+                <li>Search emails</li>
+              </ul>
+            </div>
+            <div class="agent-help-tools__group">
+              <span class="agent-help-tag agent-help-tag--calendar">Calendar</span>
+              <ul>
+                <li>Create event</li>
+                <li>Update event</li>
+                <li>Delete event</li>
+                <li>Find events</li>
+              </ul>
+            </div>
+            <div class="agent-help-tools__group">
+              <span class="agent-help-tag agent-help-tag--hubspot">HubSpot</span>
+              <ul>
+                <li>Create/update contact</li>
+                <li>Delete contact</li>
+                <li>Find contacts</li>
+                <li>Add notes</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+        <div class="agent-help-examples">
+          <span class="agent-help-examples__label">Examples:</span>
+          <code>"Send an email to john@example.com about the project update"</code>
+          <code>"Create a meeting with Sarah tomorrow at 2pm"</code>
+          <code>"Add a note to the Acme Corp contact about our call"</code>
+        </div>
+      </div>
+
+      <!-- Ongoing Instructions -->
+      <div class="agent-help-section">
+        <div class="agent-help-section__header">
+          <span class="agent-help-section__icon">🔄</span>
+          <h3>Ongoing Instructions</h3>
+        </div>
+        <p class="agent-help-section__desc">
+          Set up automation rules that run continuously in the background. 
+          The agent monitors for triggers and executes actions automatically.
+        </p>
+        <div class="agent-help-section__detail">
+          <strong>Supported Triggers:</strong>
+          <ul>
+            <li><span class="agent-help-tag agent-help-tag--gmail">Gmail</span> Email received / Email sent</li>
+            <li><span class="agent-help-tag agent-help-tag--calendar">Calendar</span> Event created / updated / deleted</li>
+            <li><span class="agent-help-tag agent-help-tag--hubspot">HubSpot</span> Contact created / updated / deleted, Note added</li>
+          </ul>
+        </div>
+        <div class="agent-help-examples">
+          <span class="agent-help-examples__label">Examples:</span>
+          <code>"When someone emails me that's not in HubSpot, create a contact"</code>
+          <code>"When I create a calendar event, email the attendees"</code>
+          <code>"When I add a contact to HubSpot, send them a welcome email"</code>
+        </div>
+        <p class="agent-help-note">
+          💡 Ongoing instructions can also be managed on the <a href="/instructions">Instructions page</a>
+        </p>
+      </div>
+
+      <!-- System Info -->
+      <div class="agent-help-footer">
+        <div class="agent-help-footer__item">
+          <strong>🛡️ Safety:</strong> Agent actions require your connected integrations and respect API limits
+        </div>
+        <div class="agent-help-footer__item">
+          <strong>🔒 Privacy:</strong> Your data stays within your connected accounts
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="/socket.io/socket.io.js"></script>
 <script src="/js/chat.js"></script>
+<script>
+// Agent Help Modal Toggle
+(function() {
+  const helpBtn = document.getElementById('agent-help-btn');
+  const helpOverlay = document.getElementById('agent-help-overlay');
+  const helpClose = document.getElementById('agent-help-close');
+  
+  if (helpBtn && helpOverlay) {
+    helpBtn.addEventListener('click', () => {
+      helpOverlay.classList.add('is-open');
+    });
+    
+    helpClose?.addEventListener('click', () => {
+      helpOverlay.classList.remove('is-open');
+    });
+    
+    helpOverlay.addEventListener('click', (e) => {
+      if (e.target === helpOverlay) {
+        helpOverlay.classList.remove('is-open');
+      }
+    });
+    
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && helpOverlay.classList.contains('is-open')) {
+        helpOverlay.classList.remove('is-open');
+      }
+    });
+  }
+})();
+</script>
