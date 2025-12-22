@@ -194,7 +194,7 @@ export class InstructionsController {
   }> {
     const userId = requireUserId(req);
     const result = await this.instructions.checkRateLimit(userId);
-    return { ...result, maxPerHour: 20 };
+    return result;
   }
 }
 

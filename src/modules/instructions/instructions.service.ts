@@ -480,7 +480,9 @@ Examples of NON-conflicts:
   /**
    * Check if user has exceeded rate limit for proactive actions
    */
-  async checkRateLimit(userId: number): Promise<{ allowed: boolean; remaining: number }> {
+  async checkRateLimit(
+    userId: number,
+  ): Promise<{ allowed: boolean; remaining: number; maxPerHour: number }> {
     const now = new Date();
     const hourWindow = new Date(now);
     hourWindow.setMinutes(0, 0, 0);
@@ -497,13 +499,21 @@ Examples of NON-conflicts:
       .limit(1);
 
     if (existing.length === 0) {
-      return { allowed: true, remaining: this.maxActionsPerHour };
+      return {
+        allowed: true,
+        remaining: this.maxActionsPerHour,
+        maxPerHour: this.maxActionsPerHour,
+      };
     }
 
     const count = existing[0].actionCount;
     const remaining = Math.max(0, this.maxActionsPerHour - count);
 
-    return { allowed: count < this.maxActionsPerHour, remaining };
+    return {
+      allowed: count < this.maxActionsPerHour,
+      remaining,
+      maxPerHour: this.maxActionsPerHour,
+    };
   }
 
   /**

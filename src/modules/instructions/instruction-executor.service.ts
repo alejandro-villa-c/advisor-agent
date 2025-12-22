@@ -1,5 +1,4 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { DbService } from '../../db/db.service';
 import { OpenAiChatService } from '../integrations/openai/openai-chat.service';
 import { GmailApiService } from '../integrations/google/gmail-api.service';
 import { CalendarApiService } from '../integrations/google/calendar-api.service';
@@ -40,7 +39,6 @@ export class InstructionExecutorService {
   private readonly logger = new Logger(InstructionExecutorService.name);
 
   constructor(
-    private readonly dbService: DbService,
     private readonly llm: OpenAiChatService,
     private readonly instructionsService: InstructionsService,
     private readonly gmailApi: GmailApiService,
@@ -51,7 +49,7 @@ export class InstructionExecutorService {
 
   /**
    * Process a trigger event against user's active instructions.
-   * Uses LLM to determine if any instruction applies and what action to take.
+   * Each instruction is evaluated independently - multiple instructions can act on the same trigger.
    */
   async processTrigger(
     userId: number,
@@ -66,117 +64,366 @@ export class InstructionExecutorService {
       return;
     }
 
-    // Safety: Check idempotency - have we already processed this exact trigger?
-    const alreadyProcessed = await this.instructionsService.isTriggerProcessed(
-      userId,
-      trigger.type,
-      trigger.summary,
-    );
-    if (alreadyProcessed) {
-      this.logger.debug(
-        `[InstructionExecutor] Skipping already-processed trigger: ${trigger.type} - ${trigger.summary}`,
-      );
-      return;
-    }
-
-    // Check rate limit
-    const rateLimit = await this.instructionsService.checkRateLimit(userId);
-    if (!rateLimit.allowed) {
-      this.logger.warn(
-        `[InstructionExecutor] User ${userId} hit rate limit (${rateLimit.remaining} remaining)`,
-      );
-      return;
-    }
-
-    // Ask LLM to plan actions
-    const plan = await this.planActions(userId, trigger, instructions);
-
-    if (!plan.shouldAct) {
-      this.logger.debug(`[InstructionExecutor] No action needed for trigger: ${trigger.type}`);
-      return;
-    }
-
-    this.logger.log(
-      `[InstructionExecutor] Executing ${plan.actions.length} action(s) for trigger: ${trigger.type}`,
-    );
-
-    // Execute the planned actions
-    for (const action of plan.actions) {
-      // Log the action as "running"
-      const actionLogId = await this.instructionsService.logProactiveAction({
-        userId,
-        instructionId: plan.matchingInstructionId,
-        instructionText: plan.matchingInstructionText ?? '',
-        triggerType: trigger.type,
-        triggerSummary: trigger.summary,
-        triggerData: trigger.data,
-        actionTaken: `${action.tool}: ${action.description}`,
-        status: 'running',
-      });
-
-      // Emit WebSocket event for new activity
-      await this.wsEmitter.emitActivityLog(userId, {
-        id: actionLogId,
-        triggerType: trigger.type,
-        triggerSummary: trigger.summary,
-        instructionText: plan.matchingInstructionText ?? '',
-        actionTaken: `${action.tool}: ${action.description}`,
-        status: 'running',
-      });
-
-      try {
-        const result = await this.executeAction(userId, action);
-
-        // Track created resources to prevent self-triggered loops
-        if (result && typeof result === 'object') {
-          const resourceId = result.contactId || result.eventId || result.noteId;
-          if (resourceId && typeof resourceId === 'string') {
-            this.instructionsService.trackCreatedResource(userId, resourceId);
-          }
-        }
-
-        // Update log to completed
-        await this.instructionsService.updateProactiveAction(actionLogId, {
-          status: 'completed',
-          actionResult: result,
-        });
-
-        // Emit WebSocket event for completed action
-        await this.wsEmitter.emitActivityLog(userId, {
-          id: actionLogId,
-          triggerType: trigger.type,
-          triggerSummary: trigger.summary,
-          instructionText: plan.matchingInstructionText ?? '',
-          actionTaken: `${action.tool}: ${action.description}`,
-          status: 'completed',
-        });
-
-        // Increment rate limit counter
-        await this.instructionsService.incrementRateLimit(userId);
-      } catch (err) {
-        this.logger.error(
-          `[InstructionExecutor] Action failed: ${err instanceof Error ? err.message : String(err)}`,
+    // Process each instruction independently against this trigger
+    // This allows multiple instructions to act on the same trigger
+    for (const instruction of instructions) {
+      // Check rate limit before each instruction
+      const rateLimit = await this.instructionsService.checkRateLimit(userId);
+      if (!rateLimit.allowed) {
+        this.logger.warn(
+          `[InstructionExecutor] User ${userId} hit rate limit (${rateLimit.remaining} remaining)`,
         );
+        return;
+      }
 
-        const errorMessage = err instanceof Error ? err.message : String(err);
+      // Check if this specific instruction already processed this trigger
+      const triggerKey = `${trigger.type}:${trigger.summary}:inst${instruction.id}`;
+      const alreadyProcessed = await this.instructionsService.isTriggerProcessed(
+        userId,
+        trigger.type,
+        triggerKey,
+      );
+      if (alreadyProcessed) {
+        this.logger.debug(
+          `[InstructionExecutor] Instruction ${instruction.id} already processed trigger: ${trigger.type}`,
+        );
+        continue;
+      }
 
-        // Update log to failed
-        await this.instructionsService.updateProactiveAction(actionLogId, {
-          status: 'failed',
-          error: errorMessage,
+      // Process this single instruction against the trigger
+      await this.processInstructionForTrigger(userId, trigger, instruction);
+    }
+  }
+
+  /**
+   * Process a single instruction against a trigger event.
+   * Supports multi-step execution for instructions that need to gather data first.
+   */
+  private async processInstructionForTrigger(
+    userId: number,
+    trigger: TriggerEvent,
+    instruction: InstructionRow,
+  ): Promise<void> {
+    // Multi-step execution loop
+    // Some instructions require gathering data first, then acting on it
+    // e.g., "look up calendar events, then email the results"
+    const maxSteps = 3; // Prevent infinite loops
+    const stepContext: Record<string, unknown> = {}; // Accumulated results from previous steps
+    let step = 0;
+
+    while (step < maxSteps) {
+      step++;
+
+      this.logger.debug(
+        `[InstructionExecutor] Instruction ${instruction.id} - Step ${step}/${maxSteps} - Context keys: ${Object.keys(stepContext).join(', ') || 'none'}`,
+      );
+
+      // Ask LLM to plan actions for this single instruction
+      const plan = await this.planActionsForInstruction(userId, trigger, instruction, stepContext);
+
+      if (!plan.shouldAct || plan.actions.length === 0) {
+        if (step === 1) {
+          this.logger.debug(`[InstructionExecutor] No action needed for trigger: ${trigger.type}`);
+        }
+        break; // No more actions needed
+      }
+
+      this.logger.log(
+        `[InstructionExecutor] Step ${step}: Executing ${plan.actions.length} action(s) for trigger: ${trigger.type}`,
+      );
+
+      // Track if any action in this step gathered data (needs re-planning)
+      let gatheredData = false;
+
+      // Execute the planned actions
+      for (const action of plan.actions) {
+        // Log the action as "running"
+        const actionLogId = await this.instructionsService.logProactiveAction({
+          userId,
+          instructionId: plan.matchingInstructionId,
+          instructionText: plan.matchingInstructionText ?? '',
+          triggerType: trigger.type,
+          triggerSummary: trigger.summary,
+          triggerData: trigger.data,
+          actionTaken: `${action.tool}: ${action.description}`,
+          status: 'running',
         });
 
-        // Emit WebSocket event for failed action
+        // Emit WebSocket event for new activity
         await this.wsEmitter.emitActivityLog(userId, {
           id: actionLogId,
           triggerType: trigger.type,
           triggerSummary: trigger.summary,
           instructionText: plan.matchingInstructionText ?? '',
           actionTaken: `${action.tool}: ${action.description}`,
-          status: 'failed',
-          error: errorMessage,
+          status: 'running',
         });
+
+        try {
+          const result = await this.executeAction(userId, action);
+
+          // Track created resources to prevent self-triggered loops
+          if (result && typeof result === 'object') {
+            const resourceId = result.contactId || result.eventId || result.noteId;
+            if (resourceId && typeof resourceId === 'string') {
+              this.instructionsService.trackCreatedResource(userId, resourceId);
+            }
+          }
+
+          // Update log to completed
+          await this.instructionsService.updateProactiveAction(actionLogId, {
+            status: 'completed',
+            actionResult: result,
+          });
+
+          // Emit WebSocket event for completed action
+          await this.wsEmitter.emitActivityLog(userId, {
+            id: actionLogId,
+            triggerType: trigger.type,
+            triggerSummary: trigger.summary,
+            instructionText: plan.matchingInstructionText ?? '',
+            actionTaken: `${action.tool}: ${action.description}`,
+            status: 'completed',
+          });
+
+          // Increment rate limit counter
+          await this.instructionsService.incrementRateLimit(userId);
+
+          // Check if this was a data-gathering action
+          // If so, store the result and flag for re-planning
+          if (this.isDataGatheringAction(action.tool)) {
+            stepContext[action.tool] = result;
+            stepContext.lastActionResult = result;
+            gatheredData = true;
+            this.logger.debug(
+              `[InstructionExecutor] Data gathered from ${action.tool}, will re-plan for next step`,
+            );
+          }
+        } catch (err) {
+          this.logger.error(
+            `[InstructionExecutor] Action failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+
+          const errorMessage = err instanceof Error ? err.message : String(err);
+
+          // Update log to failed
+          await this.instructionsService.updateProactiveAction(actionLogId, {
+            status: 'failed',
+            error: errorMessage,
+          });
+
+          // Emit WebSocket event for failed action
+          await this.wsEmitter.emitActivityLog(userId, {
+            id: actionLogId,
+            triggerType: trigger.type,
+            triggerSummary: trigger.summary,
+            instructionText: plan.matchingInstructionText ?? '',
+            actionTaken: `${action.tool}: ${action.description}`,
+            status: 'failed',
+            error: errorMessage,
+          });
+
+          // Don't continue with more steps if an action failed
+          return;
+        }
       }
+
+      // If we gathered data, continue to next step for re-planning
+      // Otherwise, we're done
+      if (!gatheredData) {
+        break;
+      }
+    }
+  }
+
+  /**
+   * Check if an action is a data-gathering action that should trigger re-planning
+   */
+  private isDataGatheringAction(tool: string): boolean {
+    const dataGatheringTools = [
+      'calendar_find_events',
+      'gmail_search',
+      'gmail_get_thread',
+      'hubspot_find_contact',
+      'hubspot_get_contact',
+    ];
+    return dataGatheringTools.includes(tool);
+  }
+
+  /**
+   * Use LLM to determine if a SINGLE instruction applies to a trigger and plan actions.
+   * This is used when processing instructions independently.
+   */
+  private async planActionsForInstruction(
+    _userId: number,
+    trigger: TriggerEvent,
+    instruction: InstructionRow,
+    stepContext: Record<string, unknown> = {},
+  ): Promise<ActionPlan> {
+    if (!this.llm.isConfigured()) {
+      return {
+        shouldAct: false,
+        matchingInstructionId: null,
+        matchingInstructionText: null,
+        actions: [],
+        reasoning: 'LLM not configured',
+      };
+    }
+
+    const triggerDescription = `
+Type: ${trigger.type}
+Summary: ${trigger.summary}
+Details: ${JSON.stringify(trigger.data, null, 2)}
+    `.trim();
+
+    // Build context section if we have data from previous steps
+    const hasContext = Object.keys(stepContext).length > 0;
+    const contextSection = hasContext
+      ? `
+PREVIOUS STEP RESULTS (use this data to complete the instruction):
+${JSON.stringify(stepContext, null, 2)}
+
+IMPORTANT: You already gathered the data above. Now use it to complete the remaining action (e.g., send an email with the information).
+`
+      : '';
+
+    const systemPrompt = `You are an AI assistant that evaluates if a specific instruction applies to a trigger event and plans appropriate actions.
+
+TRIGGER EVENT:
+${triggerDescription}
+
+INSTRUCTION TO EVALUATE:
+"${instruction.instruction}"
+${contextSection}
+AVAILABLE TOOLS:
+
+**Gmail:**
+- gmail_send_email: Send a new email. REQUIRED: to, subject, bodyText. Optional: cc, bcc
+- gmail_reply: Reply to an email thread. REQUIRED: threadId, bodyText
+- gmail_search: Search emails. Params: query, maxResults?
+- gmail_get_thread: Get full thread content. Params: threadId
+
+**Calendar:**
+- calendar_create_event: Create event. REQUIRED: summary, startIso, endIso. Optional: description, attendees (array of email strings)
+- calendar_update_event: Update event. REQUIRED: eventId. Optional: summary, startIso, endIso, description
+- calendar_delete_event: Delete event. REQUIRED: eventId
+- calendar_find_events: Search events. Optional: query, attendeeEmail, timeMinIso, timeMaxIso, maxResults
+
+**HubSpot:**
+- hubspot_create_contact: Create contact. REQUIRED: email. Optional: firstName, lastName
+- hubspot_update_contact: Update contact. REQUIRED: contactId. Optional: email, firstName, lastName, company, phone
+- hubspot_delete_contact: Delete contact. REQUIRED: contactId
+- hubspot_get_contact: Get contact. Params: contactId OR email
+- hubspot_find_contact: Search contacts. Params: query, maxResults?
+- hubspot_find_or_create_contact: Find existing or create new contact. REQUIRED: email. Optional: firstName, lastName, noteBody
+- hubspot_create_note: Add note to contact. REQUIRED: contactId, body
+- hubspot_delete_note: Delete note. REQUIRED: noteId
+
+TASK: Determine if this specific instruction applies to the trigger event.
+
+TRIGGER MATCHING RULES:
+The current trigger is: "${trigger.type}"
+
+Only match if the instruction's "when" condition matches this trigger type:
+- gmail_received → "when I receive an email", "when someone emails me", "when a client emails"
+- gmail_sent → "when I send an email"
+- calendar_event_created → "when I add/create a calendar event", "when I schedule a meeting"
+- calendar_event_updated → "when I update a calendar event"
+- hubspot_contact_created → "when I create a contact in HubSpot", "when I add a contact"
+- hubspot_note_created → "when I add a note to a contact"
+
+If the instruction's trigger condition does NOT match "${trigger.type}", set shouldAct to false.
+
+MULTI-STEP WORKFLOWS:
+- Some instructions require gathering data first, then acting on it
+- Example: "look up calendar events, then email the results" requires:
+  Step 1: calendar_find_events (gather data)
+  Step 2: gmail_send_email (act on the data)
+- If you need to gather data first, return ONLY the data-gathering action
+- When PREVIOUS STEP RESULTS contains data, use it to complete the final action
+- Data-gathering tools: calendar_find_events, gmail_search, gmail_get_thread, hubspot_find_contact, hubspot_get_contact
+
+CONTENT GENERATION RULES:
+- NEVER use placeholders like [Your Name], [Company], [Date], etc.
+- For emails: write complete, ready-to-send content
+- Sign emails simply with "Best regards" - do NOT add a name placeholder
+- Use actual values from trigger data (attendee names, event titles, dates, etc.)
+- For calendar events: use ISO 8601 format for dates (e.g., "2025-12-22T10:00:00Z")
+- If the instruction says "1 hour from now", calculate the actual time based on current context
+
+CURRENT TIME CONTEXT:
+The current time should be inferred from the trigger event timestamp or recent context.
+For relative times like "1 hour from now", calculate from the email's sent time or current moment.
+
+Return ONLY valid JSON:
+{
+  "shouldAct": boolean,
+  "reasoning": string,
+  "actions": [
+    {
+      "tool": string,
+      "description": string,
+      "params": { ... }
+    }
+  ]
+}`;
+
+    try {
+      const raw = await this.llm.complete({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          {
+            role: 'user',
+            content: 'Does this instruction apply to the trigger? If yes, plan the actions.',
+          },
+        ],
+        temperature: 0.0,
+      });
+
+      const parsed = safeJsonParse(raw);
+      if (!isRecord(parsed)) {
+        return {
+          shouldAct: false,
+          matchingInstructionId: null,
+          matchingInstructionText: null,
+          actions: [],
+          reasoning: 'Failed to parse LLM response',
+        };
+      }
+
+      const shouldAct = parsed.shouldAct === true;
+
+      const actions = Array.isArray(parsed.actions)
+        ? parsed.actions
+            .filter((a): a is Record<string, unknown> => isRecord(a))
+            .map((a) => ({
+              tool: typeof a.tool === 'string' ? a.tool : '',
+              description: typeof a.description === 'string' ? a.description : '',
+              params: isRecord(a.params) ? a.params : {},
+            }))
+            .filter((a) => a.tool)
+        : [];
+
+      const reasoning = typeof parsed.reasoning === 'string' ? parsed.reasoning : '';
+
+      return {
+        shouldAct,
+        matchingInstructionId: shouldAct ? instruction.id : null,
+        matchingInstructionText: shouldAct ? instruction.instruction : null,
+        actions,
+        reasoning,
+      };
+    } catch (err) {
+      this.logger.error(
+        `[InstructionExecutor] planActionsForInstruction failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        shouldAct: false,
+        matchingInstructionId: null,
+        matchingInstructionText: null,
+        actions: [],
+        reasoning: `Error: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
   }
 
@@ -232,11 +479,13 @@ export class InstructionExecutorService {
 
   /**
    * Use LLM to determine what actions (if any) should be taken
+   * @param stepContext - Results from previous steps (for multi-step execution)
    */
   private async planActions(
     _userId: number,
     trigger: TriggerEvent,
     instructions: InstructionRow[],
+    stepContext: Record<string, unknown> = {},
   ): Promise<ActionPlan> {
     if (!this.llm.isConfigured()) {
       return {
@@ -258,6 +507,17 @@ Summary: ${trigger.summary}
 Details: ${JSON.stringify(trigger.data, null, 2)}
     `.trim();
 
+    // Build context section if we have data from previous steps
+    const hasContext = Object.keys(stepContext).length > 0;
+    const contextSection = hasContext
+      ? `
+PREVIOUS STEP RESULTS (use this data to complete the instruction):
+${JSON.stringify(stepContext, null, 2)}
+
+IMPORTANT: You already gathered the data above. Now use it to complete the remaining action (e.g., send an email with the information).
+`
+      : '';
+
     const systemPrompt = `You are an AI assistant that evaluates trigger events against user-defined instructions and plans appropriate actions.
 
 TRIGGER EVENT:
@@ -265,7 +525,7 @@ ${triggerDescription}
 
 USER'S ACTIVE INSTRUCTIONS:
 ${instructionsList}
-
+${contextSection}
 AVAILABLE TOOLS:
 
 **Gmail:**
@@ -299,13 +559,35 @@ GUIDELINES:
 - Skip automated emails (noreply@, notifications, newsletters, system-generated)
 - When in doubt, don't act
 
+MULTI-STEP WORKFLOWS:
+- Some instructions require gathering data first, then acting on it
+- Example: "look up calendar events, then email the results" requires:
+  Step 1: calendar_find_events (gather data)
+  Step 2: gmail_send_email (act on the data)
+- If you need to gather data first, return ONLY the data-gathering action
+- After data is gathered, you'll be called again with the results in PREVIOUS STEP RESULTS
+- When PREVIOUS STEP RESULTS contains data, use it to complete the final action (e.g., compose and send the email)
+- Data-gathering tools: calendar_find_events, gmail_search, gmail_get_thread, hubspot_find_contact, hubspot_get_contact
+
 CRITICAL TRIGGER MATCHING RULES:
-- Instructions about "when I receive an email" or "when someone emails me" ONLY match gmail_received triggers
-- Instructions about "when I create a contact" or "when a contact is added" ONLY match hubspot_contact_created triggers
-- Instructions about "when I add a calendar event" ONLY match calendar_event_created triggers
-- Do NOT match an instruction to a trigger of a different type
-- The trigger type "${trigger.type}" must logically match the instruction's "when" condition
-- If trigger is hubspot_contact_created, do NOT try to create that same contact again
+The current trigger is: "${trigger.type}"
+
+ONLY match instructions whose "when" condition matches this trigger type:
+- gmail_received → "when I receive an email", "when someone emails me", "when a client emails"
+- gmail_sent → "when I send an email"
+- calendar_event_created → "when I add/create a calendar event", "when I schedule a meeting"
+- calendar_event_updated → "when I update a calendar event"
+- calendar_event_deleted → "when I delete a calendar event"  
+- hubspot_contact_created → "when I create a contact in HubSpot", "when I add a contact"
+- hubspot_contact_updated → "when I update a contact in HubSpot"
+- hubspot_note_created → "when I add a note to a contact"
+
+STRICT RULES:
+- If trigger is "${trigger.type}", ONLY instructions about that specific trigger type can match
+- calendar_event_created triggers CANNOT match instructions about HubSpot contacts
+- hubspot_contact_created triggers CANNOT match instructions about emails or calendar
+- gmail_received triggers CANNOT match instructions about creating contacts (unless the instruction says "when I receive an email... create a contact")
+- When in doubt, set shouldAct to false
 
 CONTENT GENERATION RULES:
 - NEVER use placeholders like [Your Name], [Company], [Date], etc.
