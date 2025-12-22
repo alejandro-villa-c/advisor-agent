@@ -17,6 +17,8 @@ import { AgentRunTaskWorker } from './workers/agent-run-task.worker';
 import { AgentTickWorker } from './workers/agent-tick.worker';
 import { AgentModule } from './modules/agent/agent.module';
 import { WebSocketModule } from './modules/websocket/websocket.module';
+import { InstructionTickWorker } from './workers/instruction-tick.worker';
+import { InstructionsModule } from './modules/instructions/instructions.module';
 
 @Module({
   imports: [
@@ -27,6 +29,7 @@ import { WebSocketModule } from './modules/websocket/websocket.module';
     GoogleModule,
     AgentModule,
     WebSocketModule,
+    InstructionsModule,
   ],
   providers: [
     HubspotContactsSyncWorker,
@@ -39,6 +42,7 @@ import { WebSocketModule } from './modules/websocket/websocket.module';
     AgentReactWorker,
     AgentRunTaskWorker,
     AgentTickWorker,
+    InstructionTickWorker,
   ],
 })
 export class WorkerModule {}

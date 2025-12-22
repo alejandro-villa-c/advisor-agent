@@ -50,6 +50,13 @@
       "when": 1766297028775,
       "tag": "0006_add_agent_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1766369048648,
+      "tag": "0007_add_ongoing_instructions_tables",
+      "breakpoints": true
     }
   ]
 }

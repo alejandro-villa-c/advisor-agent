@@ -414,6 +414,16 @@ export class WebController {
     res.redirect('/settings');
   }
 
+  @Get('/instructions')
+  instructions(@Req() req: Request, @Res() res: Response): void {
+    const userId = this.requireAuth(req, res);
+    if (!userId) return;
+
+    const flash = this.popFlash(req);
+
+    res.render('pages/instructions', { flash });
+  }
+
   private async loadIngestedCounts(userId: number): Promise<{
     gmailMessages: number;
     calendarEvents: number;

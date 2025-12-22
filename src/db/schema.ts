@@ -606,3 +606,166 @@ export const agentTaskToolCalls = pgTable('agent_task_tool_calls', {
 
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+/**
+ * TRIGGER TYPES
+ * Used for tracking what kind of event triggered a proactive action
+ */
+export const triggerTypeEnum = pgEnum('trigger_type', [
+  'gmail_received',
+  'gmail_sent',
+  'calendar_event_created',
+  'calendar_event_updated',
+  'calendar_event_deleted',
+  'hubspot_contact_created',
+  'hubspot_contact_updated',
+  'hubspot_contact_deleted',
+  'hubspot_note_created',
+  'hubspot_note_deleted',
+]);
+
+/**
+ * PROACTIVE ACTION STATUS
+ */
+export const proactiveActionStatusEnum = pgEnum('proactive_action_status', [
+  'pending',
+  'running',
+  'completed',
+  'failed',
+  'skipped',
+]);
+
+/**
+ * INSTRUCTION TRIGGER STATES
+ * Tracks the "last seen" state for each user's integrations
+ * to detect new items for trigger processing.
+ *
+ * This is SEPARATE from integrationStates (which tracks sync cursors).
+ * This tracks what the instruction worker has already processed.
+ */
+export const instructionTriggerStates = pgTable(
+  'instruction_trigger_states',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    /**
+     * State for each integration's trigger detection:
+     * {
+     *   gmail: {
+     *     lastProcessedInternalDateMs: number,
+     *     lastProcessedMessageIds: string[] // last N to avoid duplicates
+     *   },
+     *   calendar: {
+     *     lastProcessedEventIds: string[],
+     *     lastCheckAt: string // ISO
+     *   },
+     *   hubspot: {
+     *     lastProcessedContactIds: string[],
+     *     lastProcessedNoteIds: string[],
+     *     lastCheckAt: string // ISO
+     *   }
+     * }
+     */
+    state: jsonb('state').notNull().default({}),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdIdx: index('instruction_trigger_states_user_id_idx').on(t.userId),
+  }),
+);
+
+/**
+ * PROACTIVE ACTIONS LOG
+ * Records every action the agent takes proactively based on ongoing instructions.
+ * This provides transparency and an audit trail for users.
+ */
+export const proactiveActions = pgTable(
+  'proactive_actions',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    /**
+     * Which instruction triggered this action (null if instruction was deleted)
+     */
+    instructionId: integer('instruction_id'),
+
+    /**
+     * The instruction text at the time of execution (preserved even if instruction changes)
+     */
+    instructionText: text('instruction_text').notNull(),
+
+    /**
+     * What triggered this action
+     */
+    triggerType: triggerTypeEnum('trigger_type').notNull(),
+
+    /**
+     * Details about the trigger (e.g., email subject, contact name)
+     */
+    triggerSummary: text('trigger_summary').notNull(),
+
+    /**
+     * Full trigger data for debugging
+     */
+    triggerData: jsonb('trigger_data'),
+
+    /**
+     * What action was taken
+     */
+    actionTaken: text('action_taken').notNull(),
+
+    /**
+     * Detailed result of the action
+     */
+    actionResult: jsonb('action_result'),
+
+    status: proactiveActionStatusEnum('status').notNull().default('pending'),
+
+    error: text('error'),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdIdx: index('proactive_actions_user_id_idx').on(t.userId),
+    statusIdx: index('proactive_actions_status_idx').on(t.status),
+    createdAtIdx: index('proactive_actions_created_at_idx').on(t.createdAt),
+  }),
+);
+
+/**
+ * RATE LIMIT TRACKING
+ * Simple table to track proactive actions per user per hour
+ */
+export const proactiveActionRateLimits = pgTable(
+  'proactive_action_rate_limits',
+  {
+    id: serial('id').primaryKey(),
+
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    /**
+     * The hour window (truncated to hour)
+     */
+    hourWindow: timestamp('hour_window', { withTimezone: true }).notNull(),
+
+    /**
+     * Number of actions taken in this hour
+     */
+    actionCount: integer('action_count').notNull().default(0),
+  },
+  (t) => ({
+    userHourIdx: index('proactive_action_rate_limits_user_hour_idx').on(t.userId, t.hourWindow),
+  }),
+);

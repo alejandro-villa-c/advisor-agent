@@ -8,6 +8,8 @@ import {
   GMAIL_SYNC_MESSAGES_JOB,
   HUBSPOT_SYNC_CONTACTS_JOB,
   HUBSPOT_SYNC_NOTES_JOB,
+  INSTRUCTION_PROCESS_TRIGGER_JOB,
+  INSTRUCTION_TICK_JOB,
   RAG_EMBED_DOCUMENTS_JOB,
   SYNC_TICK_JOB,
 } from './job.constants';
@@ -50,6 +52,8 @@ export class PgBossService implements OnModuleInit, OnModuleDestroy {
       AGENT_TICK_JOB,
       AGENT_REACT_JOB,
       AGENT_RUN_TASK_JOB,
+      INSTRUCTION_TICK_JOB,
+      INSTRUCTION_PROCESS_TRIGGER_JOB,
     ];
 
     for (const queueName of queues) {

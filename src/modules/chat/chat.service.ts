@@ -9,6 +9,7 @@ import {
 } from '../integrations/openai/openai-chat.service';
 import { AgentIntentService } from '../agent/agent-intent.service';
 import { AgentTasksService } from '../agent/agent-tasks.service';
+import { InstructionsService } from '../instructions/instructions.service';
 import { PgBossService } from '../../jobs/pgboss.service';
 import { AGENT_RUN_TASK_JOB } from '../../jobs/job.constants';
 
@@ -42,9 +43,17 @@ export class ChatService {
     private readonly llm: OpenAiChatService,
     private readonly agentIntent: AgentIntentService,
     private readonly agentTasks: AgentTasksService,
+    private readonly instructionsService: InstructionsService,
     private readonly pgBoss: PgBossService,
   ) {}
 
+  /**
+   * Main method to send a message and get a response.
+   * Handles three intent types:
+   * 1. ongoing_instruction - Creates a persistent rule
+   * 2. agent - One-time task execution
+   * 3. chat - Informational Q&A using RAG
+   */
   async sendMessage(input: {
     userId: number;
     threadId?: number;
@@ -125,12 +134,10 @@ export class ChatService {
     });
 
     if (resumed) {
-      // Don't show any message here - the agent will respond appropriately
-      // based on what the user said (continue, cancel, change contact, etc.)
       return { threadId, assistant: '' };
     }
 
-    // Memory (ongoing instructions)
+    // Memory (ongoing instructions) - for RAG context
     const instrRows = await this.dbService.db
       .select({ instruction: agentInstructions.instruction })
       .from(agentInstructions)
@@ -146,9 +153,68 @@ export class ChatService {
       maxCharsPerMessage: readHistoryMaxCharsPerMessage(),
     });
 
-    // 2) Decide: agent workflow vs normal chat
+    // 2) Decide: ongoing instruction vs agent workflow vs normal chat
     const intent = await this.agentIntent.classify({ userText: text, history });
 
+    // ========================================================================
+    // HANDLE ONGOING INSTRUCTION INTENT
+    // ========================================================================
+    if (intent.intent === 'ongoing_instruction') {
+      const instructionText = intent.instructionText || text;
+
+      // Try to create the instruction (with conflict detection)
+      const result = await this.instructionsService.createInstruction(userId, instructionText);
+
+      let assistant: string;
+
+      if (result.conflict?.hasConflict) {
+        // There's a conflict with an existing instruction
+        const conflictingText =
+          result.conflict.conflictingInstruction?.instruction ?? 'an existing instruction';
+        const reason = result.conflict.reason ?? 'These instructions might contradict each other.';
+
+        assistant =
+          `I noticed this instruction might conflict with one you already have:\n\n` +
+          `**Existing:** "${conflictingText}"\n\n` +
+          `**Reason:** ${reason}\n\n` +
+          `The instruction was not added. You can:\n` +
+          `- Modify your request to avoid the conflict\n` +
+          `- Delete the existing instruction first in the Instructions page\n` +
+          `- Or let me know if you'd like me to add it anyway`;
+      } else if (result.id > 0) {
+        // Successfully created
+        assistant =
+          `✅ I've set up this ongoing instruction:\n\n` +
+          `"${instructionText}"\n\n` +
+          `I'll automatically apply this rule when relevant events happen (new emails, calendar changes, HubSpot updates, etc.).\n\n` +
+          `You can view and manage all your instructions in the **Instructions** page in the sidebar.`;
+      } else {
+        // Something went wrong
+        assistant =
+          `I understood you want to set up an ongoing instruction, but something went wrong while saving it. ` +
+          `Please try again or check the Instructions page.`;
+      }
+
+      await this.dbService.db.insert(messages).values({
+        userId,
+        threadId,
+        role: 'assistant',
+        content: assistant,
+        meta: {
+          kind: 'ongoing_instruction_response',
+          instructionId: result.id > 0 ? result.id : null,
+          instructionText: result.id > 0 ? instructionText : null,
+          conflict: result.conflict ?? null,
+          intent,
+        },
+      });
+
+      return { threadId, assistant };
+    }
+
+    // ========================================================================
+    // HANDLE AGENT INTENT (one-time task)
+    // ========================================================================
     if (intent.intent === 'agent') {
       const taskId = await this.startAgentTask({
         userId,
@@ -169,8 +235,9 @@ export class ChatService {
       return { threadId, assistant };
     }
 
-    // ---------------- existing RAG flow below (unchanged) ----------------
-
+    // ========================================================================
+    // HANDLE CHAT INTENT (RAG-based Q&A)
+    // ========================================================================
     const ragQuery = await this.buildRagQueryFromRecentUserTurns({
       userId,
       threadId,
@@ -230,6 +297,10 @@ export class ChatService {
     return { threadId, assistant };
   }
 
+  // ===========================================================================
+  // PRIVATE HELPER METHODS (unchanged from original)
+  // ===========================================================================
+
   private async tryResumeWaitingUserMessageTask(input: {
     userId: number;
     threadId: number;
@@ -254,11 +325,9 @@ export class ChatService {
 
     if (!match) return null;
 
-    // Claim waiting->queued so we don't double enqueue.
     const claimed = await this.agentTasks.claimWaitingTask(match.id);
     if (!claimed) return null;
 
-    // Append the advisor reply into the agent task conversation.
     await this.agentTasks.appendMessage({
       taskId: match.id,
       userId: input.userId,
@@ -266,7 +335,6 @@ export class ChatService {
       content: input.advisorReplyText,
     });
 
-    // Enqueue the agent run - use timestamp in key to avoid deduplication issues
     await this.pgBoss.client.send(
       AGENT_RUN_TASK_JOB,
       { taskId: match.id },
@@ -298,7 +366,6 @@ export class ChatService {
       memory,
     });
 
-    // Seed the agent conversation with the same user request.
     await this.agentTasks.appendMessage({
       taskId,
       userId: input.userId,
@@ -515,7 +582,9 @@ export class ChatService {
   }
 }
 
-// --- helpers ---
+// ===========================================================================
+// HELPER FUNCTIONS
+// ===========================================================================
 
 function deriveThreadTitleFromPrompt(prompt: string): string {
   const raw = String(prompt ?? '').trim();
@@ -772,11 +841,6 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 
 function shouldResumeUserMessageWaiting(replyText: string): boolean {
   const text = String(replyText ?? '').trim();
-
-  // If the reply is empty, don't resume
   if (!text) return false;
-
-  // For all cases, resume if there's any response
-  // The agent runner will use NLP to properly interpret the response
   return text.length >= 1;
 }

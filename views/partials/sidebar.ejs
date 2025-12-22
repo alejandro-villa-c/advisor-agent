@@ -11,6 +11,11 @@
       <div class="thread__meta">Ask the agent</div>
     </a>
 
+    <a class="thread <%= active === 'instructions' ? 'thread--active' : '' %>" href="/instructions">
+      <div class="thread__title">📋 Instructions</div>
+      <div class="thread__meta">Ongoing rules</div>
+    </a>
+
     <a class="thread <%= active === 'settings' ? 'thread--active' : '' %>" href="/settings">
       <div class="thread__title">Settings</div>
       <div class="thread__meta">Connections</div>
