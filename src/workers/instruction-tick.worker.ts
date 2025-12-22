@@ -193,7 +193,8 @@ export class InstructionTickWorker implements OnModuleInit {
       }
     }
 
-    // Save updated state
+    // Save updated state BEFORE processing triggers
+    // This prevents duplicate processing if the worker runs again quickly
     await this.instructionsService.updateTriggerState(userId, state);
 
     // Process triggers if any
@@ -204,7 +205,6 @@ export class InstructionTickWorker implements OnModuleInit {
 
       for (const trigger of triggers) {
         // Filter instructions to only those created BEFORE this event
-        // This ensures we don't apply instructions to pre-existing data
         const applicableInstructions = this.filterInstructionsByTriggerTime(
           instructions,
           trigger.eventTimestamp,
@@ -223,18 +223,12 @@ export class InstructionTickWorker implements OnModuleInit {
 
   /**
    * Filter instructions to only those that were created BEFORE the trigger event occurred.
-   * This prevents instructions from being applied to pre-existing data.
-   *
-   * Example: If user creates instruction "When I create a contact, send welcome email" at 3pm,
-   * contacts created at 2pm won't get emails, but contacts created at 4pm will.
    */
   private filterInstructionsByTriggerTime(
     instructions: InstructionRow[],
     eventTimestamp: Date,
   ): InstructionRow[] {
     return instructions.filter((inst) => {
-      // The instruction must have been created BEFORE the event occurred
-      // for it to apply to that event
       return inst.createdAt.getTime() < eventTimestamp.getTime();
     });
   }
@@ -255,7 +249,7 @@ export class InstructionTickWorker implements OnModuleInit {
     const lastProcessedMs = state.gmail?.lastProcessedInternalDateMs ?? 0;
     const lastProcessedIds = new Set(state.gmail?.lastProcessedMessageIds ?? []);
 
-    // Calculate cutoff date - either from last processed or 5 minutes ago for first run
+    // Calculate cutoff date
     const cutoffDate =
       lastProcessedMs > 0 ? new Date(lastProcessedMs) : new Date(Date.now() - 5 * 60 * 1000);
 
@@ -270,7 +264,7 @@ export class InstructionTickWorker implements OnModuleInit {
         subject: gmailMessages.subject,
         snippet: gmailMessages.snippet,
         sentAt: gmailMessages.sentAt,
-        createdAt: gmailMessages.createdAt, // When we synced it (fallback)
+        createdAt: gmailMessages.createdAt,
       })
       .from(gmailMessages)
       .where(and(eq(gmailMessages.userId, userId), gt(gmailMessages.sentAt, cutoffDate)))
@@ -280,7 +274,6 @@ export class InstructionTickWorker implements OnModuleInit {
     let maxProcessedMs = lastProcessedMs;
     const processedIds: string[] = [];
 
-    // Normalize user email for comparison
     const normalizedUserEmail = userEmail?.toLowerCase().trim() ?? null;
 
     for (const email of newEmails) {
@@ -297,16 +290,20 @@ export class InstructionTickWorker implements OnModuleInit {
       // Determine if this email was sent by the user or received
       const isSent = this.isEmailSentByUser(email.from, normalizedUserEmail);
 
-      // For sent emails, use "to" field; for received, use "from" field
+      // Parse the sender/recipient for structured data
+      const senderParsed = parseEmailAddress(email.from);
+      const recipientParsed = parseEmailAddress(email.to);
+
       const otherParty = isSent
         ? (email.to ?? 'unknown recipient')
         : (email.from ?? 'unknown sender');
 
-      // Use sentAt as the event timestamp (when the email was actually sent/received)
       const eventTimestamp = email.sentAt ?? email.createdAt ?? new Date();
 
+      const triggerType = isSent ? 'gmail_sent' : 'gmail_received';
+
       triggers.push({
-        type: isSent ? 'gmail_sent' : 'gmail_received',
+        type: triggerType,
         summary: isSent
           ? `Email sent to ${otherParty}: ${email.subject ?? '(no subject)'}`
           : `Email from ${otherParty}: ${email.subject ?? '(no subject)'}`,
@@ -319,6 +316,20 @@ export class InstructionTickWorker implements OnModuleInit {
           snippet: email.snippet,
           sentAt: email.sentAt?.toISOString(),
           isSent,
+          sender: {
+            raw: senderParsed.raw,
+            email: senderParsed.email,
+            name: senderParsed.name,
+            firstName: senderParsed.firstName,
+            lastName: senderParsed.lastName,
+          },
+          recipient: {
+            raw: recipientParsed.raw,
+            email: recipientParsed.email,
+            name: recipientParsed.name,
+            firstName: recipientParsed.firstName,
+            lastName: recipientParsed.lastName,
+          },
         },
         eventTimestamp,
       });
@@ -341,20 +352,16 @@ export class InstructionTickWorker implements OnModuleInit {
 
     const normalizedFrom = from.toLowerCase();
 
-    // Check if the from field contains the user's email
-    // Handle formats like "John Doe <john@example.com>" or just "john@example.com"
     if (normalizedFrom.includes(userEmail)) {
       return true;
     }
 
-    // Extract email from "Name <email>" format
     const emailMatch = normalizedFrom.match(/<([^>]+)>/);
     if (emailMatch) {
       const extractedEmail = emailMatch[1].trim();
       return extractedEmail === userEmail;
     }
 
-    // Direct comparison for plain email format
     return normalizedFrom.trim() === userEmail;
   }
 
@@ -376,7 +383,6 @@ export class InstructionTickWorker implements OnModuleInit {
 
     const lastProcessedIds = new Set(state.calendar?.lastProcessedEventIds ?? []);
 
-    // Query for events updated since last check
     const recentEvents = await this.dbService.db
       .select({
         id: calendarEvents.id,
@@ -399,7 +405,6 @@ export class InstructionTickWorker implements OnModuleInit {
     for (const event of recentEvents) {
       newProcessedIds.push(event.googleEventId);
 
-      // Determine if this is new or updated
       const isNew = !lastProcessedIds.has(event.googleEventId);
       const createdRecently =
         event.createdAt && new Date(event.createdAt).getTime() > lastCheckAt.getTime();
@@ -407,7 +412,6 @@ export class InstructionTickWorker implements OnModuleInit {
       const triggerType =
         isNew || createdRecently ? 'calendar_event_created' : 'calendar_event_updated';
 
-      // Use createdAt for new events, updatedAt for updates
       const eventTimestamp =
         isNew || createdRecently
           ? (event.createdAt ?? new Date())
@@ -487,7 +491,6 @@ export class InstructionTickWorker implements OnModuleInit {
       const triggerType =
         isNew || createdRecently ? 'hubspot_contact_created' : 'hubspot_contact_updated';
 
-      // Use createdAt for new contacts, updatedAt for updates
       const eventTimestamp =
         isNew || createdRecently
           ? (contact.createdAt ?? new Date())
@@ -528,8 +531,6 @@ export class InstructionTickWorker implements OnModuleInit {
       newNoteIds.push(note.hubspotNoteId);
 
       const bodyPreview = (note.body ?? '').slice(0, 100);
-
-      // Use createdAt as the event timestamp
       const eventTimestamp = note.createdAt ?? new Date();
 
       triggers.push({
@@ -557,4 +558,40 @@ export class InstructionTickWorker implements OnModuleInit {
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
+}
+
+/**
+ * Parse an email address field like "John Smith <john@example.com>" or "john@example.com"
+ */
+function parseEmailAddress(raw: string | null): {
+  raw: string;
+  email: string;
+  name: string | null;
+  firstName: string | null;
+  lastName: string | null;
+} {
+  if (!raw) {
+    return { raw: '', email: '', name: null, firstName: null, lastName: null };
+  }
+
+  const trimmed = raw.trim();
+  const match = trimmed.match(/^(.+?)\s*<([^>]+)>$/);
+
+  if (match) {
+    const name = match[1].trim().replace(/^["']|["']$/g, '');
+    const email = match[2].trim().toLowerCase();
+
+    if (name && name.toLowerCase() !== email) {
+      const nameParts = name.split(/\s+/);
+      const firstName = nameParts[0] || null;
+      const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : null;
+
+      return { raw: trimmed, email, name, firstName, lastName };
+    }
+
+    return { raw: trimmed, email, name: null, firstName: null, lastName: null };
+  }
+
+  const email = trimmed.toLowerCase();
+  return { raw: trimmed, email, name: null, firstName: null, lastName: null };
 }

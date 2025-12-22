@@ -303,6 +303,72 @@ export class CalendarApiService {
 
     return json;
   }
+
+  /**
+   * Delete a calendar event
+   */
+  async deleteEvent(userId: number, eventId: string, calendarId = 'primary'): Promise<void> {
+    const eid = (eventId ?? '').trim();
+    if (!eid) throw new Error('Calendar: deleteEvent missing "eventId"');
+
+    await this.calendarRequest(
+      userId,
+      'DELETE',
+      `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eid)}`,
+    );
+  }
+
+  /**
+   * Find/search calendar events with optional filters
+   */
+  async findEvents(
+    userId: number,
+    input: {
+      calendarId?: string;
+      query?: string;
+      attendeeEmail?: string;
+      timeMinIso?: string;
+      timeMaxIso?: string;
+      maxResults?: number;
+    },
+  ): Promise<CalendarEventSummary[]> {
+    const calendarId = input.calendarId ?? 'primary';
+    const timeMinIso = input.timeMinIso ?? new Date().toISOString();
+    const timeMaxIso =
+      input.timeMaxIso ?? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const maxResults = clampInt(input.maxResults ?? 50, 1, 250);
+
+    // Use the existing listEvents method
+    const events = await this.listEvents(userId, {
+      calendarId,
+      timeMinIso,
+      timeMaxIso,
+      maxResults,
+    });
+
+    let filtered = events;
+
+    // Filter by query (simple text match on summary/description)
+    if (input.query?.trim()) {
+      const q = input.query.trim().toLowerCase();
+      filtered = filtered.filter((e) => {
+        const summary = (e.summary ?? '').toLowerCase();
+        const description = (e.description ?? '').toLowerCase();
+        return summary.includes(q) || description.includes(q);
+      });
+    }
+
+    // Filter by attendee email
+    if (input.attendeeEmail?.trim()) {
+      const email = input.attendeeEmail.trim().toLowerCase();
+      filtered = filtered.filter((e) => {
+        const attendees = e.attendees ?? [];
+        return attendees.some((a) => a.email?.toLowerCase() === email);
+      });
+    }
+
+    return filtered;
+  }
 }
 
 function safeJson(text: string): unknown {

@@ -1,0 +1,2 @@
+DROP INDEX "proactive_action_rate_limits_user_hour_idx";--> statement-breakpoint
+CREATE UNIQUE INDEX "proactive_action_rate_limits_user_hour_uq" ON "proactive_action_rate_limits" USING btree ("user_id","hour_window");

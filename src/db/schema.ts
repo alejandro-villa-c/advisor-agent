@@ -766,6 +766,6 @@ export const proactiveActionRateLimits = pgTable(
     actionCount: integer('action_count').notNull().default(0),
   },
   (t) => ({
-    userHourIdx: index('proactive_action_rate_limits_user_hour_idx').on(t.userId, t.hourWindow),
+    userHourUq: uniqueIndex('proactive_action_rate_limits_user_hour_uq').on(t.userId, t.hourWindow),
   }),
 );

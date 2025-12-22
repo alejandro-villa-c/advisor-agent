@@ -310,6 +310,34 @@ export class GmailApiService {
 
     return json;
   }
+
+  /**
+   * Search for emails and return full message summaries (not just IDs)
+   * This is a convenience method that combines listMessageIds + getMessage
+   */
+  async searchEmails(
+    userId: number,
+    query: string,
+    maxResults = 10,
+  ): Promise<GmailMessageSummary[]> {
+    const q = (query ?? '').trim();
+    if (!q) return [];
+
+    const ids = await this.listMessageIds(userId, { q, maxResults });
+
+    const messages: GmailMessageSummary[] = [];
+    for (const id of ids) {
+      try {
+        const msg = await this.getMessage(userId, id);
+        messages.push(msg);
+      } catch {
+        // Skip messages that fail to fetch (e.g., deleted)
+        continue;
+      }
+    }
+
+    return messages;
+  }
 }
 
 function normalizeMessageId(v?: string): string | null {

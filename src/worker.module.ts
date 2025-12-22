@@ -19,6 +19,7 @@ import { AgentModule } from './modules/agent/agent.module';
 import { WebSocketModule } from './modules/websocket/websocket.module';
 import { InstructionTickWorker } from './workers/instruction-tick.worker';
 import { InstructionsModule } from './modules/instructions/instructions.module';
+import { ConfigModule } from '@nestjs/config';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { InstructionsModule } from './modules/instructions/instructions.module';
     AgentModule,
     WebSocketModule,
     InstructionsModule,
+    ConfigModule,
   ],
   providers: [
     HubspotContactsSyncWorker,

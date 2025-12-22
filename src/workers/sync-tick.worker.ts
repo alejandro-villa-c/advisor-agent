@@ -210,7 +210,7 @@ export class SyncTickWorker implements OnModuleInit {
             await this.enqueueJob(
               HUBSPOT_SYNC_CONTACTS_JOB,
               { userId },
-              { singletonKey: `hubspot_contacts:${userId}`, singletonSeconds: 21600 },
+              { singletonKey: `hubspot_contacts:${userId}`, singletonSeconds: 900 },
             );
             enqueued += 1;
           }

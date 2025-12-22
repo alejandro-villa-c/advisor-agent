@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, sql, gt } from 'drizzle-orm';
 import { DbService } from '../../db/db.service';
 import {
   agentInstructions,
@@ -8,6 +8,7 @@ import {
   instructionTriggerStates,
 } from '../../db/schema';
 import { OpenAiChatService } from '../integrations/openai/openai-chat.service';
+import { ConfigService } from '@nestjs/config';
 
 export type InstructionRow = {
   id: number;
@@ -36,16 +37,103 @@ export type ConflictCheckResult = {
   reason: string | null;
 };
 
-const MAX_ACTIONS_PER_HOUR = 20;
+/**
+ * Available tools for ongoing instructions
+ */
+export const AVAILABLE_TOOLS = [
+  {
+    category: 'Gmail',
+    tools: [
+      { name: 'gmail_send_email', description: 'Send a new email to someone' },
+      { name: 'gmail_reply', description: 'Reply to an email thread' },
+      { name: 'gmail_search', description: 'Search for emails by query' },
+      { name: 'gmail_get_thread', description: 'Get full content of an email thread' },
+    ],
+  },
+  {
+    category: 'Calendar',
+    tools: [
+      { name: 'calendar_create_event', description: 'Create a new calendar event' },
+      { name: 'calendar_update_event', description: 'Update an existing calendar event' },
+      { name: 'calendar_delete_event', description: 'Delete/cancel a calendar event' },
+      { name: 'calendar_find_events', description: 'Search for calendar events' },
+    ],
+  },
+  {
+    category: 'HubSpot',
+    tools: [
+      { name: 'hubspot_create_contact', description: 'Create a new contact' },
+      { name: 'hubspot_update_contact', description: 'Update contact information' },
+      { name: 'hubspot_delete_contact', description: 'Delete a contact' },
+      { name: 'hubspot_get_contact', description: 'Get contact details' },
+      { name: 'hubspot_find_contact', description: 'Search for contacts' },
+      {
+        name: 'hubspot_find_or_create_contact',
+        description: 'Find or create a contact (with optional note)',
+      },
+      { name: 'hubspot_create_note', description: 'Add a note to a contact' },
+      { name: 'hubspot_delete_note', description: 'Delete a note' },
+    ],
+  },
+];
+
+/**
+ * Supported triggers for ongoing instructions
+ */
+export const SUPPORTED_TRIGGERS = [
+  {
+    category: 'Gmail',
+    triggers: [
+      { type: 'gmail_received', description: 'When you receive an email' },
+      { type: 'gmail_sent', description: 'When you send an email' },
+    ],
+  },
+  {
+    category: 'Calendar',
+    triggers: [
+      { type: 'calendar_event_created', description: 'When a calendar event is created' },
+      { type: 'calendar_event_updated', description: 'When a calendar event is updated' },
+      { type: 'calendar_event_deleted', description: 'When a calendar event is deleted' },
+    ],
+  },
+  {
+    category: 'HubSpot',
+    triggers: [
+      { type: 'hubspot_contact_created', description: 'When a contact is created in HubSpot' },
+      { type: 'hubspot_contact_updated', description: 'When a contact is updated in HubSpot' },
+      { type: 'hubspot_contact_deleted', description: 'When a contact is deleted from HubSpot' },
+      { type: 'hubspot_note_created', description: 'When a note is added to a contact' },
+    ],
+  },
+];
 
 @Injectable()
 export class InstructionsService {
   private readonly logger = new Logger(InstructionsService.name);
+  private readonly maxActionsPerHour: number;
 
   constructor(
     private readonly dbService: DbService,
     private readonly llm: OpenAiChatService,
-  ) {}
+    private readonly config: ConfigService,
+  ) {
+    this.maxActionsPerHour = this.config.get<number>('PROACTIVE_ACTIONS_PER_HOUR', 20);
+  }
+
+  /**
+   * Get available tools and triggers for UI display
+   */
+  getCapabilities(): {
+    tools: typeof AVAILABLE_TOOLS;
+    triggers: typeof SUPPORTED_TRIGGERS;
+    maxActionsPerHour: number;
+  } {
+    return {
+      tools: AVAILABLE_TOOLS,
+      triggers: SUPPORTED_TRIGGERS,
+      maxActionsPerHour: this.maxActionsPerHour,
+    };
+  }
 
   /**
    * List all instructions for a user
@@ -98,7 +186,6 @@ export class InstructionsService {
     }
 
     if (!this.llm.isConfigured()) {
-      // Can't check conflicts without LLM
       return { hasConflict: false, conflictingInstruction: null, reason: null };
     }
 
@@ -179,11 +266,9 @@ Examples of NON-conflicts:
       throw new Error('Instruction cannot be empty');
     }
 
-    // Check for conflicts
     const conflict = await this.checkForConflicts(userId, trimmed);
 
     if (conflict.hasConflict) {
-      // Return the conflict info but don't create
       return { id: -1, conflict };
     }
 
@@ -221,7 +306,6 @@ Examples of NON-conflicts:
     userId: number,
     instructionId: number,
   ): Promise<{ isActive: boolean } | null> {
-    // First get current state
     const current = await this.dbService.db
       .select({ isActive: agentInstructions.isActive })
       .from(agentInstructions)
@@ -291,6 +375,47 @@ Examples of NON-conflicts:
   }
 
   /**
+   * Check if a trigger has already been processed (idempotency)
+   * Uses triggerType + triggerSummary as a composite key
+   */
+  async isTriggerProcessed(
+    userId: number,
+    triggerType: string,
+    triggerSummary: string,
+  ): Promise<boolean> {
+    // Check if we've processed this exact trigger in the last hour
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+
+    // Cast to the enum type to satisfy TypeScript
+    const typedTriggerType = triggerType as
+      | 'gmail_received'
+      | 'gmail_sent'
+      | 'calendar_event_created'
+      | 'calendar_event_updated'
+      | 'calendar_event_deleted'
+      | 'hubspot_contact_created'
+      | 'hubspot_contact_updated'
+      | 'hubspot_contact_deleted'
+      | 'hubspot_note_created'
+      | 'hubspot_note_deleted';
+
+    const existing = await this.dbService.db
+      .select({ id: proactiveActions.id })
+      .from(proactiveActions)
+      .where(
+        and(
+          eq(proactiveActions.userId, userId),
+          eq(proactiveActions.triggerType, typedTriggerType),
+          eq(proactiveActions.triggerSummary, triggerSummary),
+          gt(proactiveActions.createdAt, oneHourAgo),
+        ),
+      )
+      .limit(1);
+
+    return existing.length > 0;
+  }
+
+  /**
    * Log a proactive action
    */
   async logProactiveAction(input: {
@@ -335,6 +460,37 @@ Examples of NON-conflicts:
   }
 
   /**
+   * Update a proactive action (for status changes after execution)
+   */
+  async updateProactiveAction(
+    actionId: number,
+    update: {
+      status?: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+      actionResult?: Record<string, unknown>;
+      error?: string;
+    },
+  ): Promise<void> {
+    const setClause: Record<string, unknown> = {};
+
+    if (update.status) {
+      setClause.status = update.status;
+    }
+    if (update.actionResult !== undefined) {
+      setClause.actionResult = update.actionResult;
+    }
+    if (update.error !== undefined) {
+      setClause.error = update.error;
+    }
+
+    if (Object.keys(setClause).length === 0) return;
+
+    await this.dbService.db
+      .update(proactiveActions)
+      .set(setClause)
+      .where(eq(proactiveActions.id, actionId));
+  }
+
+  /**
    * Check if user has exceeded rate limit for proactive actions
    */
   async checkRateLimit(userId: number): Promise<{ allowed: boolean; remaining: number }> {
@@ -342,7 +498,6 @@ Examples of NON-conflicts:
     const hourWindow = new Date(now);
     hourWindow.setMinutes(0, 0, 0);
 
-    // Get or create rate limit record
     const existing = await this.dbService.db
       .select()
       .from(proactiveActionRateLimits)
@@ -355,37 +510,53 @@ Examples of NON-conflicts:
       .limit(1);
 
     if (existing.length === 0) {
-      return { allowed: true, remaining: MAX_ACTIONS_PER_HOUR };
+      return { allowed: true, remaining: this.maxActionsPerHour };
     }
 
     const count = existing[0].actionCount;
-    const remaining = Math.max(0, MAX_ACTIONS_PER_HOUR - count);
+    const remaining = Math.max(0, this.maxActionsPerHour - count);
 
-    return { allowed: count < MAX_ACTIONS_PER_HOUR, remaining };
+    return { allowed: count < this.maxActionsPerHour, remaining };
   }
 
   /**
    * Increment rate limit counter
+   * Uses try/catch pattern to handle both insert and update scenarios
    */
   async incrementRateLimit(userId: number): Promise<void> {
     const now = new Date();
     const hourWindow = new Date(now);
     hourWindow.setMinutes(0, 0, 0);
 
-    // Upsert: insert or increment
-    await this.dbService.db
-      .insert(proactiveActionRateLimits)
-      .values({
+    try {
+      // Try to insert first
+      await this.dbService.db.insert(proactiveActionRateLimits).values({
         userId,
         hourWindow,
         actionCount: 1,
-      })
-      .onConflictDoUpdate({
-        target: [proactiveActionRateLimits.userId, proactiveActionRateLimits.hourWindow],
-        set: {
-          actionCount: sql`${proactiveActionRateLimits.actionCount} + 1`,
-        },
       });
+    } catch (err: unknown) {
+      // If insert fails (conflict), update instead
+      const message = err instanceof Error ? err.message : String(err);
+      if (
+        message.includes('unique') ||
+        message.includes('duplicate') ||
+        message.includes('conflict') ||
+        message.includes('violates')
+      ) {
+        await this.dbService.db
+          .update(proactiveActionRateLimits)
+          .set({ actionCount: sql`${proactiveActionRateLimits.actionCount} + 1` })
+          .where(
+            and(
+              eq(proactiveActionRateLimits.userId, userId),
+              eq(proactiveActionRateLimits.hourWindow, hourWindow),
+            ),
+          );
+      } else {
+        throw err;
+      }
+    }
   }
 
   /**
@@ -399,7 +570,6 @@ Examples of NON-conflicts:
       .limit(1);
 
     if (rows.length === 0) {
-      // Create initial state
       await this.dbService.db.insert(instructionTriggerStates).values({
         userId,
         state: {},

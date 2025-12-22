@@ -48,8 +48,99 @@
             >
             <div class="instructions-create__actions">
               <button type="submit" class="btn btn--primary">Add Instruction</button>
+              <button type="button" class="btn btn--ghost" id="show-reference-btn" title="Show available triggers and tools">
+                ❓ Reference
+              </button>
             </div>
           </form>
+        </div>
+
+        <!-- Reference Panel (Hidden by default) -->
+        <div class="instructions-reference" id="reference-panel" style="display: none;">
+          <div class="instructions-reference__header">
+            <h3>📚 Available Triggers & Tools</h3>
+            <button type="button" class="instructions-reference__close" id="close-reference-btn">✕</button>
+          </div>
+          
+          <div class="instructions-reference__content">
+            <div class="instructions-reference__section">
+              <h4>🎯 Triggers (When...)</h4>
+              <p class="instructions-reference__hint">Your instruction can respond to these events:</p>
+              
+              <div class="instructions-reference__category">
+                <strong>Gmail</strong>
+                <ul>
+                  <li><code>When I receive an email</code> - Triggers when you get a new email</li>
+                  <li><code>When I send an email</code> - Triggers when you send an email</li>
+                </ul>
+              </div>
+              
+              <div class="instructions-reference__category">
+                <strong>Calendar</strong>
+                <ul>
+                  <li><code>When a calendar event is created</code></li>
+                  <li><code>When a calendar event is updated</code></li>
+                  <li><code>When a calendar event is deleted</code></li>
+                </ul>
+              </div>
+              
+              <div class="instructions-reference__category">
+                <strong>HubSpot</strong>
+                <ul>
+                  <li><code>When a contact is created in HubSpot</code></li>
+                  <li><code>When a contact is updated in HubSpot</code></li>
+                  <li><code>When a contact is deleted from HubSpot</code></li>
+                  <li><code>When a note is added to a contact</code></li>
+                </ul>
+              </div>
+            </div>
+            
+            <div class="instructions-reference__section">
+              <h4>🔧 Tools (Do...)</h4>
+              <p class="instructions-reference__hint">The agent can perform these actions:</p>
+              
+              <div class="instructions-reference__category">
+                <strong>Gmail</strong>
+                <ul>
+                  <li><code>Send an email</code></li>
+                  <li><code>Reply to an email</code></li>
+                  <li><code>Search for emails</code></li>
+                </ul>
+              </div>
+              
+              <div class="instructions-reference__category">
+                <strong>Calendar</strong>
+                <ul>
+                  <li><code>Create a calendar event</code></li>
+                  <li><code>Update a calendar event</code></li>
+                  <li><code>Delete a calendar event</code></li>
+                  <li><code>Look up/find calendar events</code></li>
+                </ul>
+              </div>
+              
+              <div class="instructions-reference__category">
+                <strong>HubSpot</strong>
+                <ul>
+                  <li><code>Create a contact</code></li>
+                  <li><code>Update a contact</code></li>
+                  <li><code>Delete a contact</code></li>
+                  <li><code>Find a contact</code></li>
+                  <li><code>Add a note to a contact</code></li>
+                </ul>
+              </div>
+            </div>
+            
+            <div class="instructions-reference__section">
+              <h4>💡 Example Instructions</h4>
+              <ul class="instructions-reference__examples">
+                <li>"When someone emails me that's not in HubSpot, create a contact with a note about the email"</li>
+                <li>"When I create a contact in HubSpot, send them a welcome email"</li>
+                <li>"When someone asks about our next meeting, look it up on the calendar and reply"</li>
+                <li>"When I add an event to my calendar, email the attendees to let them know"</li>
+                <li>"When a client replies to my email, add a note to their HubSpot contact"</li>
+              </ul>
+            </div>
+          </div>
         </div>
 
         <!-- Global Actions -->
@@ -84,12 +175,7 @@
               <div class="instructions-empty__icon">📋</div>
               <div class="instructions-empty__title">No instructions yet</div>
               <div class="instructions-empty__text">
-                Create your first ongoing instruction above. Examples:
-                <ul>
-                  <li>"When someone emails me that's not in HubSpot, create a contact"</li>
-                  <li>"When I create a calendar event, email the attendees"</li>
-                  <li>"When a client asks about our next meeting, look it up and respond"</li>
-                </ul>
+                Create your first ongoing instruction above. Click <strong>Reference</strong> to see available triggers and tools.
               </div>
             </div>
           </div>

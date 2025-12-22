@@ -41,12 +41,6 @@ type HubspotDebugView = {
   scopes: string[];
 };
 
-type PgBossSend = (
-  name: string,
-  data?: unknown,
-  options?: Record<string, unknown>,
-) => Promise<unknown>;
-
 @Controller()
 export class WebController {
   constructor(
@@ -56,13 +50,16 @@ export class WebController {
     private readonly hubspotOAuthService: HubspotOAuthService,
   ) {}
 
+  /**
+   * Enqueue a job using pg-boss.
+   * We call send() directly on the client to preserve the `this` context.
+   */
   private async enqueueJob(
     name: string,
-    data: unknown,
+    data: Record<string, unknown>,
     options?: Record<string, unknown>,
   ): Promise<void> {
-    const send = getPgBossSend(this.pgBoss.client as unknown);
-    await send(name, data, options);
+    await this.pgBoss.client.send(name, data, options);
   }
 
   private requireAuth(req: Request, res: Response): number | null {
@@ -503,11 +500,4 @@ function parseFlash(v: unknown): Flash | null {
   if (typeof message !== 'string') return null;
 
   return { type, message };
-}
-
-function getPgBossSend(client: unknown): PgBossSend {
-  if (!isRecord(client)) throw new Error('PgBoss client is not an object');
-  const send = client['send'];
-  if (typeof send !== 'function') throw new Error('PgBoss client.send is not a function');
-  return send as PgBossSend;
 }

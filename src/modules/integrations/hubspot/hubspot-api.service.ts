@@ -414,6 +414,46 @@ export class HubspotApiService {
 
     return json;
   }
+
+  /**
+   * Update a contact's properties
+   * ADD THIS METHOD to your HubspotApiService
+   */
+  async updateContact(
+    userId: number,
+    contactId: string,
+    properties: {
+      email?: string;
+      firstName?: string;
+      lastName?: string;
+      company?: string;
+      phone?: string;
+    },
+  ): Promise<{ id: string }> {
+    const cid = (contactId ?? '').trim();
+    if (!cid) throw new Error('HubSpot: updateContact missing "contactId"');
+
+    const propertiesToUpdate: Record<string, string> = {};
+    if (properties.email) propertiesToUpdate.email = properties.email;
+    if (properties.firstName) propertiesToUpdate.firstname = properties.firstName;
+    if (properties.lastName) propertiesToUpdate.lastname = properties.lastName;
+    if (properties.company) propertiesToUpdate.company = properties.company;
+    if (properties.phone) propertiesToUpdate.phone = properties.phone;
+
+    if (Object.keys(propertiesToUpdate).length === 0) {
+      // Nothing to update
+      return { id: cid };
+    }
+
+    const data = await this.hubspotRequest(userId, 'PATCH', `/crm/v3/objects/contacts/${cid}`, {
+      properties: propertiesToUpdate,
+    });
+
+    const id = readString(data, 'id');
+    if (!id) throw new Error('HubSpot: updateContact succeeded but returned no id');
+
+    return { id };
+  }
 }
 
 function safeJson(text: string): unknown {

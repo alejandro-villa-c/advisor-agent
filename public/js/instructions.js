@@ -14,6 +14,26 @@
   const rateLimitMax = document.getElementById('rate-limit-max');
   const rateLimitFill = document.getElementById('rate-limit-fill');
 
+  // Reference panel elements
+  const referencePanel = document.getElementById('reference-panel');
+  const showReferenceBtn = document.getElementById('show-reference-btn');
+  const closeReferenceBtn = document.getElementById('close-reference-btn');
+
+  // =========================================================================
+  // Reference Panel Toggle
+  // =========================================================================
+  if (showReferenceBtn && referencePanel) {
+    showReferenceBtn.addEventListener('click', () => {
+      referencePanel.style.display = referencePanel.style.display === 'none' ? 'block' : 'none';
+    });
+  }
+
+  if (closeReferenceBtn && referencePanel) {
+    closeReferenceBtn.addEventListener('click', () => {
+      referencePanel.style.display = 'none';
+    });
+  }
+
   // =========================================================================
   // Tab Switching
   // =========================================================================
@@ -122,7 +142,7 @@
       skipped: 'instructions-badge--muted',
     };
     const cls = classes[status] || '';
-    return `<span class="instructions-badge ${cls}">${escapeHtml(status)}</span>`;
+    return `<span class="instructions-badge ${cls}">${escapeHtml(status.toUpperCase())}</span>`;
   }
 
   // =========================================================================
@@ -138,7 +158,7 @@
             <div class="instructions-empty__icon">📋</div>
             <div class="instructions-empty__title">No instructions yet</div>
             <div class="instructions-empty__text">
-              Create your first ongoing instruction above.
+              Create your first ongoing instruction above. Click <strong>Reference</strong> to see available triggers and tools.
             </div>
           </div>
         `;

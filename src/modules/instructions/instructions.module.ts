@@ -8,9 +8,10 @@ import { HubspotModule } from '../integrations/hubspot/hubspot.module';
 import { InstructionsService } from './instructions.service';
 import { InstructionsController } from './instructions.controller';
 import { InstructionExecutorService } from './instruction-executor.service';
+import { ConfigModule } from '@nestjs/config';
 
 @Module({
-  imports: [DbModule, JobsModule, OpenAiModule, GoogleModule, HubspotModule],
+  imports: [DbModule, JobsModule, OpenAiModule, GoogleModule, HubspotModule, ConfigModule],
   controllers: [InstructionsController],
   providers: [InstructionsService, InstructionExecutorService],
   exports: [InstructionsService, InstructionExecutorService],
