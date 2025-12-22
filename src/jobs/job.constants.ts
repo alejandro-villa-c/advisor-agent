@@ -6,6 +6,7 @@ export const CALENDAR_SYNC_EVENTS_JOB = 'calendar.syncEvents';
 
 export const RAG_EMBED_DOCUMENTS_JOB = 'rag.embedDocuments';
 export const RAG_REBUILD_EMBED_JOB = 'rag.rebuildAndEmbed';
+export const RAG_REPAIR_JOB = 'rag.repair';
 
 export const SYNC_TICK_JOB = 'sync.tick';
 

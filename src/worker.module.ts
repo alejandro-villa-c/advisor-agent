@@ -20,6 +20,7 @@ import { WebSocketModule } from './modules/websocket/websocket.module';
 import { InstructionTickWorker } from './workers/instruction-tick.worker';
 import { InstructionsModule } from './modules/instructions/instructions.module';
 import { ConfigModule } from '@nestjs/config';
+import { RagRepairWorker } from './workers/rag-repair.worker';
 
 @Module({
   imports: [
@@ -39,6 +40,7 @@ import { ConfigModule } from '@nestjs/config';
     GmailSyncWorker,
     CalendarSyncWorker,
     RagEmbedWorker,
+    RagRepairWorker,
     SyncSchedulerService,
     SyncTickWorker,
     AgentReactWorker,

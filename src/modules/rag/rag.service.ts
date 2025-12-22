@@ -1,9 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { and, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 import { createHash } from 'crypto';
 import { DbService } from '../../db/db.service';
 import { documentChunks, documents } from '../../db/schema';
 import { OpenAiEmbeddingsService } from './openai-embeddings.service';
+import { OpenAiChatService } from '../integrations/openai/openai-chat.service';
 
 type Chunk = { text: string; meta: { start: number; end: number } };
 
@@ -17,17 +18,23 @@ export type RagSearchRow = {
   distance: number | null;
 };
 
-type RankedRow = RagSearchRow & {
-  rrfScore: number;
-  titleTermHits: number;
-  bodyTermHits: number;
+type SearchPlan = {
+  strategy: 'lexical_first' | 'semantic_first';
+  searchTerms: string[];
+  semanticQuery: string;
 };
 
+/**
+ * RagService - Improved search quality with LLM-driven strategy selection
+ */
 @Injectable()
 export class RagService {
+  private readonly logger = new Logger(RagService.name);
+
   constructor(
     private readonly dbService: DbService,
     private readonly embeddings: OpenAiEmbeddingsService,
+    private readonly llm: OpenAiChatService,
   ) {}
 
   chunkText(
@@ -111,14 +118,12 @@ export class RagService {
     }
 
     let chunksInserted = 0;
-
     const chunkSize = 900;
     const overlap = 120;
 
     for (const d of docs) {
       const docText = (d.text ?? '').trim();
 
-      // If a doc becomes empty, delete its chunks (scoped by userId for safety).
       if (!docText) {
         await this.dbService.db
           .delete(documentChunks)
@@ -144,8 +149,6 @@ export class RagService {
 
       const chunks = this.chunkText(docText, { chunkSize, overlap });
 
-      // Key change: make delete+insert atomic so failures cannot leave the doc chunkless.
-      // Also tolerate concurrency by using ON CONFLICT DO NOTHING.
       await this.dbService.db.transaction(async (tx) => {
         await tx
           .delete(documentChunks)
@@ -180,8 +183,6 @@ export class RagService {
             target: [documentChunks.documentId, documentChunks.chunkIndex],
           });
 
-        // NOTE: we count intended inserts (good enough for logging/metrics);
-        // if a concurrent insert won the race, onConflictDoNothing may insert fewer.
         chunksInserted += rows.length;
       });
     }
@@ -244,6 +245,17 @@ export class RagService {
     return { chunksEmbedded, modelUsed };
   }
 
+  /**
+   * IMPROVED HYBRID SEARCH - ALWAYS DO BOTH, MERGE INTELLIGENTLY
+   *
+   * The LLM decides:
+   * 1. Which strategy to PRIORITIZE (lexical vs semantic)
+   * 2. What search terms to use
+   * 3. How to rewrite the query for semantic search
+   *
+   * But we ALWAYS run both searches and merge results.
+   * This ensures we don't miss relevant content either way.
+   */
   async searchHybrid(input: {
     userId: number;
     query: string;
@@ -252,75 +264,140 @@ export class RagService {
     lexicalCandidates?: number;
   }): Promise<RagSearchRow[]> {
     const userId = input.userId;
-    const q = (input.query ?? '').trim();
-    if (!q) return [];
+    const query = (input.query ?? '').trim();
+    if (!query) return [];
 
-    const take = clampInt(input.take ?? 25, 1, 5000);
-    const semanticCandidates = clampInt(input.semanticCandidates ?? 300, 1, 5000);
-    const lexicalCandidates = clampInt(input.lexicalCandidates ?? 300, 1, 5000);
+    const take = clampInt(input.take ?? 50, 1, 500);
+    const semanticK = clampInt(input.semanticCandidates ?? 300, 50, 2000);
+    const lexicalK = clampInt(input.lexicalCandidates ?? 200, 50, 1000);
 
-    const terms = extractQueryTerms(q, 12);
+    this.logger.debug(`[RAG] searchHybrid query="${query}" take=${take}`);
 
-    const semantic = await this.semanticCandidates(userId, q, semanticCandidates);
-    const fts = await this.fullTextCandidates(userId, q, lexicalCandidates);
-    const ilike =
-      fts.length === 0 && terms.length > 0 ? await this.ilikeCandidates(userId, terms, 200) : [];
+    // Ask LLM to plan the search
+    const plan = await this.planSearch(query);
+    this.logger.debug(
+      `[RAG] Search plan: strategy=${plan.strategy}, terms=[${plan.searchTerms.join(', ')}], semanticQuery="${plan.semanticQuery}"`,
+    );
 
-    const semanticRank = buildRankMap(semantic);
-    const ftsRank = buildRankMap(fts);
-    const ilikeRank = buildRankMap(ilike);
+    // ALWAYS run both searches
+    const [semanticResults, lexicalResults] = await Promise.all([
+      this.semanticSearch(userId, plan.semanticQuery, semanticK),
+      plan.searchTerms.length > 0
+        ? this.lexicalSearch(userId, query, plan.searchTerms, lexicalK)
+        : Promise.resolve([]),
+    ]);
 
-    const combined = new Map<number, RagSearchRow>();
-    for (const r of semantic) combined.set(r.chunkId, r);
-    for (const r of fts) if (!combined.has(r.chunkId)) combined.set(r.chunkId, r);
-    for (const r of ilike) if (!combined.has(r.chunkId)) combined.set(r.chunkId, r);
+    this.logger.debug(`[RAG] Semantic results: ${semanticResults.length}`);
+    this.logger.debug(`[RAG] Lexical results: ${lexicalResults.length}`);
 
-    const rrfK = 60;
-    const scored: RankedRow[] = [];
-
-    for (const r of combined.values()) {
-      const sRank = semanticRank.get(r.chunkId);
-      const fRank = ftsRank.get(r.chunkId);
-      const iRank = ilikeRank.get(r.chunkId);
-
-      let rrfScore = 0;
-      if (typeof sRank === 'number') rrfScore += 1 / (rrfK + sRank);
-      if (typeof fRank === 'number') rrfScore += 1 / (rrfK + fRank);
-      if (typeof iRank === 'number') rrfScore += 1 / (rrfK + iRank);
-
-      const title = (r.title ?? '').toLowerCase();
-      const body = (r.chunkText ?? '').toLowerCase();
-
-      let titleTermHits = 0;
-      let bodyTermHits = 0;
-
-      for (const t of terms) {
-        if (title.includes(t)) titleTermHits += 1;
-        if (body.includes(t)) bodyTermHits += 1;
-      }
-
-      scored.push({ ...r, rrfScore, titleTermHits, bodyTermHits });
+    if (semanticResults.length > 0) {
+      this.logger.debug(
+        `[RAG] Top 3 semantic: ${semanticResults
+          .slice(0, 3)
+          .map((r) => `${r.title?.slice(0, 50)} (d=${r.distance?.toFixed(3)})`)
+          .join(', ')}`,
+      );
     }
 
+    // Build lookup sets
+    const lexicalChunkIds = new Set(lexicalResults.map((r) => r.chunkId));
+    const semanticByChunkId = new Map(semanticResults.map((r) => [r.chunkId, r]));
+
+    // Score ALL results
+    type ScoredRow = RagSearchRow & {
+      score: number;
+      inLexical: boolean;
+      inSemantic: boolean;
+      termMatches: number;
+    };
+
+    const allChunkIds = new Set([
+      ...semanticResults.map((r) => r.chunkId),
+      ...lexicalResults.map((r) => r.chunkId),
+    ]);
+
+    const scored: ScoredRow[] = [];
+
+    for (const chunkId of allChunkIds) {
+      // Get the row from whichever search found it
+      const semanticRow = semanticByChunkId.get(chunkId);
+      const lexicalRow = lexicalResults.find((r) => r.chunkId === chunkId);
+      const row = semanticRow ?? lexicalRow;
+
+      if (!row) continue;
+
+      const inLexical = lexicalChunkIds.has(chunkId);
+      const inSemantic = semanticByChunkId.has(chunkId);
+
+      // Count term matches
+      const content = ((row.title ?? '') + ' ' + (row.chunkText ?? '')).toLowerCase();
+      const termMatches = plan.searchTerms.filter((t) => content.includes(t.toLowerCase())).length;
+
+      // Calculate score based on strategy
+      let score = 0;
+
+      if (plan.strategy === 'lexical_first') {
+        // Lexical-first: prioritize term matches, then semantic distance
+        if (inLexical) {
+          score += 1.0 + termMatches * 0.2; // Base boost + term bonus
+        }
+        if (inSemantic && semanticRow?.distance != null) {
+          score += Math.max(0, 0.5 - semanticRow.distance / 2); // Smaller semantic bonus
+        }
+      } else {
+        // Semantic-first: prioritize semantic similarity, boost lexical matches
+        if (inSemantic && semanticRow?.distance != null) {
+          score += Math.max(0, 1.0 - semanticRow.distance); // Convert distance to score
+        }
+        if (inLexical) {
+          score += 0.3 + termMatches * 0.1; // Lexical boost
+        }
+      }
+
+      // Bonus for appearing in BOTH searches (strong relevance signal)
+      if (inLexical && inSemantic) {
+        score += 0.5;
+      }
+
+      scored.push({
+        ...row,
+        distance: semanticRow?.distance ?? null,
+        score,
+        inLexical,
+        inSemantic,
+        termMatches,
+      });
+    }
+
+    // Sort by score (highest first)
     scored.sort((a, b) => {
-      if (b.rrfScore !== a.rrfScore) return b.rrfScore - a.rrfScore;
-      if (b.titleTermHits !== a.titleTermHits) return b.titleTermHits - a.titleTermHits;
-      if (b.bodyTermHits !== a.bodyTermHits) return b.bodyTermHits - a.bodyTermHits;
-
-      const ad = a.distance;
-      const bd = b.distance;
-
-      const aHas = typeof ad === 'number' && Number.isFinite(ad);
-      const bHas = typeof bd === 'number' && Number.isFinite(bd);
-
-      if (aHas && bHas) return ad - bd;
-      if (aHas && !bHas) return -1;
-      if (!aHas && bHas) return 1;
-
-      return a.chunkId - b.chunkId;
+      if (b.score !== a.score) return b.score - a.score;
+      // Tie-breaker: prefer items in both searches
+      if (a.inLexical && a.inSemantic && !(b.inLexical && b.inSemantic)) return -1;
+      if (b.inLexical && b.inSemantic && !(a.inLexical && a.inSemantic)) return 1;
+      // Then by distance if available
+      const ad = a.distance ?? 1;
+      const bd = b.distance ?? 1;
+      return ad - bd;
     });
 
-    return scored.slice(0, take).map((r) => ({
+    // Debug output
+    const inBoth = scored.filter((r) => r.inLexical && r.inSemantic).length;
+    const lexicalOnly = scored.filter((r) => r.inLexical && !r.inSemantic).length;
+    const semanticOnly = scored.filter((r) => !r.inLexical && r.inSemantic).length;
+
+    this.logger.debug(
+      `[RAG] Merged: ${scored.length} total (${inBoth} in both, ${lexicalOnly} lexical-only, ${semanticOnly} semantic-only)`,
+    );
+
+    if (scored.length > 0) {
+      this.logger.debug(
+        `[RAG] Top result: "${scored[0].title}" (score=${scored[0].score.toFixed(2)}, lexical=${scored[0].inLexical}, semantic=${scored[0].inSemantic})`,
+      );
+    }
+
+    // Return top results
+    const results = scored.slice(0, take).map((r) => ({
       chunkId: r.chunkId,
       documentId: r.documentId,
       title: r.title,
@@ -329,66 +406,104 @@ export class RagService {
       chunkText: r.chunkText,
       distance: r.distance,
     }));
+
+    this.logger.debug(`[RAG] Returning ${results.length} results`);
+    return results;
   }
 
-  async search(input: { userId: number; query: string; k?: number }): Promise<RagSearchRow[]> {
-    const userId = input.userId;
-    const q = (input.query ?? '').trim();
-    const k = clampInt(input.k ?? 10, 1, 25);
-    if (!q) return [];
+  /**
+   * Ask the LLM to plan the search strategy
+   */
+  private async planSearch(query: string): Promise<SearchPlan> {
+    const defaultPlan: SearchPlan = {
+      strategy: 'semantic_first',
+      searchTerms: extractSearchTerms(query),
+      semanticQuery: query,
+    };
 
-    if (!this.embeddings.isConfigured()) {
-      const rows = await this.dbService.db
-        .select({
-          chunkId: documentChunks.id,
-          documentId: documents.id,
-          title: documents.title,
-          source: documents.source,
-          sourceId: documents.sourceId,
-          chunkText: documentChunks.text,
-        })
-        .from(documentChunks)
-        .innerJoin(documents, eq(documentChunks.documentId, documents.id))
-        .where(
-          and(
-            eq(documentChunks.userId, userId),
-            sql`${documentChunks.text} ILIKE ${'%' + q + '%'}`,
-          ),
-        )
-        .limit(k);
-
-      return rows.map((r) => ({ ...r, distance: null }));
+    if (!this.llm.isConfigured()) {
+      return defaultPlan;
     }
 
-    const { vector } = await this.embeddings.embedOne(q);
-    const vectorLiteral = `[${vector.join(',')}]`;
-    const distanceExpr = sql<number>`${documentChunks.embedding} <=> ${vectorLiteral}::vector`;
+    try {
+      const systemPrompt = `You are a search query planner for a RAG system that searches emails, calendar events, contacts, and notes.
 
-    const rows = await this.dbService.db
-      .select({
-        chunkId: documentChunks.id,
-        documentId: documents.id,
-        title: documents.title,
-        source: documents.source,
-        sourceId: documents.sourceId,
-        chunkText: documentChunks.text,
-        distance: distanceExpr,
-      })
-      .from(documentChunks)
-      .innerJoin(documents, eq(documentChunks.documentId, documents.id))
-      .where(and(eq(documentChunks.userId, userId), isNotNull(documentChunks.embedding)))
-      .orderBy(distanceExpr)
-      .limit(k);
+Given a user query, output a JSON search plan:
+{
+  "strategy": "lexical_first" | "semantic_first",
+  "searchTerms": ["term1", "term2", ...],
+  "semanticQuery": "expanded query for embedding search"
+}
 
-    return rows;
+STRATEGY:
+- "lexical_first": Query mentions a specific person, company, or entity BY NAME
+- "semantic_first": Query is about topics, concepts, categories, or aggregations
+
+SEARCH TERMS (CRITICAL):
+- Each term must be a SINGLE WORD, lowercase
+- Split names into separate words: "John Smith" → ["john", "smith"]
+- Include 3-10 single-word terms that would appear in relevant documents
+- Think about what words would actually exist in emails, receipts, calendar events, etc.
+- For multilingual content, include equivalent terms in likely languages
+
+SEMANTIC QUERY:
+- Expand with synonyms and related concepts
+- Describe what the matching documents would contain
+
+Respond with ONLY valid JSON, no markdown.`;
+
+      const response = await this.llm.complete({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: query },
+        ],
+        temperature: 0,
+      });
+
+      const jsonMatch = response.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+
+        // Post-process search terms: split any multi-word terms and lowercase
+        let searchTerms: string[] = [];
+        if (Array.isArray(parsed.searchTerms)) {
+          for (const term of parsed.searchTerms) {
+            if (typeof term === 'string') {
+              // Split multi-word terms into individual words
+              const words = term.toLowerCase().split(/\s+/).filter(Boolean);
+              searchTerms.push(...words);
+            }
+          }
+          // Deduplicate
+          searchTerms = [...new Set(searchTerms)];
+        }
+
+        return {
+          strategy: parsed.strategy === 'lexical_first' ? 'lexical_first' : 'semantic_first',
+          searchTerms: searchTerms.length > 0 ? searchTerms : defaultPlan.searchTerms,
+          semanticQuery:
+            typeof parsed.semanticQuery === 'string' && parsed.semanticQuery.trim()
+              ? parsed.semanticQuery.trim()
+              : query,
+        };
+      }
+    } catch (err) {
+      this.logger.warn(
+        `[RAG] Search planning failed, using defaults: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    return defaultPlan;
   }
 
-  private async semanticCandidates(
-    userId: number,
-    query: string,
-    k: number,
-  ): Promise<RagSearchRow[]> {
-    if (!this.embeddings.isConfigured()) return [];
+  /**
+   * Pure semantic search using vector similarity
+   */
+  private async semanticSearch(userId: number, query: string, k: number): Promise<RagSearchRow[]> {
+    if (!this.embeddings.isConfigured()) {
+      this.logger.warn('[RAG] Embeddings not configured, falling back to lexical only');
+      return [];
+    }
 
     const { vector } = await this.embeddings.embedOne(query);
     const vectorLiteral = `[${vector.join(',')}]`;
@@ -413,11 +528,40 @@ export class RagService {
     return rows;
   }
 
-  private async fullTextCandidates(
+  /**
+   * Lexical search using full-text search + ILIKE fallback
+   */
+  private async lexicalSearch(
     userId: number,
     query: string,
+    terms: string[],
     k: number,
   ): Promise<RagSearchRow[]> {
+    // Try full-text search first
+    const ftsResults = await this.fullTextSearch(userId, query, k);
+
+    if (ftsResults.length >= k / 2) {
+      return ftsResults;
+    }
+
+    // Supplement with ILIKE if FTS didn't find enough
+    const ilikeResults = await this.ilikeSearch(userId, terms, k - ftsResults.length);
+
+    // Merge, preferring FTS results
+    const seen = new Set(ftsResults.map((r) => r.chunkId));
+    const merged = [...ftsResults];
+
+    for (const r of ilikeResults) {
+      if (!seen.has(r.chunkId)) {
+        merged.push(r);
+        seen.add(r.chunkId);
+      }
+    }
+
+    return merged.slice(0, k);
+  }
+
+  private async fullTextSearch(userId: number, query: string, k: number): Promise<RagSearchRow[]> {
     const q = (query ?? '').trim();
     if (!q) return [];
 
@@ -452,19 +596,18 @@ export class RagService {
     }));
   }
 
-  private async ilikeCandidates(
-    userId: number,
-    terms: string[],
-    k: number,
-  ): Promise<RagSearchRow[]> {
+  private async ilikeSearch(userId: number, terms: string[], k: number): Promise<RagSearchRow[]> {
     if (terms.length === 0) return [];
 
+    // Build ILIKE clauses for each term
     const likeClauses = terms.map((t) => {
       const pat = `%${t}%`;
       return sql`(${documentChunks.text} ILIKE ${pat} OR ${documents.title} ILIKE ${pat})`;
     });
 
-    const whereLike = sql`(${sql.join(likeClauses, sql` OR `)})`;
+    // Use OR logic - match ANY of the terms
+    // This is more permissive but ensures we find relevant content
+    const whereClause = sql`(${sql.join(likeClauses, sql` OR `)})`;
 
     const rows = await this.dbService.db
       .select({
@@ -477,10 +620,23 @@ export class RagService {
       })
       .from(documentChunks)
       .innerJoin(documents, eq(documentChunks.documentId, documents.id))
-      .where(and(eq(documentChunks.userId, userId), whereLike))
+      .where(and(eq(documentChunks.userId, userId), whereClause))
       .limit(k);
 
-    return rows.map((r) => ({
+    // Score results by how many terms they match, return sorted
+    const scored = rows.map((r) => {
+      const content = ((r.title ?? '') + ' ' + (r.chunkText ?? '')).toLowerCase();
+      let matchCount = 0;
+      for (const t of terms) {
+        if (content.includes(t.toLowerCase())) matchCount++;
+      }
+      return { ...r, matchCount };
+    });
+
+    // Sort by match count descending
+    scored.sort((a, b) => b.matchCount - a.matchCount);
+
+    return scored.map((r) => ({
       chunkId: r.chunkId,
       documentId: r.documentId,
       title: r.title,
@@ -490,13 +646,23 @@ export class RagService {
       distance: null,
     }));
   }
+
+  /**
+   * Simple semantic-only search (for when you just want vector similarity)
+   */
+  async search(input: { userId: number; query: string; k?: number }): Promise<RagSearchRow[]> {
+    const userId = input.userId;
+    const q = (input.query ?? '').trim();
+    const k = clampInt(input.k ?? 10, 1, 100);
+    if (!q) return [];
+
+    return this.semanticSearch(userId, q, k);
+  }
 }
 
-function buildRankMap(rows: RagSearchRow[]): Map<number, number> {
-  const m = new Map<number, number>();
-  for (let i = 0; i < rows.length; i += 1) m.set(rows[i].chunkId, i + 1);
-  return m;
-}
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
 
 function clampInt(n: number, min: number, max: number): number {
   if (!Number.isFinite(n)) return min;
@@ -526,16 +692,20 @@ function readMetaNumber(meta: unknown, key: string): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-function extractQueryTerms(input: string, maxTerms: number): string[] {
+/**
+ * Extract meaningful search terms from a query.
+ * Used as fallback when LLM planning fails.
+ */
+function extractSearchTerms(input: string): string[] {
   const raw = (input ?? '').toLowerCase();
-  const cleaned = raw.replace(/[^a-z0-9]+/g, ' ');
+  const cleaned = raw.replace(/[^a-z0-9'.-]+/g, ' ');
 
   const parts = cleaned
     .split(' ')
-    .map((x) => x.trim())
+    .map((x) => x.trim().replace(/^[.']+|[.']+$/g, ''))
     .filter(Boolean);
 
-  const stop = new Set([
+  const stopwords = new Set([
     'the',
     'a',
     'an',
@@ -583,15 +753,30 @@ function extractQueryTerms(input: string, maxTerms: number): string[] {
     'could',
     'should',
     'can',
+    'what',
+    'who',
+    'when',
+    'where',
+    'why',
+    'how',
+    'which',
+    'tell',
+    'told',
+    'said',
+    'says',
+    'say',
+    'about',
+    'has',
+    'have',
   ]);
 
   const unique: string[] = [];
   const seen = new Set<string>();
 
   for (const p of parts) {
-    if (unique.length >= maxTerms) break;
-    if (p.length < 3) continue;
-    if (stop.has(p)) continue;
+    if (unique.length >= 10) break;
+    if (p.length < 2) continue;
+    if (stopwords.has(p)) continue;
     if (seen.has(p)) continue;
     seen.add(p);
     unique.push(p);

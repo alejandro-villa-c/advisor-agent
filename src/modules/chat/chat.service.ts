@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { and, asc, desc, eq, inArray } from 'drizzle-orm';
 import { DbService } from '../../db/db.service';
 import { agentInstructions, messages, threads } from '../../db/schema';
@@ -29,14 +29,10 @@ type ChatDebugCitation = {
   distance: number | null;
 };
 
-type RetrievalPlan = {
-  query: string;
-  mode: 'standard' | 'bulk';
-  expandedQueries: string[];
-};
-
 @Injectable()
 export class ChatService {
+  private readonly logger = new Logger(ChatService.name);
+
   constructor(
     private readonly dbService: DbService,
     private readonly rag: RagService,
@@ -47,13 +43,6 @@ export class ChatService {
     private readonly pgBoss: PgBossService,
   ) {}
 
-  /**
-   * Main method to send a message and get a response.
-   * Handles three intent types:
-   * 1. ongoing_instruction - Creates a persistent rule
-   * 2. agent - One-time task execution
-   * 3. chat - Informational Q&A using RAG
-   */
   async sendMessage(input: {
     userId: number;
     threadId?: number;
@@ -87,21 +76,13 @@ export class ChatService {
       isNewThread = true;
     }
 
-    // Store user message in thread
     const insertedUser = await this.dbService.db
       .insert(messages)
-      .values({
-        userId,
-        threadId,
-        role: 'user',
-        content: text,
-        meta: null,
-      })
+      .values({ userId, threadId, role: 'user', content: text, meta: null })
       .returning({ id: messages.id });
 
     const userMessageId = insertedUser[0]?.id;
 
-    // Persist thread title from the first user prompt (only once)
     if (threadTitleAtStart === 'New thread') {
       if (isNewThread) {
         await this.setThreadTitleFromPrompt({ userId, threadId, prompt: text });
@@ -125,8 +106,7 @@ export class ChatService {
       }
     }
 
-    // 1) If there is a waiting task asking the advisor for info IN THIS THREAD,
-    // treat this message as the reply.
+    // Check for waiting agent task
     const resumed = await this.tryResumeWaitingUserMessageTask({
       userId,
       threadId,
@@ -137,7 +117,7 @@ export class ChatService {
       return { threadId, assistant: '' };
     }
 
-    // Memory (ongoing instructions) - for RAG context
+    // Load ongoing instructions
     const instrRows = await this.dbService.db
       .select({ instruction: agentInstructions.instruction })
       .from(agentInstructions)
@@ -145,7 +125,7 @@ export class ChatService {
 
     const instructions = instrRows.map((r) => r.instruction).filter(Boolean);
 
-    // Multi-turn: include last N messages from the thread (user + assistant)
+    // Load conversation history
     const history = await this.loadThreadHistoryForLlm({
       userId,
       threadId,
@@ -153,22 +133,19 @@ export class ChatService {
       maxCharsPerMessage: readHistoryMaxCharsPerMessage(),
     });
 
-    // 2) Decide: ongoing instruction vs agent workflow vs normal chat
+    // Classify intent
     const intent = await this.agentIntent.classify({ userText: text, history });
 
     // ========================================================================
-    // HANDLE ONGOING INSTRUCTION INTENT
+    // HANDLE ONGOING INSTRUCTION
     // ========================================================================
     if (intent.intent === 'ongoing_instruction') {
       const instructionText = intent.instructionText || text;
-
-      // Try to create the instruction (with conflict detection)
       const result = await this.instructionsService.createInstruction(userId, instructionText);
 
       let assistant: string;
 
       if (result.conflict?.hasConflict) {
-        // There's a conflict with an existing instruction
         const conflictingText =
           result.conflict.conflictingInstruction?.instruction ?? 'an existing instruction';
         const reason = result.conflict.reason ?? 'These instructions might contradict each other.';
@@ -177,22 +154,14 @@ export class ChatService {
           `I noticed this instruction might conflict with one you already have:\n\n` +
           `**Existing:** "${conflictingText}"\n\n` +
           `**Reason:** ${reason}\n\n` +
-          `The instruction was not added. You can:\n` +
-          `- Modify your request to avoid the conflict\n` +
-          `- Delete the existing instruction first in the Instructions page\n` +
-          `- Or let me know if you'd like me to add it anyway`;
+          `The instruction was not added.`;
       } else if (result.id > 0) {
-        // Successfully created
         assistant =
           `✅ I've set up this ongoing instruction:\n\n` +
           `"${instructionText}"\n\n` +
-          `I'll automatically apply this rule when relevant events happen (new emails, calendar changes, HubSpot updates, etc.).\n\n` +
-          `You can view and manage all your instructions in the **Instructions** page in the sidebar.`;
+          `I'll automatically apply this rule when relevant events happen.`;
       } else {
-        // Something went wrong
-        assistant =
-          `I understood you want to set up an ongoing instruction, but something went wrong while saving it. ` +
-          `Please try again or check the Instructions page.`;
+        assistant = `Something went wrong while saving the instruction. Please try again.`;
       }
 
       await this.dbService.db.insert(messages).values({
@@ -200,29 +169,19 @@ export class ChatService {
         threadId,
         role: 'assistant',
         content: assistant,
-        meta: {
-          kind: 'ongoing_instruction_response',
-          instructionId: result.id > 0 ? result.id : null,
-          instructionText: result.id > 0 ? instructionText : null,
-          conflict: result.conflict ?? null,
-          intent,
-        },
+        meta: { kind: 'ongoing_instruction_response', intent },
       });
 
       return { threadId, assistant };
     }
 
     // ========================================================================
-    // HANDLE AGENT INTENT (one-time task)
+    // HANDLE AGENT INTENT
     // ========================================================================
     if (intent.intent === 'agent') {
-      const taskId = await this.startAgentTask({
-        userId,
-        threadId,
-        userText: text,
-      });
+      const taskId = await this.startAgentTask({ userId, threadId, userText: text });
 
-      const assistant = `Got it — I'll handle that for you. You'll be notified here in this thread when there are updates or when the task is complete.`;
+      const assistant = `Got it — I'll handle that for you. You'll be notified here when there are updates.`;
 
       await this.dbService.db.insert(messages).values({
         userId,
@@ -236,50 +195,55 @@ export class ChatService {
     }
 
     // ========================================================================
-    // HANDLE CHAT INTENT (RAG-based Q&A)
+    // HANDLE CHAT INTENT (RAG)
     // ========================================================================
-    const ragQuery = await this.buildRagQueryFromRecentUserTurns({
+
+    // IMPROVED: Use the user's query directly for RAG
+    // Don't over-process or rewrite queries that mention specific names
+    const ragQuery = text; // Use original query - it contains the name!
+
+    this.logger.debug(`[Chat] RAG query: "${ragQuery}"`);
+
+    // Search with improved hybrid search
+    const searchResults = await this.rag.searchHybrid({
       userId,
-      threadId,
-      fallback: text,
-      maxUserTurns: readRagQueryUserTurns(),
-      maxChars: readRagQueryMaxChars(),
-    });
-
-    const plan = await this.planRetrieval({
-      userText: text,
-      ragQuery,
-      history,
-    });
-
-    const retrievalTake = plan.mode === 'bulk' ? readRagBulkTake() : readRagStandardTake();
-
-    const base = await this.rag.searchHybrid({
-      userId,
-      query: plan.query,
-      take: retrievalTake,
+      query: ragQuery,
+      take: readRagTake(),
       semanticCandidates: readRagSemanticCandidates(),
       lexicalCandidates: readRagLexicalCandidates(),
     });
 
-    const expanded = await this.runExpandedQueries({
-      userId,
-      expandedQueries: plan.expandedQueries,
-      takeEach: Math.max(25, Math.floor(retrievalTake / 3)),
+    this.logger.debug(`[Chat] RAG returned ${searchResults.length} results`);
+
+    // Debug: Check if target content is in results
+    const lowerQuery = text.toLowerCase();
+    const queryTerms = lowerQuery.split(/\s+/).filter((t) => t.length > 2);
+
+    const matchingResults = searchResults.filter((r) => {
+      const content = ((r.title ?? '') + ' ' + (r.chunkText ?? '')).toLowerCase();
+      return queryTerms.some((term) => content.includes(term));
     });
 
-    const merged = mergeUniqueByChunkIdPreferBest([...base, ...expanded]);
-    const ranked = rankRowsBestToWorst(merged);
+    this.logger.debug(
+      `[Chat] Results matching query terms: ${matchingResults.length}/${searchResults.length}`,
+    );
 
+    if (matchingResults.length > 0) {
+      this.logger.debug(`[Chat] Top matching result: "${matchingResults[0].title}"`);
+    }
+
+    // Build citations for LLM
     const systemCitations = toCitations(
-      ranked.slice(0, readSystemCitationsMax()),
+      searchResults.slice(0, readSystemCitationsMax()),
       readSystemExcerptMaxChars(),
     );
 
-    const debugCitations = toDebugCitations(ranked.slice(0, readDebugCitationsMax()));
+    const debugCitations = toDebugCitations(searchResults.slice(0, readDebugCitationsMax()));
 
+    // Build system prompt
     const system = buildSystemPrompt({ instructions, citations: systemCitations });
 
+    // Call LLM
     const llmMessages: OpenAiChatMessage[] = [{ role: 'system', content: system }, ...history];
 
     const assistant = this.llm.isConfigured()
@@ -298,7 +262,7 @@ export class ChatService {
   }
 
   // ===========================================================================
-  // PRIVATE HELPER METHODS (unchanged from original)
+  // PRIVATE METHODS
   // ===========================================================================
 
   private async tryResumeWaitingUserMessageTask(input: {
@@ -318,9 +282,7 @@ export class ChatService {
       const taskThreadId =
         chatBridge && typeof chatBridge['threadId'] === 'number' ? chatBridge['threadId'] : null;
 
-      if (taskThreadId !== input.threadId) return false;
-
-      return shouldResumeUserMessageWaiting(input.advisorReplyText);
+      return taskThreadId === input.threadId;
     });
 
     if (!match) return null;
@@ -338,10 +300,7 @@ export class ChatService {
     await this.pgBoss.client.send(
       AGENT_RUN_TASK_JOB,
       { taskId: match.id },
-      {
-        singletonKey: `agent.runTask:${match.id}:${Date.now()}`,
-        singletonSeconds: 5,
-      },
+      { singletonKey: `agent.runTask:${match.id}:${Date.now()}`, singletonSeconds: 5 },
     );
 
     return { taskId: match.id };
@@ -376,138 +335,10 @@ export class ChatService {
     await this.pgBoss.client.send(
       AGENT_RUN_TASK_JOB,
       { taskId },
-      {
-        singletonKey: `agent.runTask:${taskId}`,
-        singletonSeconds: 60,
-      },
+      { singletonKey: `agent.runTask:${taskId}`, singletonSeconds: 60 },
     );
 
     return taskId;
-  }
-
-  private async runExpandedQueries(input: {
-    userId: number;
-    expandedQueries: string[];
-    takeEach: number;
-  }): Promise<RagSearchRow[]> {
-    const qs = Array.isArray(input.expandedQueries) ? input.expandedQueries : [];
-    const cleaned = qs
-      .map((q) => String(q ?? '').trim())
-      .filter(Boolean)
-      .slice(0, 4);
-    if (cleaned.length === 0) return [];
-
-    const out: RagSearchRow[] = [];
-
-    for (const q of cleaned) {
-      const rows = await this.rag.searchHybrid({
-        userId: input.userId,
-        query: q,
-        take: clampInt(input.takeEach, 10, 2000),
-        semanticCandidates: readRagSemanticCandidates(),
-        lexicalCandidates: readRagLexicalCandidates(),
-      });
-      out.push(...rows);
-    }
-
-    return out;
-  }
-
-  private async planRetrieval(input: {
-    userText: string;
-    ragQuery: string;
-    history: OpenAiChatMessage[];
-  }): Promise<RetrievalPlan> {
-    if (!this.llm.isConfigured() || readDisablePlanner()) {
-      return { query: input.ragQuery, mode: 'standard', expandedQueries: [] };
-    }
-
-    const sys =
-      `You plan retrieval queries for a RAG-powered assistant.\n` +
-      `Return ONLY valid JSON.\n\n` +
-      `Schema:\n` +
-      `{\n` +
-      `  "query": string,\n` +
-      `  "mode": "standard"|"bulk",\n` +
-      `  "expandedQueries": string[]\n` +
-      `}\n\n` +
-      `Guidelines:\n` +
-      `- Use BULK when the user asks for totals, summaries over many items, a full list, or the request likely spans many documents.\n` +
-      `- Do NOT mention any specific company or keywords unless they come from the user conversation.\n`;
-
-    const convo = input.history
-      .filter((m) => m.role === 'user')
-      .map((m) => `- ${m.content}`)
-      .slice(-6)
-      .join('\n');
-
-    const user =
-      `Recent user messages:\n${convo || '(none)'}\n\n` +
-      `Latest user message:\n${input.userText}\n\n` +
-      `Fallback combined query:\n${input.ragQuery}\n`;
-
-    const raw = await this.llm.complete({
-      messages: [
-        { role: 'system', content: sys },
-        { role: 'user', content: user },
-      ],
-      temperature: 0.0,
-    });
-
-    const parsed = safeJson(raw);
-    if (!isRecord(parsed)) return { query: input.ragQuery, mode: 'standard', expandedQueries: [] };
-
-    const query = typeof parsed.query === 'string' ? parsed.query.trim() : '';
-    const mode = parsed.mode === 'bulk' ? 'bulk' : 'standard';
-    const expandedQueries = Array.isArray(parsed.expandedQueries)
-      ? parsed.expandedQueries
-          .map((x) => String(x ?? '').trim())
-          .filter(Boolean)
-          .slice(0, 4)
-      : [];
-
-    return {
-      query: query || input.ragQuery,
-      mode,
-      expandedQueries,
-    };
-  }
-
-  private async buildRagQueryFromRecentUserTurns(input: {
-    userId: number;
-    threadId: number;
-    fallback: string;
-    maxUserTurns: number;
-    maxChars: number;
-  }): Promise<string> {
-    const maxTurns = clampInt(input.maxUserTurns, 1, 12);
-    const maxChars = clampInt(input.maxChars, 200, 20_000);
-
-    const rows = await this.dbService.db
-      .select({
-        content: messages.content,
-        createdAt: messages.createdAt,
-        id: messages.id,
-      })
-      .from(messages)
-      .where(
-        and(
-          eq(messages.userId, input.userId),
-          eq(messages.threadId, input.threadId),
-          eq(messages.role, 'user'),
-        ),
-      )
-      .orderBy(desc(messages.createdAt), desc(messages.id))
-      .limit(maxTurns);
-
-    const chronological = rows.slice().reverse();
-    const combined = chronological
-      .map((r) => String(r.content ?? '').trim())
-      .filter(Boolean)
-      .join('\n');
-
-    const q = capText(combined || input.fallback, maxChars).trim();
-    return q || input.fallback;
   }
 
   private async loadThreadHistoryForLlm(input: {
@@ -523,8 +354,6 @@ export class ChatService {
       .select({
         role: messages.role,
         content: messages.content,
-        createdAt: messages.createdAt,
-        id: messages.id,
       })
       .from(messages)
       .where(
@@ -582,9 +411,9 @@ export class ChatService {
   }
 }
 
-// ===========================================================================
+// =============================================================================
 // HELPER FUNCTIONS
-// ===========================================================================
+// =============================================================================
 
 function deriveThreadTitleFromPrompt(prompt: string): string {
   const raw = String(prompt ?? '').trim();
@@ -604,26 +433,25 @@ function deriveThreadTitleFromPrompt(prompt: string): string {
 
 function buildSystemPrompt(input: { instructions: string[]; citations: ChatCitation[] }): string {
   const instructionsBlock = input.instructions.length
-    ? `Ongoing instructions (memory):\n- ${input.instructions.join('\n- ')}\n\n`
+    ? `Your ongoing instructions:\n- ${input.instructions.join('\n- ')}\n\n`
     : '';
 
   const contextBlock = input.citations.length
-    ? `Context (RAG excerpts):\n${input.citations
+    ? `Retrieved context:\n${input.citations
         .map((c, i) => {
-          const label = `[${i + 1}] ${c.source} ${c.title ?? ''} (${c.sourceId})`.trim();
-          return `${label}\n${c.excerpt}`;
+          const sourceLabel = c.source === 'gmail_email' ? 'Email' : c.source;
+          return `[${i + 1}] ${sourceLabel}: ${c.title ?? 'Untitled'}\n${c.excerpt}`;
         })
         .join('\n\n')}\n\n`
-    : 'Context (RAG excerpts):\n(no relevant excerpts found)\n\n';
+    : 'No relevant context found.\n\n';
 
   return (
-    `You are an AI assistant for financial advisors.\n` +
-    `Use the provided context to answer accurately.\n` +
-    `If the context is insufficient, say so and ask a concise follow-up question.\n` +
-    `Be helpful and practical.\n\n` +
+    `You are an AI assistant with access to the user's emails, calendar, contacts, and notes.\n\n` +
+    `Use the retrieved context to answer questions thoroughly. ` +
+    `When multiple relevant items exist, summarize all of them. ` +
+    `If the context doesn't contain relevant information, say so.\n\n` +
     instructionsBlock +
-    contextBlock +
-    `Return a clear answer.\n`
+    contextBlock
   );
 }
 
@@ -641,206 +469,64 @@ function toCitations(rows: RagSearchRow[], excerptMaxChars: number): ChatCitatio
 }
 
 function toDebugCitations(rows: RagSearchRow[]): ChatDebugCitation[] {
-  return rows.map((r) => {
-    const distance = extractDistance(r);
-    const similarity = extractSimilarity(r, distance);
-
-    return {
-      chunkId: r.chunkId,
-      documentId: r.documentId,
-      similarity,
-      distance,
-    };
-  });
-}
-
-function rankRowsBestToWorst(rows: RagSearchRow[]): RagSearchRow[] {
-  return rows.slice().sort((a, b) => compareRowsBestFirst(a, b));
-}
-
-function mergeUniqueByChunkIdPreferBest(rows: RagSearchRow[]): RagSearchRow[] {
-  const m = new Map<number, RagSearchRow>();
-
-  for (const r of rows) {
-    const existing = m.get(r.chunkId);
-    if (!existing) {
-      m.set(r.chunkId, r);
-      continue;
-    }
-
-    if (compareRowsBestFirst(r, existing) < 0) {
-      m.set(r.chunkId, r);
-    }
-  }
-
-  return Array.from(m.values());
-}
-
-function compareRowsBestFirst(a: RagSearchRow, b: RagSearchRow): number {
-  const ad = extractDistance(a);
-  const bd = extractDistance(b);
-
-  const aHasD = typeof ad === 'number';
-  const bHasD = typeof bd === 'number';
-
-  if (aHasD && !bHasD) return -1;
-  if (!aHasD && bHasD) return 1;
-
-  if (aHasD && bHasD) {
-    if (ad !== bd) return ad - bd;
-    return a.chunkId - b.chunkId;
-  }
-
-  const as = extractSimilarity(a, null);
-  const bs = extractSimilarity(b, null);
-
-  const aHasS = typeof as === 'number';
-  const bHasS = typeof bs === 'number';
-
-  if (aHasS && !bHasS) return -1;
-  if (!aHasS && bHasS) return 1;
-
-  if (aHasS && bHasS) {
-    if (as !== bs) return bs - as;
-    return a.chunkId - b.chunkId;
-  }
-
-  return a.chunkId - b.chunkId;
-}
-
-function extractDistance(row: RagSearchRow): number | null {
-  const r = row as unknown as Record<string, unknown>;
-
-  const candidates = [r.distance, r.semanticDistance, r.vectorDistance, r.embeddingDistance];
-
-  for (const v of candidates) {
-    if (typeof v === 'number' && Number.isFinite(v)) return v;
-  }
-
-  return null;
-}
-
-function extractSimilarity(row: RagSearchRow, distance: number | null): number | null {
-  const r = row as unknown as Record<string, unknown>;
-
-  const candidates = [
-    r.similarity,
-    r.score,
-    r.semanticSimilarity,
-    r.relevance,
-    r.hybridScore,
-    r.lexicalScore,
-    r.bm25Score,
-    r.rankScore,
-  ];
-
-  for (const v of candidates) {
-    if (typeof v === 'number' && Number.isFinite(v)) return v;
-  }
-
-  if (typeof distance === 'number' && Number.isFinite(distance)) {
-    return 1 - distance;
-  }
-
-  return null;
+  return rows.map((r) => ({
+    chunkId: r.chunkId,
+    documentId: r.documentId,
+    similarity: r.distance != null ? 1 - r.distance : null,
+    distance: r.distance,
+  }));
 }
 
 function excerptText(text: string, maxChars: number): string {
-  const max = clampInt(maxChars, 80, 5000);
   const t = String(text ?? '').trim();
   if (!t) return '';
-  if (t.length <= max) return t;
-  return t.slice(0, max).trim();
+  if (t.length <= maxChars) return t;
+  return t.slice(0, maxChars).trim() + '...';
 }
 
 function readHistoryMaxMessages(): number {
-  const raw = Number(process.env.CHAT_HISTORY_MAX_MESSAGES ?? '16');
-  return Number.isFinite(raw) ? raw : 16;
+  return Number(process.env.CHAT_HISTORY_MAX_MESSAGES ?? '16') || 16;
 }
 
 function readHistoryMaxCharsPerMessage(): number {
-  const raw = Number(process.env.CHAT_HISTORY_MAX_CHARS ?? '2000');
-  return Number.isFinite(raw) ? raw : 2000;
+  return Number(process.env.CHAT_HISTORY_MAX_CHARS ?? '2000') || 2000;
 }
 
 function readSystemExcerptMaxChars(): number {
-  const raw = Number(process.env.RAG_SYSTEM_EXCERPT_MAX_CHARS ?? '650');
-  return Number.isFinite(raw) ? raw : 650;
+  return Number(process.env.RAG_SYSTEM_EXCERPT_MAX_CHARS ?? '800') || 800;
 }
 
 function readSystemCitationsMax(): number {
-  const raw = Number(process.env.RAG_SYSTEM_CITATIONS_MAX ?? '40');
-  return Number.isFinite(raw) ? clampInt(raw, 1, 400) : 40;
+  return Number(process.env.RAG_SYSTEM_CITATIONS_MAX ?? '30') || 30;
 }
 
 function readDebugCitationsMax(): number {
-  const raw = Number(process.env.RAG_DEBUG_CITATIONS_MAX ?? '300');
-  return Number.isFinite(raw) ? clampInt(raw, 0, 5000) : 300;
+  return Number(process.env.RAG_DEBUG_CITATIONS_MAX ?? '50') || 50;
 }
 
-function readRagStandardTake(): number {
-  const raw = Number(process.env.RAG_STANDARD_TAKE ?? '200');
-  return Number.isFinite(raw) ? clampInt(raw, 10, 5000) : 200;
-}
-
-function readRagBulkTake(): number {
-  const raw = Number(process.env.RAG_BULK_TAKE ?? '1200');
-  return Number.isFinite(raw) ? clampInt(raw, 50, 5000) : 1200;
+function readRagTake(): number {
+  return Number(process.env.RAG_TAKE ?? '100') || 100;
 }
 
 function readRagSemanticCandidates(): number {
-  const raw = Number(process.env.RAG_SEMANTIC_CANDIDATES ?? '800');
-  return Number.isFinite(raw) ? clampInt(raw, 50, 5000) : 800;
+  return Number(process.env.RAG_SEMANTIC_CANDIDATES ?? '500') || 500;
 }
 
 function readRagLexicalCandidates(): number {
-  const raw = Number(process.env.RAG_LEXICAL_CANDIDATES ?? '800');
-  return Number.isFinite(raw) ? clampInt(raw, 50, 5000) : 800;
-}
-
-function readRagQueryUserTurns(): number {
-  const raw = Number(process.env.RAG_QUERY_USER_TURNS ?? '5');
-  return Number.isFinite(raw) ? clampInt(raw, 1, 12) : 5;
-}
-
-function readRagQueryMaxChars(): number {
-  const raw = Number(process.env.RAG_QUERY_MAX_CHARS ?? '4000');
-  return Number.isFinite(raw) ? clampInt(raw, 200, 20_000) : 4000;
-}
-
-function readDisablePlanner(): boolean {
-  return String(process.env.RAG_DISABLE_PLANNER ?? '').trim() === '1';
+  return Number(process.env.RAG_LEXICAL_CANDIDATES ?? '200') || 200;
 }
 
 function clampInt(n: number, min: number, max: number): number {
   if (!Number.isFinite(n)) return min;
   const x = Math.trunc(n);
-  if (x < min) return min;
-  if (x > max) return max;
-  return x;
+  return x < min ? min : x > max ? max : x;
 }
 
 function capText(s: string, maxLen: number): string {
   const t = (s ?? '').trim();
-  if (!t) return '';
   return t.length > maxLen ? t.slice(0, maxLen) : t;
-}
-
-function safeJson(text: string): unknown {
-  if (!text) return {};
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return {};
-  }
 }
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
-}
-
-function shouldResumeUserMessageWaiting(replyText: string): boolean {
-  const text = String(replyText ?? '').trim();
-  if (!text) return false;
-  return text.length >= 1;
 }
