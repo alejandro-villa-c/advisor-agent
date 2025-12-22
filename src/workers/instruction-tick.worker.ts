@@ -486,24 +486,32 @@ export class InstructionTickWorker implements OnModuleInit {
     for (const contact of recentContacts) {
       newContactIds.push(contact.hubspotContactId);
 
+      // A contact is "new" only if we haven't seen it before in our trigger state
       const isNew = !lastContactIds.has(contact.hubspotContactId);
-      const createdRecently =
-        contact.createdAt && new Date(contact.createdAt).getTime() > lastCheckAt.getTime();
+
+      // Check if it was ACTUALLY created recently (within the last check window)
+      // Use a tighter window to avoid re-triggering on syncs
+      const createdAt = contact.createdAt ? new Date(contact.createdAt).getTime() : 0;
+      const lastCheckTime = lastCheckAt.getTime();
+      const createdRecently = createdAt > lastCheckTime;
+
+      // Only trigger "created" if BOTH conditions are true:
+      // 1. We haven't seen this contact ID before in our state
+      // 2. The contact was actually created after our last check
+      const isCreatedTrigger = isNew && createdRecently;
 
       const displayName =
         `${contact.firstName ?? ''} ${contact.lastName ?? ''}`.trim() || contact.email || 'Unknown';
 
-      const triggerType =
-        isNew || createdRecently ? 'hubspot_contact_created' : 'hubspot_contact_updated';
+      const triggerType = isCreatedTrigger ? 'hubspot_contact_created' : 'hubspot_contact_updated';
 
-      const eventTimestamp =
-        isNew || createdRecently
-          ? (contact.createdAt ?? new Date())
-          : (contact.updatedAt ?? new Date());
+      const eventTimestamp = isCreatedTrigger
+        ? (contact.createdAt ?? new Date())
+        : (contact.updatedAt ?? new Date());
 
       triggers.push({
         type: triggerType,
-        summary: `HubSpot contact ${isNew || createdRecently ? 'created' : 'updated'}: ${displayName} (${contact.hubspotContactId})`,
+        summary: `HubSpot contact ${isCreatedTrigger ? 'created' : 'updated'}: ${displayName} (${contact.hubspotContactId})`,
         data: {
           hubspotContactId: contact.hubspotContactId,
           email: contact.email,
