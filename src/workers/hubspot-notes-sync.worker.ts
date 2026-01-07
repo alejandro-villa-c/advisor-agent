@@ -97,24 +97,20 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
     // DELETION HANDLING: Remove notes that no longer exist in HubSpot
     const deletedCount = await this.deleteRemovedNotes(userId, allHubspotNoteIds);
 
-    // Repair behavior: include docs missing chunkIndex=0 even if unchanged
-    const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
+    // FIX: Only embed CHANGED documents
+    // RagRepairWorker handles orphaned documents separately
+    const changedDocIds = await this.loadDocumentIdsForSourceIds({
       userId,
       source: 'hubspot_note',
-      sourceIds: allHubspotNoteIds,
+      sourceIds: uniqueChangedSourceIds,
     });
 
-    await this.enqueueEmbedForDocumentIds({
-      userId,
-      documentIds: [
-        ...(await this.loadDocumentIdsForSourceIds({
-          userId,
-          source: 'hubspot_note',
-          sourceIds: uniqueChangedSourceIds,
-        })),
-        ...repairDocIds,
-      ],
-    });
+    if (changedDocIds.length > 0) {
+      await this.enqueueEmbedForDocumentIds({
+        userId,
+        documentIds: changedDocIds,
+      });
+    }
 
     await this.dbService.db
       .insert(integrationStates)
@@ -126,7 +122,6 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
           totalImported: total,
           page,
           changedDocuments: uniqueChangedSourceIds.length,
-          missingChunkDocumentsQueued: repairDocIds.length,
           deletedNotes: deletedCount,
         },
       })
@@ -139,7 +134,7 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
       });
 
     this.logger.log(
-      `[${HUBSPOT_SYNC_NOTES_JOB}] done job=${String(job.id)} totalNotes=${total} changedDocs=${uniqueChangedSourceIds.length} repairedDocs=${repairDocIds.length} deletedNotes=${deletedCount}`,
+      `[${HUBSPOT_SYNC_NOTES_JOB}] done job=${String(job.id)} totalNotes=${total} changedDocs=${uniqueChangedSourceIds.length} deletedNotes=${deletedCount}`,
     );
   }
 
@@ -152,9 +147,7 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
   ): Promise<number> {
     const uniqueIds = Array.from(new Set(currentHubspotNoteIds)).filter(Boolean);
 
-    // If we got zero notes from HubSpot, don't delete everything - could be an API issue
     if (uniqueIds.length === 0) {
-      // Check if we have any local notes - if so, this might be suspicious
       const localCount = await this.dbService.db
         .select({ count: sql<number>`count(*)::int` })
         .from(hubspotNotes)
@@ -171,7 +164,6 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
       return 0;
     }
 
-    // Find local notes not in the current HubSpot list
     const localNotes = await this.dbService.db
       .select({ hubspotNoteId: hubspotNotes.hubspotNoteId })
       .from(hubspotNotes)
@@ -183,7 +175,6 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
 
     if (toDelete.length === 0) return 0;
 
-    // Safety check: don't delete more than 50% of notes in one sync
     const deletionRatio = toDelete.length / localIds.length;
     if (deletionRatio > 0.5 && toDelete.length > 10) {
       this.logger.warn(
@@ -195,7 +186,6 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
     let deletedCount = 0;
 
     for (const batch of chunkArray(toDelete, 100)) {
-      // 1. Delete document chunks for these notes
       const docIds = await this.loadDocumentIdsForSourceIds({
         userId,
         source: 'hubspot_note',
@@ -210,7 +200,6 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
           );
       }
 
-      // 2. Delete documents
       await this.dbService.db
         .delete(documents)
         .where(
@@ -221,7 +210,6 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
           ),
         );
 
-      // 3. Delete notes from mirror table
       await this.dbService.db
         .delete(hubspotNotes)
         .where(and(eq(hubspotNotes.userId, userId), inArray(hubspotNotes.hubspotNoteId, batch)));
@@ -421,43 +409,6 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
     return out;
   }
 
-  private async loadDocumentIdsMissingChunksForSourceIds(input: {
-    userId: number;
-    source: 'hubspot_note' | 'hubspot_contact' | 'gmail_email' | 'calendar_event';
-    sourceIds: string[];
-  }): Promise<number[]> {
-    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
-    if (ids.length === 0) return [];
-
-    const out: number[] = [];
-
-    for (const chunk of chunkArray(ids, 500)) {
-      const rows = await this.dbService.db
-        .select({ id: documents.id })
-        .from(documents)
-        .leftJoin(
-          documentChunks,
-          and(
-            eq(documentChunks.userId, documents.userId),
-            eq(documentChunks.documentId, documents.id),
-            eq(documentChunks.chunkIndex, 0),
-          ),
-        )
-        .where(
-          and(
-            eq(documents.userId, input.userId),
-            eq(documents.source, input.source),
-            inArray(documents.sourceId, chunk),
-            sql`${documentChunks.id} IS NULL`,
-          ),
-        );
-
-      for (const r of rows) out.push(r.id);
-    }
-
-    return out;
-  }
-
   private async enqueueEmbedForDocumentIds(input: {
     userId: number;
     documentIds: number[];
@@ -468,11 +419,18 @@ export class HubspotNotesSyncWorker implements OnModuleInit {
 
     if (unique.length === 0) return;
 
-    for (const batch of chunkArray(unique, 200)) {
-      await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
-        userId: input.userId,
-        documentIds: batch,
-      });
+    for (const batch of chunkArray(unique, 100)) {
+      await this.pgBossService.client.send(
+        RAG_EMBED_DOCUMENTS_JOB,
+        {
+          userId: input.userId,
+          documentIds: batch,
+        },
+        {
+          singletonKey: `rag.embed.hubspot-notes:${input.userId}`,
+          singletonSeconds: 30,
+        },
+      );
     }
   }
 }

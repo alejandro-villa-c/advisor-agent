@@ -1,12 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PgBossService } from '../jobs/pgboss.service';
-import {
-  AGENT_TICK_JOB,
-  SYNC_TICK_JOB,
-  INSTRUCTION_TICK_JOB,
-  RAG_REPAIR_JOB,
-} from '../jobs/job.constants';
+import { AGENT_TICK_JOB, SYNC_TICK_JOB, INSTRUCTION_TICK_JOB } from '../jobs/job.constants';
 
 @Injectable()
 export class SyncSchedulerService implements OnModuleInit {
@@ -16,17 +11,15 @@ export class SyncSchedulerService implements OnModuleInit {
   private readonly syncTickCron: string;
   private readonly agentTickCron: string;
   private readonly instructionTickCron: string;
-  private readonly ragRepairCron: string;
 
   constructor(
     private readonly pgBoss: PgBossService,
     private readonly config: ConfigService,
   ) {
     // Load cron expressions from env or use defaults
-    this.syncTickCron = this.config.get<string>('SYNC_TICK_CRON', '*/1 * * * *');
+    this.syncTickCron = this.config.get<string>('SYNC_TICK_CRON', '*/2 * * * *');
     this.agentTickCron = this.config.get<string>('AGENT_TICK_CRON', '*/1 * * * *');
-    this.instructionTickCron = this.config.get<string>('INSTRUCTION_TICK_CRON', '*/1 * * * *');
-    this.ragRepairCron = this.config.get<string>('RAG_REPAIR_CRON', '*/1 * * * *');
+    this.instructionTickCron = this.config.get<string>('INSTRUCTION_TICK_CRON', '*/2 * * * *');
   }
 
   async onModuleInit(): Promise<void> {
@@ -52,12 +45,8 @@ export class SyncSchedulerService implements OnModuleInit {
       await this.pgBoss.client.send(INSTRUCTION_TICK_JOB, { reason: 'startup' });
       this.logger.log(`Enqueued ${INSTRUCTION_TICK_JOB} immediately (startup)`);
 
-      // RAG Repair - finds orphaned documents (no chunks) and re-queues embedding
-      await this.pgBoss.client.schedule(RAG_REPAIR_JOB, this.ragRepairCron, {});
-      this.logger.log(`Scheduled ${RAG_REPAIR_JOB} with cron: ${this.ragRepairCron}`);
-
-      await this.pgBoss.client.send(RAG_REPAIR_JOB, { reason: 'startup' });
-      this.logger.log(`Enqueued ${RAG_REPAIR_JOB} immediately (startup)`);
+      // NOTE: RAG_REPAIR_JOB is scheduled by RagRepairWorker itself (every 15 min)
+      // Do NOT schedule it here to avoid duplicate scheduling
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(`Failed to schedule jobs: ${message}`);

@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { and, eq, isNull, sql, isNotNull, gt } from 'drizzle-orm';
 import { PgBossService } from '../jobs/pgboss.service';
 import { DbService } from '../db/db.service';
@@ -27,17 +28,25 @@ type PgBossJob<T> = {
  * - Race conditions during sync
  * - Interrupted transactions
  *
- * This worker should run periodically (e.g., every 5 minutes) to ensure
+ * This worker runs periodically (every 15 minutes by default) to ensure
  * all documents are properly chunked and embedded.
+ *
+ * NOTE: This is the ONLY place RAG_REPAIR_JOB should be scheduled.
+ * SyncSchedulerService should NOT schedule this job.
  */
 @Injectable()
 export class RagRepairWorker implements OnModuleInit {
   private readonly logger = new Logger(RagRepairWorker.name);
+  private readonly ragRepairCron: string;
 
   constructor(
     private readonly pgBossService: PgBossService,
     private readonly dbService: DbService,
-  ) {}
+    private readonly config: ConfigService,
+  ) {
+    // Default to every 15 minutes - repair is not urgent
+    this.ragRepairCron = this.config.get<string>('RAG_REPAIR_CRON', '*/15 * * * *');
+  }
 
   async onModuleInit(): Promise<void> {
     // Create the queue
@@ -69,7 +78,7 @@ export class RagRepairWorker implements OnModuleInit {
 
     this.logger.log(`Registered worker: ${RAG_REPAIR_JOB}`);
 
-    // Schedule periodic repair job (every 5 minutes)
+    // Schedule periodic repair job
     await this.schedulePeriodicRepair();
   }
 
@@ -77,13 +86,13 @@ export class RagRepairWorker implements OnModuleInit {
     try {
       await this.pgBossService.client.schedule(
         RAG_REPAIR_JOB,
-        '*/5 * * * *', // Every 5 minutes
+        this.ragRepairCron,
         {},
         {
           tz: 'UTC',
         },
       );
-      this.logger.log(`Scheduled ${RAG_REPAIR_JOB} to run every 5 minutes`);
+      this.logger.log(`Scheduled ${RAG_REPAIR_JOB} with cron: ${this.ragRepairCron}`);
     } catch (err) {
       // Schedule might already exist
       this.logger.warn(
@@ -94,7 +103,7 @@ export class RagRepairWorker implements OnModuleInit {
 
   private async handleOne(job: PgBossJob<RagRepairJobData>): Promise<void> {
     const userId = job.data.userId;
-    const batchSize = clampInt(job.data.batchSize ?? 100, 10, 500);
+    const batchSize = clampInt(job.data.batchSize ?? 50, 10, 200); // Reduced batch size
 
     this.logger.log(
       `[${RAG_REPAIR_JOB}] start job=${String(job.id)} userId=${userId ?? 'ALL'} batchSize=${batchSize}`,
@@ -121,12 +130,13 @@ export class RagRepairWorker implements OnModuleInit {
     // Enqueue embed jobs for each user's orphaned documents
     let jobsEnqueued = 0;
     for (const [uid, docIds] of byUser) {
+      // Use stable singleton key to prevent duplicate jobs
       await this.pgBossService.client.send(
         RAG_EMBED_DOCUMENTS_JOB,
         { userId: uid, documentIds: docIds },
         {
-          singletonKey: `rag.repair.embed:${uid}:${Date.now()}`,
-          singletonSeconds: 60,
+          singletonKey: `rag.repair.embed:${uid}`,
+          singletonSeconds: 300, // 5 minutes - prevents rapid re-queueing
         },
       );
       jobsEnqueued++;
@@ -136,10 +146,10 @@ export class RagRepairWorker implements OnModuleInit {
       );
     }
 
-    // Also find documents with chunks but missing embeddings
+    // Also find documents with chunks but missing embeddings (but limit to avoid API overload)
     const missingEmbeddings = await this.findDocumentsWithMissingEmbeddings({
       userId,
-      limit: batchSize,
+      limit: Math.min(batchSize, 25), // Smaller limit for embedding repairs
     });
 
     if (missingEmbeddings.length > 0) {
@@ -159,8 +169,8 @@ export class RagRepairWorker implements OnModuleInit {
           RAG_EMBED_DOCUMENTS_JOB,
           { userId: uid, documentIds: docIds },
           {
-            singletonKey: `rag.repair.missing-embed:${uid}:${Date.now()}`,
-            singletonSeconds: 60,
+            singletonKey: `rag.repair.missing-embed:${uid}`,
+            singletonSeconds: 300,
           },
         );
         jobsEnqueued++;

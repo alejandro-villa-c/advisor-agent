@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { PgBossService } from '../jobs/pgboss.service';
 import { DbService } from '../db/db.service';
-import { documentChunks, documents, gmailMessages, integrationStates } from '../db/schema';
+import { documents, gmailMessages, integrationStates } from '../db/schema';
 import { GmailApiService } from '../modules/integrations/google/gmail-api.service';
 import {
   AGENT_REACT_JOB,
@@ -95,7 +95,6 @@ export class GmailSyncWorker implements OnModuleInit {
     const mode = job.data.mode ?? 'incremental';
 
     // MEMORY FIX: Reduced batch sizes to prevent OOM
-    // Process fewer messages per job, but chain jobs faster
     const maxPagesDefault = mode === 'backfill' ? 10 : mode === 'initial' ? 10 : 5;
     const maxMessagesDefault = mode === 'backfill' ? 500 : mode === 'initial' ? 500 : 200;
 
@@ -167,7 +166,6 @@ export class GmailSyncWorker implements OnModuleInit {
     const uniqueIds = Array.from(new Set(messageIds)).slice(0, maxMessages);
 
     // Phase 2: Process messages in small batches to limit memory
-    // MEMORY FIX: Process in chunks of 50 instead of all at once
     const PROCESS_BATCH_SIZE = 50;
     const concurrency = mode === 'backfill' ? 5 : 3;
 
@@ -243,23 +241,20 @@ export class GmailSyncWorker implements OnModuleInit {
       },
     });
 
-    // Repair + embed (process in smaller batches)
-    const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
-      userId,
-      source: 'gmail_email',
-      sourceIds: uniqueIds,
-    });
-
+    // FIX: Only embed CHANGED documents, not "repair" docs
+    // RagRepairWorker handles orphaned documents separately
     const changedDocIds = await this.loadDocumentIdsForSourceIds({
       userId,
       source: 'gmail_email',
       sourceIds: changedSourceIds,
     });
 
-    await this.enqueueEmbedForDocumentIds({
-      userId,
-      documentIds: [...changedDocIds, ...repairDocIds],
-    });
+    if (changedDocIds.length > 0) {
+      await this.enqueueEmbedForDocumentIds({
+        userId,
+        documentIds: changedDocIds,
+      });
+    }
 
     // Wake agent for touched threads (batch to avoid large payloads)
     const threads = Array.from(touchedThreadIds).filter(Boolean);
@@ -295,7 +290,7 @@ export class GmailSyncWorker implements OnModuleInit {
     }
 
     this.logger.log(
-      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} mode=${mode} processed=${totalProcessed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} touchedThreads=${threads.length} backfillDone=${backfillState?.done ?? 'n/a'} enqueuedNextBackfill=${didEnqueueNextBackfill}`,
+      `[${GMAIL_SYNC_MESSAGES_JOB}] done job=${String(job.id)} userId=${userId} mode=${mode} processed=${totalProcessed} pages=${pages} changedDocs=${Array.from(new Set(changedSourceIds)).length} touchedThreads=${threads.length} backfillDone=${backfillState?.done ?? 'n/a'} enqueuedNextBackfill=${didEnqueueNextBackfill}`,
     );
   }
 
@@ -495,43 +490,6 @@ export class GmailSyncWorker implements OnModuleInit {
     return out;
   }
 
-  private async loadDocumentIdsMissingChunksForSourceIds(input: {
-    userId: number;
-    source: 'gmail_email' | 'calendar_event' | 'hubspot_contact' | 'hubspot_note';
-    sourceIds: string[];
-  }): Promise<number[]> {
-    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
-    if (ids.length === 0) return [];
-
-    const out: number[] = [];
-
-    for (const chunk of chunkArray(ids, 500)) {
-      const rows = await this.dbService.db
-        .select({ id: documents.id })
-        .from(documents)
-        .leftJoin(
-          documentChunks,
-          and(
-            eq(documentChunks.userId, documents.userId),
-            eq(documentChunks.documentId, documents.id),
-            eq(documentChunks.chunkIndex, 0),
-          ),
-        )
-        .where(
-          and(
-            eq(documents.userId, input.userId),
-            eq(documents.source, input.source),
-            inArray(documents.sourceId, chunk),
-            sql`${documentChunks.id} IS NULL`,
-          ),
-        );
-
-      for (const r of rows) out.push(r.id);
-    }
-
-    return out;
-  }
-
   private async enqueueEmbedForDocumentIds(input: {
     userId: number;
     documentIds: number[];
@@ -542,12 +500,20 @@ export class GmailSyncWorker implements OnModuleInit {
 
     if (unique.length === 0) return;
 
-    // MEMORY FIX: Smaller batches for embed jobs
-    for (const batch of chunkArray(unique, 200)) {
-      await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
-        userId: input.userId,
-        documentIds: batch,
-      });
+    // Smaller batches for embed jobs
+    for (const batch of chunkArray(unique, 100)) {
+      await this.pgBossService.client.send(
+        RAG_EMBED_DOCUMENTS_JOB,
+        {
+          userId: input.userId,
+          documentIds: batch,
+        },
+        {
+          // Use singleton to prevent duplicate embed jobs for same user
+          singletonKey: `rag.embed.gmail:${input.userId}`,
+          singletonSeconds: 30,
+        },
+      );
     }
   }
 

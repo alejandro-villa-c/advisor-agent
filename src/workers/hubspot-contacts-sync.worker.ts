@@ -117,33 +117,28 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
         },
       });
 
-    // Enqueue embed for changed docs OR docs missing chunkIndex=0 (repair behavior)
-    const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
+    // FIX: Only embed CHANGED documents
+    // RagRepairWorker handles orphaned documents separately
+    const changedDocIds = await this.loadDocumentIdsForSourceIds({
       userId,
       source: 'hubspot_contact',
-      sourceIds: allHubspotIds,
+      sourceIds: changedSourceIds,
     });
 
-    await this.enqueueEmbedForDocumentIds({
-      userId,
-      documentIds: [
-        ...(await this.loadDocumentIdsForSourceIds({
-          userId,
-          source: 'hubspot_contact',
-          sourceIds: changedSourceIds,
-        })),
-        ...repairDocIds,
-      ],
-    });
+    if (changedDocIds.length > 0) {
+      await this.enqueueEmbedForDocumentIds({
+        userId,
+        documentIds: changedDocIds,
+      });
+    }
 
     this.logger.log(
-      `[${HUBSPOT_SYNC_CONTACTS_JOB}] done job=${String(job.id)} totalContacts=${total} changedDocs=${Array.from(new Set(changedSourceIds)).length} repairedDocs=${repairDocIds.length} deletedContacts=${deletedCount}`,
+      `[${HUBSPOT_SYNC_CONTACTS_JOB}] done job=${String(job.id)} totalContacts=${total} changedDocs=${Array.from(new Set(changedSourceIds)).length} deletedContacts=${deletedCount}`,
     );
   }
 
   /**
    * Delete contacts (and their documents/chunks) that no longer exist in HubSpot.
-   * This does a full reconciliation against the list of IDs we just fetched.
    */
   private async deleteRemovedContacts(
     userId: number,
@@ -151,7 +146,6 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
   ): Promise<number> {
     const uniqueIds = Array.from(new Set(currentHubspotIds)).filter(Boolean);
 
-    // If we got zero contacts from HubSpot, don't delete everything - something might be wrong
     if (uniqueIds.length === 0) {
       this.logger.warn(
         `[${HUBSPOT_SYNC_CONTACTS_JOB}] skipping deletion - received 0 contacts from HubSpot`,
@@ -159,7 +153,6 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
       return 0;
     }
 
-    // Find local contacts not in the current HubSpot list
     const localContacts = await this.dbService.db
       .select({ hubspotContactId: hubspotContacts.hubspotContactId })
       .from(hubspotContacts)
@@ -171,8 +164,6 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
 
     if (toDelete.length === 0) return 0;
 
-    // Safety check: don't delete more than 50% of contacts in one sync
-    // This protects against API issues returning partial data
     const deletionRatio = toDelete.length / localIds.length;
     if (deletionRatio > 0.5 && toDelete.length > 10) {
       this.logger.warn(
@@ -181,11 +172,9 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
       return 0;
     }
 
-    // Delete in batches
     let deletedCount = 0;
 
     for (const batch of chunkArray(toDelete, 100)) {
-      // 1. Delete document chunks for these contacts
       const docIds = await this.loadDocumentIdsForSourceIds({
         userId,
         source: 'hubspot_contact',
@@ -200,7 +189,6 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
           );
       }
 
-      // 2. Delete documents
       await this.dbService.db
         .delete(documents)
         .where(
@@ -211,7 +199,6 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
           ),
         );
 
-      // 3. Delete contacts from mirror table
       await this.dbService.db
         .delete(hubspotContacts)
         .where(
@@ -396,43 +383,6 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
     return out;
   }
 
-  private async loadDocumentIdsMissingChunksForSourceIds(input: {
-    userId: number;
-    source: 'hubspot_contact' | 'hubspot_note' | 'gmail_email' | 'calendar_event';
-    sourceIds: string[];
-  }): Promise<number[]> {
-    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
-    if (ids.length === 0) return [];
-
-    const out: number[] = [];
-
-    for (const chunk of chunkArray(ids, 500)) {
-      const rows = await this.dbService.db
-        .select({ id: documents.id })
-        .from(documents)
-        .leftJoin(
-          documentChunks,
-          and(
-            eq(documentChunks.userId, documents.userId),
-            eq(documentChunks.documentId, documents.id),
-            eq(documentChunks.chunkIndex, 0),
-          ),
-        )
-        .where(
-          and(
-            eq(documents.userId, input.userId),
-            eq(documents.source, input.source),
-            inArray(documents.sourceId, chunk),
-            sql`${documentChunks.id} IS NULL`,
-          ),
-        );
-
-      for (const r of rows) out.push(r.id);
-    }
-
-    return out;
-  }
-
   private async enqueueEmbedForDocumentIds(input: {
     userId: number;
     documentIds: number[];
@@ -443,11 +393,18 @@ export class HubspotContactsSyncWorker implements OnModuleInit {
 
     if (unique.length === 0) return;
 
-    for (const batch of chunkArray(unique, 200)) {
-      await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
-        userId: input.userId,
-        documentIds: batch,
-      });
+    for (const batch of chunkArray(unique, 100)) {
+      await this.pgBossService.client.send(
+        RAG_EMBED_DOCUMENTS_JOB,
+        {
+          userId: input.userId,
+          documentIds: batch,
+        },
+        {
+          singletonKey: `rag.embed.hubspot-contacts:${input.userId}`,
+          singletonSeconds: 30,
+        },
+      );
     }
   }
 }

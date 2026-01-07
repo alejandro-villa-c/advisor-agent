@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { PgBossService } from '../jobs/pgboss.service';
 import { DbService } from '../db/db.service';
-import { calendarEvents, documentChunks, documents, integrationStates } from '../db/schema';
+import { calendarEvents, documents, integrationStates } from '../db/schema';
 import { CalendarApiService } from '../modules/integrations/google/calendar-api.service';
 import {
   AGENT_REACT_JOB,
@@ -88,7 +88,6 @@ export class CalendarSyncWorker implements OnModuleInit {
     let processed = 0;
 
     const changedSourceIds: string[] = [];
-    const processedSourceIds: string[] = [];
 
     while (pages < maxPages) {
       pages += 1;
@@ -104,7 +103,6 @@ export class CalendarSyncWorker implements OnModuleInit {
       if (page.events.length === 0) break;
 
       const pageSourceIds = page.events.map((ev) => `${calendarId}:${ev.id}`);
-      processedSourceIds.push(...pageSourceIds);
 
       const existingBySourceId = await this.loadExistingDocsMap({
         userId,
@@ -254,24 +252,20 @@ export class CalendarSyncWorker implements OnModuleInit {
       },
     });
 
-    // Repair behavior: include docs that are missing chunkIndex=0, even if unchanged
-    const repairDocIds = await this.loadDocumentIdsMissingChunksForSourceIds({
+    // FIX: Only embed CHANGED documents
+    // RagRepairWorker handles orphaned documents separately
+    const changedDocIds = await this.loadDocumentIdsForSourceIds({
       userId,
       source: 'calendar_event',
-      sourceIds: processedSourceIds,
+      sourceIds: changedSourceIds,
     });
 
-    await this.enqueueEmbedForDocumentIds({
-      userId,
-      documentIds: [
-        ...(await this.loadDocumentIdsForSourceIds({
-          userId,
-          source: 'calendar_event',
-          sourceIds: changedSourceIds,
-        })),
-        ...repairDocIds,
-      ],
-    });
+    if (changedDocIds.length > 0) {
+      await this.enqueueEmbedForDocumentIds({
+        userId,
+        documentIds: changedDocIds,
+      });
+    }
 
     // Wake agent for calendar changes
     const changed = Array.from(new Set(changedSourceIds)).filter(Boolean);
@@ -283,7 +277,7 @@ export class CalendarSyncWorker implements OnModuleInit {
     }
 
     this.logger.log(
-      `[${CALENDAR_SYNC_EVENTS_JOB}] done job=${String(job.id)} userId=${userId} processed=${processed} pages=${pages} changedDocs=${changed.length} repairedDocs=${repairDocIds.length}`,
+      `[${CALENDAR_SYNC_EVENTS_JOB}] done job=${String(job.id)} userId=${userId} processed=${processed} pages=${pages} changedDocs=${changed.length}`,
     );
   }
 
@@ -345,43 +339,6 @@ export class CalendarSyncWorker implements OnModuleInit {
     return out;
   }
 
-  private async loadDocumentIdsMissingChunksForSourceIds(input: {
-    userId: number;
-    source: 'gmail_email' | 'calendar_event' | 'hubspot_contact' | 'hubspot_note';
-    sourceIds: string[];
-  }): Promise<number[]> {
-    const ids = Array.from(new Set(input.sourceIds)).filter(Boolean);
-    if (ids.length === 0) return [];
-
-    const out: number[] = [];
-
-    for (const chunk of chunkArray(ids, 1000)) {
-      const rows = await this.dbService.db
-        .select({ id: documents.id })
-        .from(documents)
-        .leftJoin(
-          documentChunks,
-          and(
-            eq(documentChunks.userId, documents.userId),
-            eq(documentChunks.documentId, documents.id),
-            eq(documentChunks.chunkIndex, 0),
-          ),
-        )
-        .where(
-          and(
-            eq(documents.userId, input.userId),
-            eq(documents.source, input.source),
-            inArray(documents.sourceId, chunk),
-            sql`${documentChunks.id} IS NULL`,
-          ),
-        );
-
-      for (const r of rows) out.push(r.id);
-    }
-
-    return out;
-  }
-
   private async enqueueEmbedForDocumentIds(input: {
     userId: number;
     documentIds: number[];
@@ -392,11 +349,18 @@ export class CalendarSyncWorker implements OnModuleInit {
 
     if (unique.length === 0) return;
 
-    for (const batch of chunkArray(unique, 1000)) {
-      await this.pgBossService.client.send(RAG_EMBED_DOCUMENTS_JOB, {
-        userId: input.userId,
-        documentIds: batch,
-      });
+    for (const batch of chunkArray(unique, 100)) {
+      await this.pgBossService.client.send(
+        RAG_EMBED_DOCUMENTS_JOB,
+        {
+          userId: input.userId,
+          documentIds: batch,
+        },
+        {
+          singletonKey: `rag.embed.calendar:${input.userId}`,
+          singletonSeconds: 30,
+        },
+      );
     }
   }
 
