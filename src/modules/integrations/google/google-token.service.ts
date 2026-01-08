@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { and, eq } from 'drizzle-orm';
 import { DbService } from '../../../db/db.service';
 import { oauthAccounts } from '../../../db/schema';
@@ -12,8 +12,24 @@ type GoogleTokenResponse = {
   error_description?: string;
 };
 
+/**
+ * Custom error for expired/revoked Google tokens.
+ * This allows callers to handle re-authentication gracefully.
+ */
+export class GoogleTokenExpiredError extends Error {
+  constructor(
+    message: string,
+    public readonly userId: number,
+  ) {
+    super(message);
+    this.name = 'GoogleTokenExpiredError';
+  }
+}
+
 @Injectable()
 export class GoogleTokenService {
+  private readonly logger = new Logger(GoogleTokenService.name);
+
   constructor(private readonly dbService: DbService) {}
 
   /**
@@ -48,6 +64,53 @@ export class GoogleTokenService {
     }
   }
 
+  /**
+   * Check if a user has a valid Google connection.
+   * Returns false if the token is expired/revoked.
+   */
+  async isGoogleConnected(userId: number): Promise<boolean> {
+    try {
+      const db = this.dbService.db;
+
+      const rows = await db
+        .select({
+          id: oauthAccounts.id,
+          refreshToken: oauthAccounts.refreshToken,
+        })
+        .from(oauthAccounts)
+        .where(and(eq(oauthAccounts.userId, userId), eq(oauthAccounts.provider, 'google')))
+        .limit(1);
+
+      return rows.length > 0 && !!rows[0].refreshToken;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Mark a user's Google connection as needing re-authentication.
+   * This is called when we detect the refresh token is expired/revoked.
+   */
+  async markTokenAsExpired(userId: number): Promise<void> {
+    const db = this.dbService.db;
+
+    // We don't delete the account, just clear the tokens so sync workers skip this user
+    // The user can re-connect via the settings page
+    await db
+      .update(oauthAccounts)
+      .set({
+        accessToken: '',
+        refreshToken: null,
+        expiresAt: null,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(oauthAccounts.userId, userId), eq(oauthAccounts.provider, 'google')));
+
+    this.logger.warn(
+      `[GoogleTokenService] Marked Google token as expired for userId=${userId}. User needs to reconnect.`,
+    );
+  }
+
   async getValidAccessToken(userId: number): Promise<string> {
     const db = this.dbService.db;
     const account = await this.getGoogleAccountRow(userId);
@@ -62,8 +125,9 @@ export class GoogleTokenService {
     }
 
     if (!account.refreshToken) {
-      throw new Error(
-        'Google refresh token missing. Reconnect Google (OAuth) to obtain offline access.',
+      throw new GoogleTokenExpiredError(
+        'Google refresh token missing. Please reconnect your Google account in Settings.',
+        userId,
       );
     }
 
@@ -72,33 +136,54 @@ export class GoogleTokenService {
     if (!clientId) throw new Error('GOOGLE_CLIENT_ID is not set');
     if (!clientSecret) throw new Error('GOOGLE_CLIENT_SECRET is not set');
 
-    const refreshed = await this.refreshAccessToken({
-      clientId,
-      clientSecret,
-      refreshToken: account.refreshToken,
-    });
+    try {
+      const refreshed = await this.refreshAccessToken({
+        clientId,
+        clientSecret,
+        refreshToken: account.refreshToken,
+      });
 
-    const accessToken = refreshed.access_token;
-    if (!accessToken) {
-      const msg = refreshed.error_description || refreshed.error || 'unknown error';
-      throw new Error(`Google token refresh failed: ${msg}`);
+      const accessToken = refreshed.access_token;
+      if (!accessToken) {
+        const msg = refreshed.error_description || refreshed.error || 'unknown error';
+        throw new Error(`Google token refresh failed: ${msg}`);
+      }
+
+      const expiresInSec = typeof refreshed.expires_in === 'number' ? refreshed.expires_in : 3600;
+      const expiresAt = new Date(Date.now() + expiresInSec * 1000);
+
+      await db
+        .update(oauthAccounts)
+        .set({
+          accessToken,
+          expiresAt,
+          tokenType: refreshed.token_type ?? account.tokenType ?? null,
+          scope: refreshed.scope ?? account.scope ?? null,
+          updatedAt: new Date(),
+        })
+        .where(eq(oauthAccounts.id, account.id));
+
+      return accessToken;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+
+      // Check if this is a token expiration/revocation error
+      if (
+        message.includes('Token has been expired or revoked') ||
+        message.includes('invalid_grant') ||
+        message.includes('Token has been revoked')
+      ) {
+        // Mark the token as expired so sync workers skip this user
+        await this.markTokenAsExpired(userId);
+
+        throw new GoogleTokenExpiredError(
+          'Your Google connection has expired. Please reconnect your Google account in Settings.',
+          userId,
+        );
+      }
+
+      throw err;
     }
-
-    const expiresInSec = typeof refreshed.expires_in === 'number' ? refreshed.expires_in : 3600;
-    const expiresAt = new Date(Date.now() + expiresInSec * 1000);
-
-    await db
-      .update(oauthAccounts)
-      .set({
-        accessToken,
-        expiresAt,
-        tokenType: refreshed.token_type ?? account.tokenType ?? null,
-        scope: refreshed.scope ?? account.scope ?? null,
-        updatedAt: new Date(),
-      })
-      .where(eq(oauthAccounts.id, account.id));
-
-    return accessToken;
   }
 
   private async getGoogleAccountRow(userId: number): Promise<{

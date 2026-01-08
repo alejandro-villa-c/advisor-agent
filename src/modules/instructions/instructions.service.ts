@@ -107,10 +107,25 @@ export const SUPPORTED_TRIGGERS = [
   },
 ];
 
+/**
+ * In-memory cache for trigger checks to avoid repeated LLM calls.
+ * Key format: "userId:triggerType:triggerSummary:instructionId"
+ * Value: timestamp when checked
+ */
+type TriggerCheckCache = Map<string, number>;
+
 @Injectable()
 export class InstructionsService {
   private readonly logger = new Logger(InstructionsService.name);
   private readonly maxActionsPerHour: number;
+
+  /**
+   * In-memory cache for trigger checks.
+   * This prevents re-checking the same trigger+instruction pair within a time window.
+   * Entries expire after 24 hours.
+   */
+  private readonly triggerCheckCache: TriggerCheckCache = new Map();
+  private readonly TRIGGER_CHECK_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
   constructor(
     private readonly dbService: DbService,
@@ -118,6 +133,26 @@ export class InstructionsService {
     private readonly config: ConfigService,
   ) {
     this.maxActionsPerHour = this.config.get<number>('PROACTIVE_ACTIONS_PER_HOUR', 20);
+
+    // Periodically clean up expired cache entries (every 10 minutes)
+    setInterval(() => this.cleanupTriggerCheckCache(), 10 * 60 * 1000);
+  }
+
+  /**
+   * Clean up expired entries from the trigger check cache
+   */
+  private cleanupTriggerCheckCache(): void {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, timestamp] of this.triggerCheckCache.entries()) {
+      if (now - timestamp > this.TRIGGER_CHECK_CACHE_TTL_MS) {
+        this.triggerCheckCache.delete(key);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      this.logger.debug(`[InstructionsService] Cleaned ${cleaned} expired trigger check entries`);
+    }
   }
 
   /**
@@ -376,8 +411,75 @@ Return ONLY valid JSON:
   }
 
   /**
-   * Check if a trigger has already been processed for a specific instruction (idempotency)
-   * Uses triggerType + unique trigger identifier + instructionId as a composite key
+   * Check if a trigger has already been CHECKED for a specific instruction.
+   * This is different from isTriggerProcessed - it includes both:
+   * - Triggers where we took action (shouldAct=true)
+   * - Triggers where we checked but didn't act (shouldAct=false)
+   *
+   * Uses an in-memory cache first, then falls back to DB for acted-on triggers.
+   */
+  async isTriggerChecked(
+    userId: number,
+    triggerType: string,
+    triggerSummary: string,
+    instructionId: number,
+  ): Promise<boolean> {
+    // Generate cache key
+    const cacheKey = `${userId}:${triggerType}:${triggerSummary}:${instructionId}`;
+
+    // Check in-memory cache first (fastest)
+    const cachedAt = this.triggerCheckCache.get(cacheKey);
+    if (cachedAt && Date.now() - cachedAt < this.TRIGGER_CHECK_CACHE_TTL_MS) {
+      return true;
+    }
+
+    // Fall back to DB check for triggers where we actually acted
+    // (the proactiveActions table only stores triggers where shouldAct=true)
+    const dbChecked = await this.isTriggerProcessed(
+      userId,
+      triggerType,
+      triggerSummary,
+      instructionId,
+    );
+
+    if (dbChecked) {
+      // Also add to cache for faster future lookups
+      this.triggerCheckCache.set(cacheKey, Date.now());
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Mark a trigger as checked for a specific instruction.
+   * This prevents re-checking the same trigger+instruction pair.
+   *
+   * @param shouldAct - If true, we'll also log this to proactiveActions (done elsewhere).
+   *                    If false, we only store in the in-memory cache.
+   */
+  markTriggerChecked(
+    userId: number,
+    triggerType: string,
+    triggerSummary: string,
+    instructionId: number,
+    shouldAct: boolean,
+  ): void {
+    // Always add to in-memory cache
+    const cacheKey = `${userId}:${triggerType}:${triggerSummary}:${instructionId}`;
+    this.triggerCheckCache.set(cacheKey, Date.now());
+
+    // Log for debugging
+    this.logger.debug(
+      `[InstructionsService] Marked trigger as checked: ${triggerType} for instruction ${instructionId} (shouldAct=${shouldAct})`,
+    );
+  }
+
+  /**
+   * Check if a trigger has been PROCESSED (action taken) for a specific instruction.
+   * This checks the proactiveActions table.
+   *
+   * @deprecated Use isTriggerChecked instead, which includes both acted and non-acted triggers.
    */
   async isTriggerProcessed(
     userId: number,

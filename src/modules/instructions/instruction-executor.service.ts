@@ -76,16 +76,17 @@ export class InstructionExecutorService {
         return;
       }
 
-      // Check if this specific instruction already processed this trigger
-      const alreadyProcessed = await this.instructionsService.isTriggerProcessed(
+      // Check if this specific instruction already CHECKED this trigger
+      // This includes both acted-on triggers AND checked-but-not-matched triggers
+      const alreadyChecked = await this.instructionsService.isTriggerChecked(
         userId,
         trigger.type,
         trigger.summary,
         instruction.id,
       );
-      if (alreadyProcessed) {
+      if (alreadyChecked) {
         this.logger.debug(
-          `[InstructionExecutor] Instruction ${instruction.id} already processed trigger: ${trigger.type} - ${trigger.summary}`,
+          `[InstructionExecutor] Instruction ${instruction.id} already checked trigger: ${trigger.type} - ${trigger.summary}`,
         );
         continue;
       }
@@ -120,6 +121,19 @@ export class InstructionExecutorService {
 
       // Ask LLM to plan actions for this single instruction
       const plan = await this.planActionsForInstruction(userId, trigger, instruction, stepContext);
+
+      // CRITICAL FIX: Mark the trigger as checked IMMEDIATELY after the LLM call
+      // This prevents re-checking the same trigger+instruction pair on subsequent ticks
+      // We only need to mark on step 1 (the initial check)
+      if (step === 1) {
+        this.instructionsService.markTriggerChecked(
+          userId,
+          trigger.type,
+          trigger.summary,
+          instruction.id,
+          plan.shouldAct,
+        );
+      }
 
       if (!plan.shouldAct || plan.actions.length === 0) {
         if (step === 1) {
